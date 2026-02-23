@@ -1,0 +1,10 @@
+[package]
+name = "forge-manifest"
+description = "Hierarchical capability manifest for Code Mode tool discovery"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true

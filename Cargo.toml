@@ -1,0 +1,53 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/forge-cli",
+    "crates/forge-sandbox",
+    "crates/forge-sandbox-worker",
+    "crates/forge-manifest",
+    "crates/forge-server",
+    "crates/forge-client",
+    "crates/forge-config",
+    "crates/forge-test-server",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "FSL-1.1-ALv2"
+rust-version = "1.91.1"
+repository = "https://github.com/postrv/forgemax"
+
+[workspace.dependencies]
+# Core runtime
+deno_core = "0.385"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Async
+async-trait = "0.1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# MCP protocol
+rmcp = { version = "0.16", features = ["server", "macros", "transport-io"] }
+schemars = "1.0"
+
+# Security / audit
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+# Internal crates
+forge-sandbox = { path = "crates/forge-sandbox" }
+forge-manifest = { path = "crates/forge-manifest" }
+forge-server = { path = "crates/forge-server" }
+forge-client = { path = "crates/forge-client" }
+forge-config = { path = "crates/forge-config" }

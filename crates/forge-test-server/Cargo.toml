@@ -1,0 +1,18 @@
+[package]
+name = "forge-test-server"
+description = "Mock MCP server for Forge integration tests"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "forge-test-server"
+path = "src/main.rs"
+
+[dependencies]
+rmcp = { version = "0.16", features = ["server", "macros", "transport-io"] }
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+schemars = "1.0"

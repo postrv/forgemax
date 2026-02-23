@@ -1,0 +1,24 @@
+[package]
+name = "forge-client"
+description = "MCP client connections to downstream servers for Forge gateway"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+forge-sandbox.workspace = true
+rmcp = { version = "0.16", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+async-trait.workspace = true
+http = "1"
+
+[dev-dependencies]
+forge-manifest.workspace = true
+forge-server.workspace = true
+tracing.workspace = true
+async-trait.workspace = true

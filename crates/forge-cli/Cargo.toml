@@ -1,0 +1,21 @@
+[package]
+name = "forge-cli"
+description = "Forge Code Mode MCP Gateway - CLI entry point"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+forge-server.workspace = true
+forge-manifest.workspace = true
+forge-sandbox.workspace = true
+forge-client.workspace = true
+forge-config.workspace = true
+rmcp.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+async-trait.workspace = true
