@@ -72,22 +72,12 @@ async fn mcpclient_connects_to_stdio_server() {
     assert_eq!(client.name(), "test-server");
 
     let tools = client.list_tools().await.expect("failed to list tools");
-    assert!(
-        tools.len() >= 3,
-        "expected at least 3 tools, got {}",
-        tools.len()
-    );
+    assert!(tools.len() >= 3, "expected at least 3 tools, got {}", tools.len());
 
     let tool_names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
     assert!(tool_names.contains(&"echo"), "should have echo tool");
-    assert!(
-        tool_names.contains(&"math.add"),
-        "should have math.add tool"
-    );
-    assert!(
-        tool_names.contains(&"symbols.find"),
-        "should have symbols.find tool"
-    );
+    assert!(tool_names.contains(&"math.add"), "should have math.add tool");
+    assert!(tool_names.contains(&"symbols.find"), "should have symbols.find tool");
 
     client.disconnect().await.expect("disconnect failed");
 }
@@ -100,11 +90,7 @@ async fn mcpclient_calls_tool_and_gets_result() {
         .expect("failed to connect");
 
     let result = client
-        .call_tool(
-            "test-server",
-            "echo",
-            serde_json::json!({"message": "hello forge"}),
-        )
+        .call_tool("test-server", "echo", serde_json::json!({"message": "hello forge"}))
         .await
         .expect("echo tool call failed");
 
@@ -115,12 +101,14 @@ async fn mcpclient_calls_tool_and_gets_result() {
 
 #[tokio::test]
 async fn mcpclient_handles_connection_failure() {
-    let result = McpClient::connect_stdio("nonexistent", "/nonexistent/path/to/binary", &[]).await;
+    let result = McpClient::connect_stdio(
+        "nonexistent",
+        "/nonexistent/path/to/binary",
+        &[],
+    )
+    .await;
 
-    assert!(
-        result.is_err(),
-        "connecting to nonexistent binary should fail"
-    );
+    assert!(result.is_err(), "connecting to nonexistent binary should fail");
     let err = result.err().unwrap().to_string();
     assert!(
         err.contains("nonexistent") || err.contains("spawn") || err.contains("No such file"),

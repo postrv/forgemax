@@ -143,18 +143,12 @@ fn hex_encode(bytes: &[u8]) -> String {
     s
 }
 
-/// Create a code preview (first N bytes, with ellipsis if truncated).
-///
-/// Truncates at a valid UTF-8 char boundary to avoid panics on multibyte characters.
+/// Create a code preview (first N chars, with ellipsis if truncated).
 pub fn code_preview(code: &str) -> String {
     if code.len() <= CODE_PREVIEW_MAX {
         code.to_string()
     } else {
-        let mut end = CODE_PREVIEW_MAX;
-        while !code.is_char_boundary(end) {
-            end -= 1;
-        }
-        let mut preview = code[..end].to_string();
+        let mut preview = code[..CODE_PREVIEW_MAX].to_string();
         preview.push_str("...");
         preview
     }
@@ -191,11 +185,16 @@ impl AuditEntryBuilder {
     }
 
     /// Finalize the audit entry with the execution result.
-    pub fn finish(self, result: &Result<serde_json::Value, crate::SandboxError>) -> AuditEntry {
+    pub fn finish(
+        self,
+        result: &Result<serde_json::Value, crate::SandboxError>,
+    ) -> AuditEntry {
         let duration_ms = self.start.elapsed().as_millis() as u64;
         let (result_size_bytes, outcome) = match result {
             Ok(value) => {
-                let size = serde_json::to_string(value).map(|s| s.len()).unwrap_or(0);
+                let size = serde_json::to_string(value)
+                    .map(|s| s.len())
+                    .unwrap_or(0);
                 (size, AuditOutcome::Success)
             }
             Err(crate::SandboxError::Timeout { .. }) => (0, AuditOutcome::Timeout),
@@ -297,45 +296,6 @@ mod tests {
         let preview = code_preview(&code);
         assert_eq!(preview.len(), 503); // 500 + "..."
         assert!(preview.ends_with("..."));
-    }
-
-    #[test]
-    fn code_preview_multibyte_emoji_boundary() {
-        // 499 ASCII bytes + U+1F600 (4 bytes) = 503 total, crosses the 500 boundary
-        let mut code = "a".repeat(499);
-        code.push('\u{1F600}'); // 😀 — 4 bytes
-        code.push_str(&"b".repeat(100));
-        let preview = code_preview(&code);
-        assert!(preview.ends_with("..."));
-        // Should truncate before the emoji since byte 500 is mid-char
-        assert!(preview.starts_with(&"a".repeat(499)));
-    }
-
-    #[test]
-    fn code_preview_all_emoji() {
-        // 200 × U+1F600 (4 bytes each) = 800 bytes
-        let code: String = std::iter::repeat('\u{1F600}').take(200).collect();
-        let preview = code_preview(&code);
-        assert!(preview.ends_with("..."));
-        // Verify valid UTF-8 (would panic on invalid)
-        let _ = preview.chars().count();
-    }
-
-    #[test]
-    fn code_preview_exact_500_ascii() {
-        let code = "a".repeat(500);
-        let preview = code_preview(&code);
-        assert_eq!(preview, code); // no truncation, no "..."
-    }
-
-    #[test]
-    fn code_preview_cjk_boundary() {
-        // CJK chars are 3 bytes each: 167 × 3 = 501 bytes, crosses 500
-        let code: String = std::iter::repeat('\u{4E00}').take(200).collect(); // 600 bytes
-        let preview = code_preview(&code);
-        assert!(preview.ends_with("..."));
-        // Verify valid UTF-8
-        let _ = preview.chars().count();
     }
 
     #[test]

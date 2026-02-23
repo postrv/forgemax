@@ -8,9 +8,7 @@
 //! or HTTP transports, and [`RouterDispatcher`] for routing tool calls to the
 //! correct downstream server.
 
-pub mod circuit_breaker;
 pub mod router;
-pub mod timeout;
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -25,9 +23,7 @@ use rmcp::{RoleClient, ServiceExt};
 use serde_json::Value;
 use tokio::process::Command;
 
-pub use circuit_breaker::{CircuitBreakerConfig, CircuitBreakerDispatcher};
 pub use router::RouterDispatcher;
-pub use timeout::TimeoutDispatcher;
 
 /// Configuration for connecting to a downstream MCP server.
 #[derive(Debug, Clone)]
@@ -101,11 +97,13 @@ impl McpClient {
             "connecting to downstream MCP server (stdio)"
         );
 
-        let transport = TokioChildProcess::new(Command::new(command).configure(|cmd| {
-            for arg in &args_owned {
-                cmd.arg(arg);
-            }
-        }))
+        let transport = TokioChildProcess::new(
+            Command::new(command).configure(|cmd| {
+                for arg in &args_owned {
+                    cmd.arg(arg);
+                }
+            }),
+        )
         .with_context(|| {
             format!(
                 "failed to spawn stdio transport for server '{}' (command: {})",
@@ -149,12 +147,6 @@ impl McpClient {
         );
 
         let mut config = StreamableHttpClientTransportConfig::with_uri(url);
-
-        // Strip sensitive headers on plain HTTP to prevent credential leakage
-        let headers = headers.map(|mut h| {
-            sanitize_headers_for_transport(url, &mut h);
-            h
-        });
 
         if let Some(hdrs) = &headers {
             for (key, value) in hdrs {
@@ -251,14 +243,22 @@ impl McpClient {
 
 #[async_trait::async_trait]
 impl ToolDispatcher for McpClient {
-    async fn call_tool(&self, _server: &str, tool: &str, args: Value) -> Result<Value> {
-        let arguments = args.as_object().cloned().or_else(|| {
-            if args.is_null() {
-                Some(serde_json::Map::new())
-            } else {
-                None
-            }
-        });
+    async fn call_tool(
+        &self,
+        _server: &str,
+        tool: &str,
+        args: Value,
+    ) -> Result<Value> {
+        let arguments = args
+            .as_object()
+            .cloned()
+            .or_else(|| {
+                if args.is_null() {
+                    Some(serde_json::Map::new())
+                } else {
+                    None
+                }
+            });
 
         let result: CallToolResult = self
             .inner
@@ -271,7 +271,10 @@ impl ToolDispatcher for McpClient {
             })
             .await
             .with_context(|| {
-                format!("tool call failed: server='{}', tool='{}'", self.name, tool)
+                format!(
+                    "tool call failed: server='{}', tool='{}'",
+                    self.name, tool
+                )
             })?;
 
         call_tool_result_to_value(result)
@@ -311,259 +314,26 @@ fn call_tool_result_to_value(result: CallToolResult) -> Result<Value> {
     }
 }
 
-/// Maximum size in bytes for binary content (images, audio) before truncation.
-const MAX_BINARY_CONTENT_SIZE: usize = 1_048_576; // 1 MB
-
-/// Maximum size in bytes for text content before truncation.
-/// Prevents OOM from enormous text responses from compromised downstream servers.
-const MAX_TEXT_CONTENT_SIZE: usize = 10_485_760; // 10 MB
-
 /// Convert a single Content item to a JSON Value.
-///
-/// Binary content (images, audio) larger than [`MAX_BINARY_CONTENT_SIZE`] is
-/// replaced with truncation metadata to prevent OOM on large base64 payloads.
 fn content_to_value(content: &Content) -> Result<Value> {
     match &content.raw {
         RawContent::Text(t) => {
-            if t.text.len() > MAX_TEXT_CONTENT_SIZE {
-                Ok(serde_json::json!({
-                    "type": "text",
-                    "truncated": true,
-                    "original_size": t.text.len(),
-                    "preview": &t.text[..1024.min(t.text.len())],
-                }))
-            } else {
-                serde_json::from_str(&t.text).or_else(|_| Ok(Value::String(t.text.clone())))
-            }
+            serde_json::from_str(&t.text).or_else(|_| Ok(Value::String(t.text.clone())))
         }
-        RawContent::Image(img) => {
-            if img.data.len() > MAX_BINARY_CONTENT_SIZE {
-                Ok(serde_json::json!({
-                    "type": "image",
-                    "truncated": true,
-                    "original_size": img.data.len(),
-                    "mime_type": img.mime_type,
-                }))
-            } else {
-                Ok(serde_json::json!({
-                    "type": "image",
-                    "data": img.data,
-                    "mime_type": img.mime_type,
-                }))
-            }
-        }
+        RawContent::Image(img) => Ok(serde_json::json!({
+            "type": "image",
+            "data": img.data,
+            "mime_type": img.mime_type,
+        })),
         RawContent::Resource(r) => Ok(serde_json::json!({
             "type": "resource",
             "resource": serde_json::to_value(&r.resource).unwrap_or(Value::Null),
         })),
-        RawContent::Audio(a) => {
-            if a.data.len() > MAX_BINARY_CONTENT_SIZE {
-                Ok(serde_json::json!({
-                    "type": "audio",
-                    "truncated": true,
-                    "original_size": a.data.len(),
-                    "mime_type": a.mime_type,
-                }))
-            } else {
-                Ok(serde_json::json!({
-                    "type": "audio",
-                    "data": a.data,
-                    "mime_type": a.mime_type,
-                }))
-            }
-        }
+        RawContent::Audio(a) => Ok(serde_json::json!({
+            "type": "audio",
+            "data": a.data,
+            "mime_type": a.mime_type,
+        })),
         _ => Ok(serde_json::json!({"type": "unknown"})),
-    }
-}
-
-/// Sensitive header name substrings (lowercase). Any header whose lowercased name
-/// contains one of these is stripped on plain HTTP connections.
-const SENSITIVE_HEADER_PATTERNS: &[&str] = &[
-    "authorization",
-    "cookie",
-    "token",
-    "secret",
-    "key",
-    "credential",
-    "password",
-    "auth",
-];
-
-/// Returns true if the header name matches a sensitive pattern.
-fn is_sensitive_header(name: &str) -> bool {
-    let lower = name.to_lowercase();
-    SENSITIVE_HEADER_PATTERNS
-        .iter()
-        .any(|pattern| lower.contains(pattern))
-}
-
-/// Strip sensitive headers from HTTP connections over plain HTTP.
-///
-/// Strips any header whose name contains "auth", "token", "secret", "key",
-/// "cookie", "credential", or "password" (case-insensitive) to prevent
-/// accidental credential leakage over unencrypted transports.
-fn sanitize_headers_for_transport(url: &str, headers: &mut HashMap<String, String>) {
-    if url.starts_with("http://") {
-        let removed: Vec<String> = headers
-            .keys()
-            .filter(|k| is_sensitive_header(k))
-            .cloned()
-            .collect();
-        for key in &removed {
-            headers.remove(key);
-        }
-        if !removed.is_empty() {
-            tracing::warn!(
-                url = %url,
-                removed_headers = ?removed,
-                "stripped sensitive headers from plain HTTP connection — use HTTPS to send credentials"
-            );
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use rmcp::model::{Content, RawContent};
-
-    #[test]
-    fn content_to_value_text_string() {
-        let content = Content::text("hello");
-        let val = content_to_value(&content).unwrap();
-        assert_eq!(val, Value::String("hello".into()));
-    }
-
-    #[test]
-    fn content_to_value_text_json() {
-        let content = Content::text(r#"{"k":"v"}"#);
-        let val = content_to_value(&content).unwrap();
-        assert_eq!(val, serde_json::json!({"k": "v"}));
-    }
-
-    #[test]
-    fn content_to_value_small_image_preserved() {
-        let small_data = "a".repeat(1024); // 1KB
-        let content = Content::image(small_data.clone(), "image/png");
-        let val = content_to_value(&content).unwrap();
-        assert_eq!(val["type"], "image");
-        assert_eq!(val["data"], small_data);
-        assert!(val.get("truncated").is_none());
-    }
-
-    #[test]
-    fn content_to_value_oversized_image_truncated() {
-        let large_data = "a".repeat(2 * 1024 * 1024); // 2MB
-        let content = Content::image(large_data, "image/png");
-        let val = content_to_value(&content).unwrap();
-        assert_eq!(val["type"], "image");
-        assert_eq!(val["truncated"], true);
-        assert!(val.get("data").is_none());
-        assert!(val["original_size"].as_u64().unwrap() > MAX_BINARY_CONTENT_SIZE as u64);
-    }
-
-    #[test]
-    fn content_to_value_oversized_audio_truncated() {
-        let large_data = "a".repeat(2 * 1024 * 1024); // 2MB
-        let content = Content {
-            raw: RawContent::Audio(rmcp::model::RawAudioContent {
-                data: large_data,
-                mime_type: "audio/wav".into(),
-            }),
-            annotations: None,
-        };
-        let val = content_to_value(&content).unwrap();
-        assert_eq!(val["type"], "audio");
-        assert_eq!(val["truncated"], true);
-        assert!(val.get("data").is_none());
-    }
-
-    #[test]
-    fn content_to_value_oversized_text_truncated() {
-        let large_text = "x".repeat(11 * 1024 * 1024); // 11MB
-        let content = Content::text(large_text);
-        let val = content_to_value(&content).unwrap();
-        assert_eq!(val["type"], "text");
-        assert_eq!(val["truncated"], true);
-        assert!(val["original_size"].as_u64().unwrap() > MAX_TEXT_CONTENT_SIZE as u64);
-        assert!(val["preview"].as_str().unwrap().len() <= 1024);
-    }
-
-    #[test]
-    fn content_to_value_normal_text_not_truncated() {
-        let normal_text = "x".repeat(1024); // 1KB — well under limit
-        let content = Content::text(normal_text.clone());
-        let val = content_to_value(&content).unwrap();
-        assert_eq!(val, Value::String(normal_text));
-    }
-
-    #[test]
-    fn sanitize_headers_strips_auth_on_http() {
-        let mut headers = HashMap::new();
-        headers.insert("Authorization".into(), "Bearer secret".into());
-        headers.insert("Content-Type".into(), "application/json".into());
-        sanitize_headers_for_transport("http://example.com/mcp", &mut headers);
-        assert!(!headers.contains_key("Authorization"));
-        assert!(headers.contains_key("Content-Type"));
-    }
-
-    #[test]
-    fn sanitize_headers_strips_api_key_on_http() {
-        let mut headers = HashMap::new();
-        headers.insert("X-Api-Key".into(), "sk-123".into());
-        headers.insert("Content-Type".into(), "application/json".into());
-        sanitize_headers_for_transport("http://example.com/mcp", &mut headers);
-        assert!(!headers.contains_key("X-Api-Key"));
-        assert!(headers.contains_key("Content-Type"));
-    }
-
-    #[test]
-    fn sanitize_headers_strips_cookie_on_http() {
-        let mut headers = HashMap::new();
-        headers.insert("Cookie".into(), "session=abc123".into());
-        sanitize_headers_for_transport("http://example.com/mcp", &mut headers);
-        assert!(!headers.contains_key("Cookie"));
-    }
-
-    #[test]
-    fn sanitize_headers_strips_custom_token_on_http() {
-        let mut headers = HashMap::new();
-        headers.insert("X-Auth-Token".into(), "tok_secret".into());
-        headers.insert("X-Secret-Key".into(), "s3cr3t".into());
-        headers.insert("X-Custom-Credential".into(), "cred".into());
-        headers.insert("X-Password".into(), "pass".into());
-        headers.insert("Accept".into(), "application/json".into());
-        sanitize_headers_for_transport("http://example.com/mcp", &mut headers);
-        assert!(!headers.contains_key("X-Auth-Token"));
-        assert!(!headers.contains_key("X-Secret-Key"));
-        assert!(!headers.contains_key("X-Custom-Credential"));
-        assert!(!headers.contains_key("X-Password"));
-        assert!(headers.contains_key("Accept"));
-    }
-
-    #[test]
-    fn sanitize_headers_preserves_all_on_https() {
-        let mut headers = HashMap::new();
-        headers.insert("Authorization".into(), "Bearer secret".into());
-        headers.insert("X-Api-Key".into(), "sk-123".into());
-        headers.insert("Cookie".into(), "session=abc".into());
-        sanitize_headers_for_transport("https://example.com/mcp", &mut headers);
-        assert!(headers.contains_key("Authorization"));
-        assert!(headers.contains_key("X-Api-Key"));
-        assert!(headers.contains_key("Cookie"));
-    }
-
-    #[test]
-    fn is_sensitive_header_matches() {
-        assert!(is_sensitive_header("Authorization"));
-        assert!(is_sensitive_header("x-api-key"));
-        assert!(is_sensitive_header("Cookie"));
-        assert!(is_sensitive_header("X-Auth-Token"));
-        assert!(is_sensitive_header("X-Secret-Key"));
-        assert!(is_sensitive_header("X-Custom-Credential"));
-        assert!(is_sensitive_header("X-Password"));
-        assert!(!is_sensitive_header("Content-Type"));
-        assert!(!is_sensitive_header("Accept"));
-        assert!(!is_sensitive_header("User-Agent"));
     }
 }

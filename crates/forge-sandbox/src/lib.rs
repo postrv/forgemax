@@ -21,11 +21,9 @@
 pub mod audit;
 pub mod error;
 pub mod executor;
-pub mod groups;
 pub mod host;
 pub mod ipc;
 pub mod ops;
-pub mod redact;
 pub mod validator;
 
 pub use error::SandboxError;

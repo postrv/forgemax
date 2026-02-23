@@ -87,74 +87,26 @@ cargo test --workspace
 
 ### Configuration
 
-Copy the example config and add your tokens:
-
-```bash
-cp forge.toml.example forge.toml
-```
-
-The example includes pre-configured connections for 11 reputable MCP servers:
-
-| Server | Company | Transport | Auth |
-|--------|---------|-----------|------|
-| narsil | — | stdio | None |
-| github | GitHub | stdio (Docker) | Personal access token |
-| playwright | Microsoft | stdio (npx) | None |
-| sentry | Sentry | stdio (npx) | Auth token |
-| cloudflare | Cloudflare | SSE | OAuth |
-| supabase | Supabase | stdio (npx) | Access token |
-| notion | Notion | stdio (npx) | Integration token |
-| figma | Figma | SSE | OAuth |
-| stripe | Stripe | stdio (npx) | Secret key |
-| linear | Linear | SSE | OAuth |
-| atlassian | Atlassian | SSE | OAuth |
-
-Uncomment only the servers you need. Environment variables are expanded (`${GITHUB_TOKEN}`).
-
-<details>
-<summary>Minimal config (narsil only)</summary>
+Create `forge.toml` in your working directory:
 
 ```toml
 [servers.narsil]
 command = "narsil-mcp"
 args = ["--repos", "."]
 transport = "stdio"
+
+[servers.github]
+url = "https://mcp.github.com/sse"
+transport = "sse"
+headers = { Authorization = "Bearer ${GITHUB_TOKEN}" }
 
 [sandbox]
 timeout_secs = 5
 max_heap_mb = 64
-execution_mode = "child_process"
+max_concurrent = 8
+max_tool_calls = 50
+execution_mode = "child_process"  # or "in_process" (default)
 ```
-</details>
-
-<details>
-<summary>Advanced options</summary>
-
-```toml
-# Per-server resilience
-[servers.narsil]
-command = "narsil-mcp"
-args = ["--repos", "."]
-transport = "stdio"
-timeout_secs = 30
-circuit_breaker = true
-failure_threshold = 3
-recovery_timeout_secs = 60
-
-# Cross-server data flow isolation
-[groups.internal]
-servers = ["supabase"]
-isolation = "strict"
-
-[groups.external]
-servers = ["notion", "linear", "atlassian"]
-isolation = "strict"
-
-[groups.tools]
-servers = ["narsil", "playwright", "github"]
-isolation = "open"
-```
-</details>
 
 ## How It Works
 
@@ -197,58 +149,29 @@ The sandbox executes JavaScript, routes `forge.callTool()` to real MCP servers v
 ## Security Model
 
 ```
-Code Validator          Banned patterns, size limits, Unicode normalization,
-                        comment stripping, whitespace-aware matching
-        |
-  V8 Bootstrap          eval/Function constructor removal at runtime
+Input Validation        Banned patterns, size limits, format checks
         |
    V8 Isolate           No fs/net/env, fresh per call, memory-isolated
         |
-  API Boundary          Opaque bindings, arg validation, rate limits
-        |
-Manifest Sanitization   Tool metadata sanitized to prevent prompt injection
-        |
- Content Size Limits    OOM prevention for text (10MB), binary (1MB) responses
-        |
-  Error Redaction       URLs, IPs, paths, credentials, stack traces stripped
-                        before reaching the LLM — validation errors preserved
+  API Boundary          Opaque bindings, per-op auth, rate limits, arg validation
         |
  Resource Limits        Timeout, heap cap, output size cap, concurrency cap
         |
- Header Security        Sensitive headers (auth, token, key, cookie, secret,
-                        credential, password) stripped on plain HTTP
-        |
- Per-Server Timeouts    Individual timeout per downstream server
-        |
-  Circuit Breakers      Closed → Open → HalfOpen state machine per server,
-                        prevents cascade failures from flaky downstreams
-        |
-  Server Groups         Opt-in strict/open isolation policies controlling
-                        cross-server data flow within a single execution
-        |
 Process Isolation       Child process, clean env, kill-on-timeout (production mode)
-        |
- Binary Security        Absolute paths only, permission checks, no PATH fallback
-        |
-  IPC Protocol          Length-delimited JSON, configurable message size limits,
-                        protocol desync prevention
         |
   Audit Logging         Every execution logged — code hash, tool calls, duration, outcome
 ```
 
-Three rounds of adversarial security testing (automated scanners + manual review + Arbiter prompt shield) resolved 19 findings across all severity levels. See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed security analysis.
-
 ## Tests
 
-222 tests across the workspace:
+122 tests across the workspace:
 
 ```
-forge-sandbox       108 unit + 10 integration (child process mode)
-forge-manifest       25 (builders + dynamic generation + sanitization)
-forge-config         24 (parsing, validation, env expansion, groups)
-forge-client         32 unit (router, timeout, circuit breaker, header sanitization) + 9 e2e
-forge-server          6 unit + 4 integration
-forge-cli             4 unit (config parsing)
+forge-sandbox       52 unit + 10 integration (child process mode)
+forge-manifest      19 (builders + dynamic generation)
+forge-config        15 (parsing, validation, env expansion)
+forge-client         7 unit (router) + 9 e2e (real MCP connections)
+forge-server         6 unit + 4 integration
 ```
 
 ```bash
@@ -269,6 +192,4 @@ cargo test --workspace
 
 ## License
 
-[FSL-1.1-ALv2](LICENSE) — Functional Source License, Version 1.1, with Apache License 2.0 future grant.
-
-You can use, modify, and redistribute Forge for any purpose **except** offering a competing commercial product or service. After two years from each release, that version converts to Apache 2.0.
+MIT

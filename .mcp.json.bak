@@ -1,0 +1,24 @@
+{
+  "mcpServers": {
+    "narsil-mcp": {
+      "command": "/Users/laurence/.cargo/bin/narsil-mcp",
+      "args": [
+        "--repos",
+        ".",
+        "--git",
+        "--call-graph",
+        "--persist",
+        "--watch",
+        "--streaming",
+        "--graph"
+      ]
+    },
+    "arbiter": {
+      "command": "/Users/laurence/.cargo/bin/arbiter",
+      "args": [
+        "serve",
+        "--stdio"
+      ]
+    }
+  }
+}

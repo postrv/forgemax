@@ -36,7 +36,7 @@ pub enum SandboxError {
     },
 
     /// A banned code pattern was detected during validation.
-    #[error("banned pattern detected: `{pattern}` — the sandbox has no filesystem, network, or module access. Use forge.callTool() or forge.server() to interact with external services.")]
+    #[error("banned pattern detected: {pattern}")]
     BannedPattern {
         /// The pattern that was matched.
         pattern: String,

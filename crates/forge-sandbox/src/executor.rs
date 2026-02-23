@@ -58,12 +58,12 @@ impl Default for SandboxConfig {
     fn default() -> Self {
         Self {
             timeout: Duration::from_secs(5),
-            max_code_size: 64 * 1024,        // 64 KB
-            max_output_size: 1024 * 1024,    // 1 MB
-            max_heap_size: 64 * 1024 * 1024, // 64 MB
+            max_code_size: 64 * 1024,            // 64 KB
+            max_output_size: 1024 * 1024,         // 1 MB
+            max_heap_size: 64 * 1024 * 1024,      // 64 MB
             max_concurrent: 8,
             max_tool_calls: 50,
-            max_tool_call_args_size: 1024 * 1024, // 1 MB
+            max_tool_call_args_size: 1024 * 1024,  // 1 MB
             execution_mode: ExecutionMode::default(),
         }
     }
@@ -117,11 +117,13 @@ impl SandboxExecutor {
 
         validate_code(code, Some(self.config.max_code_size))?;
 
-        let _permit = self.semaphore.clone().try_acquire_owned().map_err(|_| {
-            SandboxError::ConcurrencyLimit {
+        let _permit = self
+            .semaphore
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| SandboxError::ConcurrencyLimit {
                 max: self.config.max_concurrent,
-            }
-        })?;
+            })?;
 
         let code = code.to_string();
         let manifest = manifest.clone();
@@ -186,11 +188,13 @@ impl SandboxExecutor {
 
         validate_code(code, Some(self.config.max_code_size))?;
 
-        let _permit = self.semaphore.clone().try_acquire_owned().map_err(|_| {
-            SandboxError::ConcurrencyLimit {
+        let _permit = self
+            .semaphore
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| SandboxError::ConcurrencyLimit {
                 max: self.config.max_concurrent,
-            }
-        })?;
+            })?;
 
         // Wrap dispatcher with audit tracking
         let (audit_tx, mut audit_rx) = tokio::sync::mpsc::unbounded_channel::<ToolCallAudit>();
@@ -199,12 +203,15 @@ impl SandboxExecutor {
 
         let result = match self.config.execution_mode {
             ExecutionMode::ChildProcess => {
-                crate::host::SandboxHost::execute_in_child(code, &self.config, auditing_dispatcher)
-                    .await
+                crate::host::SandboxHost::execute_in_child(
+                    code,
+                    &self.config,
+                    auditing_dispatcher,
+                )
+                .await
             }
             ExecutionMode::InProcess => {
-                self.execute_code_in_process(code, auditing_dispatcher)
-                    .await
+                self.execute_code_in_process(code, auditing_dispatcher).await
             }
         };
 
@@ -262,9 +269,7 @@ impl SandboxExecutor {
 /// State for the near-heap-limit callback.
 struct HeapLimitState {
     handle: v8::IsolateHandle,
-    /// Whether the heap limit has been triggered. Uses AtomicBool so the callback
-    /// can use a shared `&` reference instead of `&mut`, eliminating aliasing concerns.
-    triggered: AtomicBool,
+    triggered: bool,
 }
 
 /// V8 near-heap-limit callback. Terminates execution and grants 1MB grace
@@ -274,14 +279,9 @@ extern "C" fn near_heap_limit_callback(
     current_heap_limit: usize,
     _initial_heap_limit: usize,
 ) -> usize {
-    // SAFETY: `data` points to `heap_state` (Box<HeapLimitState>) allocated below.
-    // The Box outlives this callback because: (1) the watchdog thread is joined
-    // before heap_state is dropped, and (2) V8 only invokes this callback while the
-    // isolate's event loop is running, which completes before the join.
-    // We use a shared `&` reference (not `&mut`) because `triggered` is AtomicBool,
-    // so no aliasing concerns even if V8 were to call this callback re-entrantly.
-    let state = unsafe { &*(data as *const HeapLimitState) };
-    if !state.triggered.swap(true, Ordering::SeqCst) {
+    let state = unsafe { &mut *(data as *mut HeapLimitState) };
+    if !state.triggered {
+        state.triggered = true;
         state.handle.terminate_execution();
     }
     // Grant 1MB grace so the termination exception can propagate
@@ -308,8 +308,7 @@ pub async fn run_search(
             message: e.to_string(),
         })?;
 
-    // Bootstrap: capture ops in closures, create minimal forge object, delete Deno,
-    // and remove dangerous code generation primitives.
+    // Bootstrap: capture ops in closures, create minimal forge object, delete Deno
     runtime
         .execute_script(
             "[forge:bootstrap]",
@@ -322,22 +321,6 @@ pub async fn run_search(
                         log: log,
                     });
                     delete globalThis.Deno;
-
-                    // Remove code generation primitives to prevent prototype chain attacks.
-                    // Even with the validator banning eval( and Function(, an attacker could
-                    // reach Function via forge.log.constructor or similar prototype chain access.
-                    delete globalThis.eval;
-                    const AsyncFunction = (async function(){}).constructor;
-                    const GeneratorFunction = (function*(){}).constructor;
-                    Object.defineProperty(Function.prototype, 'constructor', {
-                        value: undefined, configurable: false, writable: false
-                    });
-                    Object.defineProperty(AsyncFunction.prototype, 'constructor', {
-                        value: undefined, configurable: false, writable: false
-                    });
-                    Object.defineProperty(GeneratorFunction.prototype, 'constructor', {
-                        value: undefined, configurable: false, writable: false
-                    });
                 })(Deno.core.ops);
             "#,
         )
@@ -363,8 +346,7 @@ pub async fn run_execute(
     };
     let mut runtime = create_runtime(Some(dispatcher), config.max_heap_size, Some(limits))?;
 
-    // Bootstrap: capture ops in closures, create full forge API, delete Deno,
-    // and remove dangerous code generation primitives.
+    // Bootstrap: capture ops in closures, create full forge API, delete Deno.
     // User code accesses tools via forge.callTool() or forge.server("x").cat.tool().
     runtime
         .execute_script(
@@ -406,20 +388,6 @@ pub async fn run_execute(
                     });
 
                     delete globalThis.Deno;
-
-                    // Remove code generation primitives to prevent prototype chain attacks.
-                    delete globalThis.eval;
-                    const AsyncFunction = (async function(){}).constructor;
-                    const GeneratorFunction = (function*(){}).constructor;
-                    Object.defineProperty(Function.prototype, 'constructor', {
-                        value: undefined, configurable: false, writable: false
-                    });
-                    Object.defineProperty(AsyncFunction.prototype, 'constructor', {
-                        value: undefined, configurable: false, writable: false
-                    });
-                    Object.defineProperty(GeneratorFunction.prototype, 'constructor', {
-                        value: undefined, configurable: false, writable: false
-                    });
                 })(Deno.core.ops);
             "#,
         )
@@ -468,13 +436,13 @@ async fn run_user_code(
     config: &SandboxConfig,
 ) -> Result<Value, SandboxError> {
     // --- Set up heap limit callback ---
-    let heap_state = Box::new(HeapLimitState {
+    let mut heap_state = Box::new(HeapLimitState {
         handle: runtime.v8_isolate().thread_safe_handle(),
-        triggered: AtomicBool::new(false),
+        triggered: false,
     });
     runtime.v8_isolate().add_near_heap_limit_callback(
         near_heap_limit_callback,
-        &*heap_state as *const HeapLimitState as *mut std::ffi::c_void,
+        heap_state.as_mut() as *mut HeapLimitState as *mut std::ffi::c_void,
     );
 
     // --- Set up CPU watchdog ---
@@ -485,7 +453,9 @@ async fn run_user_code(
     let (cancel_tx, cancel_rx) = std::sync::mpsc::channel::<()>();
 
     let watchdog = std::thread::spawn(move || {
-        if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = cancel_rx.recv_timeout(timeout) {
+        if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+            cancel_rx.recv_timeout(timeout)
+        {
             watchdog_timed_out.store(true, Ordering::SeqCst);
             watchdog_handle.terminate_execution();
         }
@@ -534,7 +504,7 @@ async fn run_user_code(
     let _ = watchdog.join();
 
     // --- Check error causes in priority order ---
-    if heap_state.triggered.load(Ordering::SeqCst) {
+    if heap_state.triggered {
         return Err(SandboxError::HeapLimitExceeded);
     }
 
@@ -758,7 +728,7 @@ mod tests {
     #[tokio::test]
     async fn heap_limit_prevents_oom() {
         let exec = SandboxExecutor::new(SandboxConfig {
-            max_heap_size: 10 * 1024 * 1024,  // 10 MB
+            max_heap_size: 10 * 1024 * 1024, // 10 MB
             timeout: Duration::from_secs(30), // Long timeout so heap fills first
             ..Default::default()
         });
@@ -849,10 +819,7 @@ mod tests {
 
         let result = exec.execute_code(code, dispatcher).await.unwrap();
         assert!(
-            result
-                .as_str()
-                .unwrap()
-                .contains("tool call limit exceeded"),
+            result.as_str().unwrap().contains("tool call limit exceeded"),
             "expected tool call limit message, got: {result:?}"
         );
     }
@@ -927,50 +894,6 @@ mod tests {
         assert_eq!(arr.len(), 2);
         assert_eq!(arr[0]["server"], "server1");
         assert_eq!(arr[1]["server"], "server2");
-    }
-
-    #[tokio::test]
-    async fn eval_is_not_accessible() {
-        let exec = executor();
-        let manifest = serde_json::json!({});
-
-        let code = r#"async () => {
-            return typeof globalThis.eval;
-        }"#;
-
-        let result = exec.execute_search(code, &manifest).await.unwrap();
-        assert_eq!(result, "undefined");
-    }
-
-    #[tokio::test]
-    async fn function_constructor_is_blocked() {
-        let exec = executor();
-        let dispatcher: Arc<dyn ToolDispatcher> = Arc::new(TestDispatcher);
-
-        // Try to access Function via prototype chain — should get undefined
-        let code = r#"async () => {
-            const ctor = forge.log.constructor;
-            return String(ctor);
-        }"#;
-
-        let result = exec.execute_code(code, dispatcher).await.unwrap();
-        assert_eq!(result, "undefined");
-    }
-
-    #[tokio::test]
-    async fn async_function_constructor_is_blocked() {
-        let exec = executor();
-        let dispatcher: Arc<dyn ToolDispatcher> = Arc::new(TestDispatcher);
-
-        // Try to access AsyncFunction via prototype chain
-        let code = r#"async () => {
-            const fn1 = async () => {};
-            const ctor = fn1.constructor;
-            return String(ctor);
-        }"#;
-
-        let result = exec.execute_code(code, dispatcher).await.unwrap();
-        assert_eq!(result, "undefined");
     }
 
     #[tokio::test]

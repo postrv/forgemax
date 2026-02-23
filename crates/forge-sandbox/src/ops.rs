@@ -87,13 +87,7 @@ pub async fn op_forge_call_tool(
     let result = dispatcher
         .call_tool(&server, &tool, args)
         .await
-        .map_err(|e| {
-            JsErrorBox::generic(crate::redact::redact_error_for_llm(
-                &server,
-                &tool,
-                &e.to_string(),
-            ))
-        })?;
+        .map_err(|e| JsErrorBox::generic(format!("tool call failed: {e}")))?;
 
     serde_json::to_string(&result)
         .map_err(|e| JsErrorBox::generic(format!("result serialization failed: {e}")))

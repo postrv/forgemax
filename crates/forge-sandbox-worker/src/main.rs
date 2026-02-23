@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use forge_sandbox::ipc::{read_message, read_message_with_limit, write_message, ChildMessage, ParentMessage};
+use forge_sandbox::ipc::{read_message, write_message, ChildMessage, ParentMessage};
 use forge_sandbox::ToolDispatcher;
 use tokio::io::{self, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, oneshot};
@@ -100,7 +100,6 @@ async fn main() -> Result<()> {
     };
 
     let sandbox_config = config.to_sandbox_config();
-    let max_ipc_size = config.max_ipc_message_size;
 
     // Set up IPC channels
     // tx: child messages to send to parent (tool requests, logs)
@@ -118,27 +117,18 @@ async fn main() -> Result<()> {
     // Spawn the V8 execution on a dedicated thread (V8 isolates are !Send)
     let exec_tx = tx.clone();
     let exec_handle = std::thread::spawn(move || {
-        let rt = match tokio::runtime::Builder::new_current_thread()
+        let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-        {
-            Ok(rt) => rt,
-            Err(e) => {
-                let _ = exec_tx.send(ChildMessage::ExecutionComplete {
-                    result: Err(format!("failed to create tokio runtime: {}", e)),
-                });
-                return;
-            }
-        };
+            .expect("failed to create tokio runtime in worker thread");
 
-        let result = rt.block_on(forge_sandbox::executor::run_execute(
-            &sandbox_config,
-            &code,
-            dispatcher,
-        ));
+        let result =
+            rt.block_on(forge_sandbox::executor::run_execute(&sandbox_config, &code, dispatcher));
 
         let child_result = match result {
-            Ok(value) => ChildMessage::ExecutionComplete { result: Ok(value) },
+            Ok(value) => ChildMessage::ExecutionComplete {
+                result: Ok(value),
+            },
             Err(e) => ChildMessage::ExecutionComplete {
                 result: Err(e.to_string()),
             },
@@ -189,7 +179,7 @@ async fn main() -> Result<()> {
             }
 
             // Incoming: parent sends a tool call result
-            result = read_message_with_limit::<ParentMessage, _>(&mut stdin, max_ipc_size) => {
+            result = read_message::<ParentMessage, _>(&mut stdin) => {
                 match result {
                     Ok(Some(ParentMessage::ToolCallResult { request_id, result })) => {
                         if let Some(waiter) = pending_waiters.remove(&request_id) {

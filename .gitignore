@@ -16,10 +16,6 @@
 
 # Local MCP config (contains machine-specific paths)
 .mcp.json
-.mcp.json.bak
-
-# Local Forge config (contains machine-specific paths)
-forge.toml
 
 # Internal planning and commercial docs
 .archive/
