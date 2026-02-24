@@ -6,6 +6,9 @@
 //! - Routes tool calls through IPC
 //! - Respects timeouts
 //! - Produces audit entries
+//!
+//! All tests are serialized to avoid resource contention from multiple
+//! V8 worker processes competing on CI runners.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,6 +16,7 @@ use std::time::Duration;
 use forge_sandbox::audit::JsonLinesAuditLogger;
 use forge_sandbox::executor::ExecutionMode;
 use forge_sandbox::{SandboxConfig, SandboxExecutor, ToolDispatcher};
+use serial_test::serial;
 
 /// Test dispatcher that echoes back the server/tool/args.
 struct EchoDispatcher;
@@ -59,6 +63,7 @@ fn child_process_config() -> SandboxConfig {
 }
 
 #[tokio::test]
+#[serial]
 async fn child_process_simple_execution() {
     let exec = SandboxExecutor::new(child_process_config());
     let dispatcher: Arc<dyn ToolDispatcher> = Arc::new(EchoDispatcher);
@@ -72,6 +77,7 @@ async fn child_process_simple_execution() {
 }
 
 #[tokio::test]
+#[serial]
 async fn child_process_tool_call_through_ipc() {
     let exec = SandboxExecutor::new(child_process_config());
     let dispatcher: Arc<dyn ToolDispatcher> = Arc::new(EchoDispatcher);
@@ -89,6 +95,7 @@ async fn child_process_tool_call_through_ipc() {
 }
 
 #[tokio::test]
+#[serial]
 async fn child_process_multiple_tool_calls() {
     let exec = SandboxExecutor::new(child_process_config());
     let dispatcher: Arc<dyn ToolDispatcher> = Arc::new(EchoDispatcher);
@@ -109,6 +116,7 @@ async fn child_process_multiple_tool_calls() {
 }
 
 #[tokio::test]
+#[serial]
 async fn child_process_server_proxy_syntax() {
     let exec = SandboxExecutor::new(child_process_config());
     let dispatcher: Arc<dyn ToolDispatcher> = Arc::new(EchoDispatcher);
@@ -124,6 +132,7 @@ async fn child_process_server_proxy_syntax() {
 }
 
 #[tokio::test]
+#[serial]
 async fn child_process_js_error_captured() {
     let exec = SandboxExecutor::new(child_process_config());
     let dispatcher: Arc<dyn ToolDispatcher> = Arc::new(EchoDispatcher);
@@ -138,6 +147,7 @@ async fn child_process_js_error_captured() {
 }
 
 #[tokio::test]
+#[serial]
 async fn child_process_timeout() {
     let config = SandboxConfig {
         execution_mode: ExecutionMode::ChildProcess,
@@ -170,6 +180,7 @@ async fn child_process_timeout() {
 }
 
 #[tokio::test]
+#[serial]
 async fn child_process_with_audit_logging() {
     let buf: Vec<u8> = Vec::new();
     let logger = Arc::new(JsonLinesAuditLogger::new(buf));
@@ -193,6 +204,7 @@ async fn child_process_with_audit_logging() {
 }
 
 #[tokio::test]
+#[serial]
 async fn child_process_returns_complex_data() {
     let exec = SandboxExecutor::new(child_process_config());
     let dispatcher: Arc<dyn ToolDispatcher> = Arc::new(EchoDispatcher);
@@ -214,6 +226,7 @@ async fn child_process_returns_complex_data() {
 }
 
 #[tokio::test]
+#[serial]
 async fn child_process_tool_call_with_slow_dispatcher() {
     let exec = SandboxExecutor::new(child_process_config());
     let dispatcher: Arc<dyn ToolDispatcher> = Arc::new(SlowDispatcher);
@@ -228,6 +241,7 @@ async fn child_process_tool_call_with_slow_dispatcher() {
 }
 
 #[tokio::test]
+#[serial]
 async fn child_process_banned_code_rejected() {
     let exec = SandboxExecutor::new(child_process_config());
     let dispatcher: Arc<dyn ToolDispatcher> = Arc::new(EchoDispatcher);
