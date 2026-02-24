@@ -1,0 +1,42 @@
+{
+  "name": "forgemax",
+  "version": "0.1.0",
+  "description": "Code Mode MCP Gateway — collapses N servers x M tools into 2 tools",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "gateway",
+    "ai",
+    "claude",
+    "code-mode"
+  ],
+  "author": "postrv",
+  "license": "FSL-1.1-ALv2",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/postrv/forgemax.git"
+  },
+  "bin": {
+    "forgemax": "bin/forgemax"
+  },
+  "scripts": {
+    "postinstall": "node install.js"
+  },
+  "files": [
+    "install.js",
+    "bin/",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "os": [
+    "darwin",
+    "linux",
+    "win32"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ]
+}

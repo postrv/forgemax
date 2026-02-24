@@ -4,6 +4,8 @@ description = "V8 sandbox for executing LLM-generated JavaScript via deno_core"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 deno_core.workspace = true
@@ -18,3 +20,7 @@ async-trait.workspace = true
 sha2.workspace = true
 uuid.workspace = true
 chrono.workspace = true
+regex = "1"
+
+[dev-dependencies]
+tempfile = "3"

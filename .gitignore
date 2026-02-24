@@ -16,6 +16,13 @@
 
 # Local MCP config (contains machine-specific paths)
 .mcp.json
+.mcp.json.bak
+
+# Local Forge config (contains machine-specific paths)
+forge.toml
+
+# npm binary artifacts (downloaded during postinstall)
+npm/bin/
 
 # Internal planning and commercial docs
 .archive/

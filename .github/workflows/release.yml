@@ -1,0 +1,179 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets -- -D warnings
+
+  version-check:
+    name: Version check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Verify version matches tag
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          CARGO_VERSION=$(cargo metadata --no-deps --format-version 1 | \
+            jq -r '.packages[] | select(.name == "forge-cli") | .version')
+          if [ "$TAG_VERSION" != "$CARGO_VERSION" ]; then
+            echo "::error::Tag version ($TAG_VERSION) does not match Cargo.toml version ($CARGO_VERSION)"
+            exit 1
+          fi
+      - name: Verify --version output
+        run: |
+          cargo build --release -p forge-cli
+          VERSION_OUTPUT=$(./target/release/forgemax --version)
+          EXPECTED="forgemax ${GITHUB_REF_NAME#v}"
+          if [ "$VERSION_OUTPUT" != "$EXPECTED" ]; then
+            echo "::error::--version output ($VERSION_OUTPUT) does not match expected ($EXPECTED)"
+            exit 1
+          fi
+
+  security:
+    name: Security audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --verbose
+
+  publish-crates:
+    name: Publish to crates.io
+    needs: [lint, version-check, security, test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Publish crates in dependency order
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          CRATES=(
+            forge-config
+            forge-manifest
+            forge-sandbox
+            forge-sandbox-worker
+            forge-client
+            forge-server
+            forge-cli
+          )
+          for crate in "${CRATES[@]}"; do
+            echo "Publishing $crate..."
+            cargo publish -p "$crate" --allow-dirty || {
+              echo "Warning: $crate may already be published, continuing..."
+            }
+            # Wait for crates.io index to update
+            sleep 30
+          done
+
+  build-binaries:
+    name: Build binaries
+    needs: [lint, version-check, security, test]
+    uses: ./.github/workflows/build-binaries.yml
+    with:
+      upload-artifacts: true
+
+  release:
+    name: Create GitHub Release
+    needs: [build-binaries]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Package release archives
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          mkdir -p release
+
+          # Unix targets → tar.gz
+          for dir in forgemax-linux-x86_64 forgemax-linux-x86_64-musl forgemax-macos-x86_64 forgemax-macos-aarch64; do
+            if [ -d "artifacts/$dir" ]; then
+              tar czf "release/forgemax-v${VERSION}-${dir#forgemax-}.tar.gz" \
+                -C "artifacts/$dir" .
+            fi
+          done
+
+          # Windows → zip
+          if [ -d "artifacts/forgemax-windows-x86_64" ]; then
+            (cd "artifacts/forgemax-windows-x86_64" && \
+              zip -r "../../release/forgemax-v${VERSION}-windows-x86_64.zip" .)
+          fi
+
+      - name: Generate checksums
+        run: |
+          cd release
+          sha256sum * > SHA256SUMS.txt
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+
+  npm-publish:
+    name: Publish to npm
+    needs: [release]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+      - name: Update npm package version
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          cd npm
+          node -e "
+            const pkg = require('./package.json');
+            pkg.version = '${VERSION}';
+            require('fs').writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
+          "
+      - name: Publish to npm
+        run: cd npm && npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

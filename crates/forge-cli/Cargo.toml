@@ -4,6 +4,15 @@ description = "Forge Code Mode MCP Gateway - CLI entry point"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = true
+keywords = ["mcp", "model-context-protocol", "gateway", "ai", "code-mode"]
+categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "forgemax"
+path = "src/main.rs"
 
 [dependencies]
 forge-server.workspace = true

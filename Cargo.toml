@@ -14,9 +14,15 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
+license = "FSL-1.1-ALv2"
 rust-version = "1.91.1"
-repository = "https://github.com/postrv/forge"
+repository = "https://github.com/postrv/forgemax"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
 
 [workspace.dependencies]
 # Core runtime
@@ -46,8 +52,8 @@ uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 
 # Internal crates
-forge-sandbox = { path = "crates/forge-sandbox" }
-forge-manifest = { path = "crates/forge-manifest" }
-forge-server = { path = "crates/forge-server" }
-forge-client = { path = "crates/forge-client" }
-forge-config = { path = "crates/forge-config" }
+forge-sandbox = { path = "crates/forge-sandbox", version = "0.1.0" }
+forge-manifest = { path = "crates/forge-manifest", version = "0.1.0" }
+forge-server = { path = "crates/forge-server", version = "0.1.0" }
+forge-client = { path = "crates/forge-client", version = "0.1.0" }
+forge-config = { path = "crates/forge-config", version = "0.1.0" }

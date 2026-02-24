@@ -1,0 +1,26 @@
+{
+  "version": "0.1.0",
+  "description": "Code Mode MCP Gateway — collapses N servers x M tools into 2 tools",
+  "homepage": "https://github.com/postrv/forgemax",
+  "license": "FSL-1.1-ALv2",
+  "architecture": {
+    "64bit": {
+      "url": "https://github.com/postrv/forgemax/releases/download/v0.1.0/forgemax-v0.1.0-windows-x86_64.zip",
+      "hash": ""
+    }
+  },
+  "bin": [
+    "forgemax.exe",
+    "forgemax-worker.exe"
+  ],
+  "checkver": {
+    "github": "https://github.com/postrv/forgemax"
+  },
+  "autoupdate": {
+    "architecture": {
+      "64bit": {
+        "url": "https://github.com/postrv/forgemax/releases/download/v$version/forgemax-v$version-windows-x86_64.zip"
+      }
+    }
+  }
+}

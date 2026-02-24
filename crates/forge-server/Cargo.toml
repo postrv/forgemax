@@ -4,6 +4,8 @@ description = "MCP server exposing search() and execute() Code Mode tools"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 forge-sandbox.workspace = true

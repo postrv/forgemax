@@ -47,12 +47,7 @@ impl Default for RouterDispatcher {
 
 #[async_trait::async_trait]
 impl ToolDispatcher for RouterDispatcher {
-    async fn call_tool(
-        &self,
-        server: &str,
-        tool: &str,
-        args: Value,
-    ) -> Result<Value> {
+    async fn call_tool(&self, server: &str, tool: &str, args: Value) -> Result<Value> {
         let client = self.clients.get(server).ok_or_else(|| {
             anyhow::anyhow!(
                 "unknown server '{}', available servers: {:?}",
@@ -90,12 +85,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ToolDispatcher for MockDispatcher {
-        async fn call_tool(
-            &self,
-            server: &str,
-            tool: &str,
-            args: Value,
-        ) -> Result<Value> {
+        async fn call_tool(&self, server: &str, tool: &str, args: Value) -> Result<Value> {
             self.calls
                 .lock()
                 .unwrap()
@@ -114,12 +104,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ToolDispatcher for FailingDispatcher {
-        async fn call_tool(
-            &self,
-            _server: &str,
-            _tool: &str,
-            _args: Value,
-        ) -> Result<Value> {
+        async fn call_tool(&self, _server: &str, _tool: &str, _args: Value) -> Result<Value> {
             Err(anyhow::anyhow!("downstream connection failed"))
         }
     }
@@ -251,9 +236,7 @@ mod tests {
     #[tokio::test]
     async fn router_empty_returns_error() {
         let router = RouterDispatcher::new();
-        let result = router
-            .call_tool("any", "tool", serde_json::json!({}))
-            .await;
+        let result = router.call_tool("any", "tool", serde_json::json!({})).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("unknown server"));
     }

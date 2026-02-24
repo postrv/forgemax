@@ -72,6 +72,13 @@ pub struct WorkerConfig {
     pub max_output_size: usize,
     /// Maximum size of LLM-generated code in bytes.
     pub max_code_size: usize,
+    /// Maximum IPC message size in bytes. Defaults to [`DEFAULT_MAX_IPC_MESSAGE_SIZE`].
+    #[serde(default = "default_max_ipc_message_size")]
+    pub max_ipc_message_size: usize,
+}
+
+fn default_max_ipc_message_size() -> usize {
+    DEFAULT_MAX_IPC_MESSAGE_SIZE
 }
 
 impl From<&crate::SandboxConfig> for WorkerConfig {
@@ -83,6 +90,7 @@ impl From<&crate::SandboxConfig> for WorkerConfig {
             max_tool_call_args_size: config.max_tool_call_args_size,
             max_output_size: config.max_output_size,
             max_code_size: config.max_code_size,
+            max_ipc_message_size: DEFAULT_MAX_IPC_MESSAGE_SIZE,
         }
     }
 }
@@ -112,18 +120,42 @@ pub async fn write_message<T: Serialize, W: AsyncWrite + Unpin>(
 ) -> Result<(), std::io::Error> {
     let payload = serde_json::to_vec(msg)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    let len = payload.len() as u32;
+    let len = u32::try_from(payload.len()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "IPC payload too large: {} bytes (max {} bytes)",
+                payload.len(),
+                u32::MAX
+            ),
+        )
+    })?;
     writer.write_all(&len.to_be_bytes()).await?;
     writer.write_all(&payload).await?;
     writer.flush().await?;
     Ok(())
 }
 
+/// Default maximum IPC message size: 64 MB.
+pub const DEFAULT_MAX_IPC_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
+
 /// Read a length-delimited JSON message from an async reader.
 ///
 /// Returns `None` if the reader has reached EOF (clean shutdown).
+/// Uses [`DEFAULT_MAX_IPC_MESSAGE_SIZE`] as the size limit.
 pub async fn read_message<T: for<'de> Deserialize<'de>, R: AsyncRead + Unpin>(
     reader: &mut R,
+) -> Result<Option<T>, std::io::Error> {
+    read_message_with_limit(reader, DEFAULT_MAX_IPC_MESSAGE_SIZE).await
+}
+
+/// Read a length-delimited JSON message with a configurable size limit.
+///
+/// Returns `None` if the reader has reached EOF (clean shutdown).
+/// The `max_size` parameter controls the maximum allowed message size in bytes.
+pub async fn read_message_with_limit<T: for<'de> Deserialize<'de>, R: AsyncRead + Unpin>(
+    reader: &mut R,
+    max_size: usize,
 ) -> Result<Option<T>, std::io::Error> {
     let mut len_buf = [0u8; 4];
     match reader.read_exact(&mut len_buf).await {
@@ -134,11 +166,14 @@ pub async fn read_message<T: for<'de> Deserialize<'de>, R: AsyncRead + Unpin>(
 
     let len = u32::from_be_bytes(len_buf) as usize;
 
-    // Sanity check: reject messages larger than 64 MB
-    if len > 64 * 1024 * 1024 {
+    // Reject messages exceeding the configured limit
+    if len > max_size {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("IPC message too large: {} bytes", len),
+            format!(
+                "IPC message too large: {} bytes (limit: {} bytes)",
+                len, max_size
+            ),
         ));
     }
 
@@ -167,6 +202,7 @@ mod tests {
                 max_tool_call_args_size: 1024 * 1024,
                 max_output_size: 1024 * 1024,
                 max_code_size: 64 * 1024,
+                max_ipc_message_size: DEFAULT_MAX_IPC_MESSAGE_SIZE,
             },
         };
 
@@ -177,7 +213,11 @@ mod tests {
         let decoded: ParentMessage = read_message(&mut cursor).await.unwrap().unwrap();
 
         match decoded {
-            ParentMessage::Execute { code, manifest, config } => {
+            ParentMessage::Execute {
+                code,
+                manifest,
+                config,
+            } => {
                 assert_eq!(code, "async () => { return 42; }");
                 assert!(manifest.is_some());
                 assert_eq!(config.timeout_ms, 5000);
@@ -246,7 +286,12 @@ mod tests {
         let decoded: ChildMessage = read_message(&mut cursor).await.unwrap().unwrap();
 
         match decoded {
-            ChildMessage::ToolCallRequest { request_id, server, tool, args } => {
+            ChildMessage::ToolCallRequest {
+                request_id,
+                server,
+                tool,
+                args,
+            } => {
                 assert_eq!(request_id, 1);
                 assert_eq!(server, "narsil");
                 assert_eq!(tool, "ast.parse");
@@ -298,7 +343,9 @@ mod tests {
 
     #[tokio::test]
     async fn multiple_messages_in_stream() {
-        let msg1 = ChildMessage::Log { message: "first".into() };
+        let msg1 = ChildMessage::Log {
+            message: "first".into(),
+        };
         let msg2 = ChildMessage::ToolCallRequest {
             request_id: 1,
             server: "s".into(),
@@ -329,10 +376,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execution_complete_error_roundtrip() {
+        let msg = ChildMessage::ExecutionComplete {
+            result: Err("failed to create tokio runtime: resource unavailable".into()),
+        };
+
+        let mut buf = Vec::new();
+        write_message(&mut buf, &msg).await.unwrap();
+
+        let mut cursor = Cursor::new(buf);
+        let decoded: ChildMessage = read_message(&mut cursor).await.unwrap().unwrap();
+
+        match decoded {
+            ChildMessage::ExecutionComplete { result } => {
+                let err = result.unwrap_err();
+                assert!(
+                    err.contains("tokio runtime"),
+                    "expected runtime error: {err}"
+                );
+            }
+            other => panic!("expected ExecutionComplete, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
     async fn eof_returns_none() {
         let mut cursor = Cursor::new(Vec::<u8>::new());
         let result: Option<ParentMessage> = read_message(&mut cursor).await.unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn u32_try_from_overflow() {
+        // Validates that the conversion logic correctly rejects sizes > u32::MAX
+        let overflow_size = u32::MAX as usize + 1;
+        assert!(u32::try_from(overflow_size).is_err());
+    }
+
+    #[tokio::test]
+    async fn write_message_normal_size_succeeds() {
+        // Regression guard: normal-sized messages still work after the try_from change
+        let msg = ChildMessage::Log {
+            message: "a".repeat(1024),
+        };
+        let mut buf = Vec::new();
+        write_message(&mut buf, &msg).await.unwrap();
+        assert!(buf.len() > 1024);
     }
 
     #[tokio::test]
@@ -367,5 +456,52 @@ mod tests {
         assert_eq!(sandbox.max_heap_size, back.max_heap_size);
         assert_eq!(sandbox.max_tool_calls, back.max_tool_calls);
         assert_eq!(sandbox.max_output_size, back.max_output_size);
+        assert_eq!(worker.max_ipc_message_size, DEFAULT_MAX_IPC_MESSAGE_SIZE);
+    }
+
+    #[tokio::test]
+    async fn read_message_with_limit_rejects_oversized() {
+        let msg = ChildMessage::Log {
+            message: "x".repeat(1024),
+        };
+        let mut buf = Vec::new();
+        write_message(&mut buf, &msg).await.unwrap();
+
+        // Set limit smaller than the message payload
+        let mut cursor = Cursor::new(buf);
+        let result: Result<Option<ChildMessage>, _> =
+            read_message_with_limit(&mut cursor, 64).await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("too large"), "error: {err_msg}");
+    }
+
+    #[tokio::test]
+    async fn read_message_with_limit_accepts_within_limit() {
+        let msg = ChildMessage::Log {
+            message: "hello".into(),
+        };
+        let mut buf = Vec::new();
+        write_message(&mut buf, &msg).await.unwrap();
+
+        let mut cursor = Cursor::new(buf);
+        let result: Option<ChildMessage> =
+            read_message_with_limit(&mut cursor, 1024).await.unwrap();
+        assert!(result.is_some());
+    }
+
+    #[tokio::test]
+    async fn worker_config_ipc_limit_serde_default() {
+        // Deserializing JSON without max_ipc_message_size should use the default
+        let json = r#"{
+            "timeout_ms": 5000,
+            "max_heap_size": 67108864,
+            "max_tool_calls": 50,
+            "max_tool_call_args_size": 1048576,
+            "max_output_size": 1048576,
+            "max_code_size": 65536
+        }"#;
+        let config: WorkerConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.max_ipc_message_size, DEFAULT_MAX_IPC_MESSAGE_SIZE);
     }
 }

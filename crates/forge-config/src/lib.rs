@@ -58,6 +58,25 @@ pub struct ForgeConfig {
     /// Sandbox execution settings.
     #[serde(default)]
     pub sandbox: SandboxOverrides,
+
+    /// Server group definitions for cross-server data flow policies.
+    #[serde(default)]
+    pub groups: HashMap<String, GroupConfig>,
+}
+
+/// Configuration for a server group.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GroupConfig {
+    /// Server names belonging to this group.
+    pub servers: Vec<String>,
+
+    /// Isolation mode: "strict" (no cross-group data flow) or "open" (unrestricted).
+    #[serde(default = "default_isolation")]
+    pub isolation: String,
+}
+
+fn default_isolation() -> String {
+    "open".to_string()
 }
 
 /// Configuration for a single downstream MCP server.
@@ -85,6 +104,22 @@ pub struct ServerConfig {
     /// Server description (optional, for manifest).
     #[serde(default)]
     pub description: Option<String>,
+
+    /// Per-server timeout in seconds for individual tool calls.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+
+    /// Enable circuit breaker for this server.
+    #[serde(default)]
+    pub circuit_breaker: Option<bool>,
+
+    /// Number of consecutive failures before opening the circuit (default: 3).
+    #[serde(default)]
+    pub failure_threshold: Option<u32>,
+
+    /// Seconds to wait before probing a tripped circuit (default: 30).
+    #[serde(default)]
+    pub recovery_timeout_secs: Option<u64>,
 }
 
 /// Sandbox configuration overrides.
@@ -164,6 +199,40 @@ impl ForgeConfig {
                 }
             }
         }
+
+        // Validate groups
+        let mut seen_servers: HashMap<&str, &str> = HashMap::new();
+        for (group_name, group_config) in &self.groups {
+            // Validate isolation mode
+            match group_config.isolation.as_str() {
+                "strict" | "open" => {}
+                other => {
+                    return Err(ConfigError::Invalid(format!(
+                        "group '{}': unsupported isolation '{}', supported: strict, open",
+                        group_name, other
+                    )));
+                }
+            }
+
+            for server_ref in &group_config.servers {
+                // Check server exists
+                if !self.servers.contains_key(server_ref) {
+                    return Err(ConfigError::Invalid(format!(
+                        "group '{}': references unknown server '{}'",
+                        group_name, server_ref
+                    )));
+                }
+                // Check no server in multiple groups
+                if let Some(existing_group) = seen_servers.get(server_ref.as_str()) {
+                    return Err(ConfigError::Invalid(format!(
+                        "server '{}' is in multiple groups: '{}' and '{}'",
+                        server_ref, existing_group, group_name
+                    )));
+                }
+                seen_servers.insert(server_ref, group_name);
+            }
+        }
+
         Ok(())
     }
 }
@@ -277,8 +346,14 @@ mod tests {
 
         let err = ForgeConfig::from_toml(toml).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("grpc"), "error should mention the transport: {msg}");
-        assert!(msg.contains("stdio"), "error should mention supported transports: {msg}");
+        assert!(
+            msg.contains("grpc"),
+            "error should mention the transport: {msg}"
+        );
+        assert!(
+            msg.contains("stdio"),
+            "error should mention supported transports: {msg}"
+        );
     }
 
     #[test]
@@ -320,7 +395,10 @@ mod tests {
 
         let config = ForgeConfig::from_file(&path).unwrap();
         assert_eq!(config.servers.len(), 1);
-        assert_eq!(config.servers["test"].command.as_deref(), Some("test-server"));
+        assert_eq!(
+            config.servers["test"].command.as_deref(),
+            Some("test-server")
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -406,7 +484,159 @@ mod tests {
         "#;
 
         let config = ForgeConfig::from_toml(toml).unwrap();
-        assert_eq!(config.sandbox.execution_mode.as_deref(), Some("child_process"));
+        assert_eq!(
+            config.sandbox.execution_mode.as_deref(),
+            Some("child_process")
+        );
+    }
+
+    #[test]
+    fn config_parses_groups() {
+        let toml = r#"
+            [servers.vault]
+            command = "vault-mcp"
+            transport = "stdio"
+
+            [servers.slack]
+            command = "slack-mcp"
+            transport = "stdio"
+
+            [groups.internal]
+            servers = ["vault"]
+            isolation = "strict"
+
+            [groups.external]
+            servers = ["slack"]
+            isolation = "open"
+        "#;
+
+        let config = ForgeConfig::from_toml(toml).unwrap();
+        assert_eq!(config.groups.len(), 2);
+        assert_eq!(config.groups["internal"].isolation, "strict");
+        assert_eq!(config.groups["external"].servers, vec!["slack"]);
+    }
+
+    #[test]
+    fn config_groups_default_to_empty() {
+        let toml = r#"
+            [servers.test]
+            command = "test"
+            transport = "stdio"
+        "#;
+        let config = ForgeConfig::from_toml(toml).unwrap();
+        assert!(config.groups.is_empty());
+    }
+
+    #[test]
+    fn config_rejects_group_with_unknown_server() {
+        let toml = r#"
+            [servers.real]
+            command = "real"
+            transport = "stdio"
+
+            [groups.bad]
+            servers = ["nonexistent"]
+        "#;
+        let err = ForgeConfig::from_toml(toml).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("nonexistent"), "should mention server: {msg}");
+        assert!(msg.contains("unknown"), "should say unknown: {msg}");
+    }
+
+    #[test]
+    fn config_rejects_server_in_multiple_groups() {
+        let toml = r#"
+            [servers.shared]
+            command = "shared"
+            transport = "stdio"
+
+            [groups.a]
+            servers = ["shared"]
+
+            [groups.b]
+            servers = ["shared"]
+        "#;
+        let err = ForgeConfig::from_toml(toml).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("shared"), "should mention server: {msg}");
+        assert!(
+            msg.contains("multiple groups"),
+            "should say multiple groups: {msg}"
+        );
+    }
+
+    #[test]
+    fn config_rejects_invalid_isolation_mode() {
+        let toml = r#"
+            [servers.test]
+            command = "test"
+            transport = "stdio"
+
+            [groups.bad]
+            servers = ["test"]
+            isolation = "paranoid"
+        "#;
+        let err = ForgeConfig::from_toml(toml).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("paranoid"), "should mention mode: {msg}");
+    }
+
+    #[test]
+    fn config_parses_server_timeout() {
+        let toml = r#"
+            [servers.slow]
+            command = "slow-mcp"
+            transport = "stdio"
+            timeout_secs = 30
+        "#;
+
+        let config = ForgeConfig::from_toml(toml).unwrap();
+        assert_eq!(config.servers["slow"].timeout_secs, Some(30));
+    }
+
+    #[test]
+    fn config_server_timeout_defaults_to_none() {
+        let toml = r#"
+            [servers.fast]
+            command = "fast-mcp"
+            transport = "stdio"
+        "#;
+
+        let config = ForgeConfig::from_toml(toml).unwrap();
+        assert!(config.servers["fast"].timeout_secs.is_none());
+    }
+
+    #[test]
+    fn config_parses_circuit_breaker() {
+        let toml = r#"
+            [servers.flaky]
+            command = "flaky-mcp"
+            transport = "stdio"
+            circuit_breaker = true
+            failure_threshold = 5
+            recovery_timeout_secs = 60
+        "#;
+
+        let config = ForgeConfig::from_toml(toml).unwrap();
+        let flaky = &config.servers["flaky"];
+        assert_eq!(flaky.circuit_breaker, Some(true));
+        assert_eq!(flaky.failure_threshold, Some(5));
+        assert_eq!(flaky.recovery_timeout_secs, Some(60));
+    }
+
+    #[test]
+    fn config_circuit_breaker_defaults_to_none() {
+        let toml = r#"
+            [servers.stable]
+            command = "stable-mcp"
+            transport = "stdio"
+        "#;
+
+        let config = ForgeConfig::from_toml(toml).unwrap();
+        let stable = &config.servers["stable"];
+        assert!(stable.circuit_breaker.is_none());
+        assert!(stable.failure_threshold.is_none());
+        assert!(stable.recovery_timeout_secs.is_none());
     }
 
     #[test]

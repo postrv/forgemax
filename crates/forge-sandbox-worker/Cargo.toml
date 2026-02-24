@@ -4,9 +4,11 @@ description = "Isolated V8 sandbox worker process for Forge"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [[bin]]
-name = "forge-sandbox-worker"
+name = "forgemax-worker"
 path = "src/main.rs"
 
 [dependencies]

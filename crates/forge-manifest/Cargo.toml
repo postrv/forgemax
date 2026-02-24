@@ -4,6 +4,8 @@ description = "Hierarchical capability manifest for Code Mode tool discovery"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 serde.workspace = true
