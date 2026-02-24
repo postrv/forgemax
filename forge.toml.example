@@ -1,0 +1,136 @@
+# Forge — Default Configuration
+#
+# Copy this file to forge.toml and fill in your tokens:
+#   cp forge.toml.example forge.toml
+#
+# Environment variables are expanded: ${VAR_NAME}
+# Protect forge.toml with appropriate file permissions — it may contain secrets.
+#
+# Only uncomment the servers you actually use. Each server you enable adds
+# tools to the gateway but costs nothing in LLM context (Forge keeps it to
+# ~1,000 tokens regardless of how many servers are connected).
+
+# ─── Code Intelligence ────────────────────────────────────────────────
+
+[servers.narsil]
+command = "narsil-mcp"
+args = ["--repos", "."]
+transport = "stdio"
+timeout_secs = 30
+
+# ─── Developer Tools ─────────────────────────────────────────────────
+
+[servers.github]
+# Official GitHub MCP server (Go binary via Docker)
+# Get a token: https://github.com/settings/tokens
+command = "docker"
+args = ["run", "-i", "--rm", "-e", "GITHUB_PERSONAL_ACCESS_TOKEN", "ghcr.io/github/github-mcp-server"]
+transport = "stdio"
+timeout_secs = 30
+env = { GITHUB_PERSONAL_ACCESS_TOKEN = "${GITHUB_TOKEN}" }
+
+[servers.playwright]
+# Browser automation — no auth required
+# https://github.com/microsoft/playwright-mcp
+command = "npx"
+args = ["@playwright/mcp@latest", "--headless"]
+transport = "stdio"
+timeout_secs = 60
+
+[servers.sentry]
+# Error monitoring — https://docs.sentry.io/product/sentry-mcp/
+# Get a token: https://sentry.io/settings/account/api/auth-tokens/
+command = "npx"
+args = ["@sentry/mcp-server@latest", "--access-token", "${SENTRY_AUTH_TOKEN}"]
+transport = "stdio"
+timeout_secs = 15
+
+# ─── Cloud Platforms ─────────────────────────────────────────────────
+
+[servers.cloudflare]
+# Cloudflare API — authenticates via OAuth on first connection
+# https://developers.cloudflare.com/agents/model-context-protocol/
+url = "https://mcp.cloudflare.com/sse"
+transport = "sse"
+timeout_secs = 30
+
+[servers.supabase]
+# Database, auth, edge functions, storage
+# Get a token: https://supabase.com/dashboard/account/tokens
+# https://supabase.com/docs/guides/getting-started/mcp
+command = "npx"
+args = ["-y", "@supabase/mcp-server-supabase@latest", "--access-token", "${SUPABASE_ACCESS_TOKEN}"]
+transport = "stdio"
+timeout_secs = 30
+
+# ─── Productivity & Design ───────────────────────────────────────────
+
+[servers.notion]
+# Knowledge base and docs
+# Create an integration: https://www.notion.so/my-integrations
+# https://developers.notion.com/docs/mcp
+command = "npx"
+args = ["-y", "@notionhq/notion-mcp-server"]
+transport = "stdio"
+timeout_secs = 15
+env = { OPENAPI_MCP_HEADERS = "{\"Authorization\":\"Bearer ${NOTION_TOKEN}\",\"Notion-Version\":\"2022-06-28\"}" }
+
+[servers.figma]
+# Design file access — authenticates via OAuth
+# https://developers.figma.com/docs/figma-mcp-server
+url = "https://mcp.figma.com/sse"
+transport = "sse"
+timeout_secs = 30
+
+# ─── Payments ────────────────────────────────────────────────────────
+
+[servers.stripe]
+# Payments API — https://docs.stripe.com/mcp
+# Get a key: https://dashboard.stripe.com/apikeys
+command = "npx"
+args = ["-y", "@stripe/mcp", "--api-key", "${STRIPE_SECRET_KEY}"]
+transport = "stdio"
+timeout_secs = 15
+
+# ─── Project Management ─────────────────────────────────────────────
+
+[servers.linear]
+# Issue tracking — authenticates via OAuth
+# https://linear.app/docs/mcp
+url = "https://mcp.linear.app/sse"
+transport = "sse"
+timeout_secs = 15
+
+[servers.atlassian]
+# Jira + Confluence — authenticates via OAuth
+# https://www.atlassian.com/platform/remote-mcp-server
+url = "https://mcp.atlassian.com/v1/sse"
+transport = "sse"
+timeout_secs = 30
+
+# ─── Sandbox Settings ────────────────────────────────────────────────
+
+[sandbox]
+timeout_secs = 5
+max_heap_mb = 64
+max_concurrent = 8
+max_tool_calls = 50
+execution_mode = "child_process"
+
+# ─── Server Groups (optional) ────────────────────────────────────────
+#
+# Uncomment to enforce strict data-flow isolation between server groups.
+# Servers in a "strict" group cannot share data with servers in other
+# strict groups within a single execute() call.
+#
+# [groups.internal]
+# servers = ["supabase"]
+# isolation = "strict"
+#
+# [groups.external]
+# servers = ["notion", "linear", "atlassian"]
+# isolation = "strict"
+#
+# [groups.tools]
+# servers = ["narsil", "playwright", "github", "sentry"]
+# isolation = "open"

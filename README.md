@@ -87,44 +87,74 @@ cargo test --workspace
 
 ### Configuration
 
-Create `forge.toml` in your working directory:
+Copy the example config and add your tokens:
+
+```bash
+cp forge.toml.example forge.toml
+```
+
+The example includes pre-configured connections for 11 reputable MCP servers:
+
+| Server | Company | Transport | Auth |
+|--------|---------|-----------|------|
+| narsil | — | stdio | None |
+| github | GitHub | stdio (Docker) | Personal access token |
+| playwright | Microsoft | stdio (npx) | None |
+| sentry | Sentry | stdio (npx) | Auth token |
+| cloudflare | Cloudflare | SSE | OAuth |
+| supabase | Supabase | stdio (npx) | Access token |
+| notion | Notion | stdio (npx) | Integration token |
+| figma | Figma | SSE | OAuth |
+| stripe | Stripe | stdio (npx) | Secret key |
+| linear | Linear | SSE | OAuth |
+| atlassian | Atlassian | SSE | OAuth |
+
+Uncomment only the servers you need. Environment variables are expanded (`${GITHUB_TOKEN}`).
+
+<details>
+<summary>Minimal config (narsil only)</summary>
 
 ```toml
 [servers.narsil]
 command = "narsil-mcp"
 args = ["--repos", "."]
 transport = "stdio"
-timeout_secs = 30           # per-server timeout
-circuit_breaker = true       # open circuit after consecutive failures
-failure_threshold = 3        # failures before opening
-recovery_timeout_secs = 60   # seconds before probing again
-
-[servers.github]
-url = "https://mcp.github.com/sse"
-transport = "sse"
-headers = { Authorization = "Bearer ${GITHUB_TOKEN}" }
-timeout_secs = 10
 
 [sandbox]
 timeout_secs = 5
 max_heap_mb = 64
-max_concurrent = 8
-max_tool_calls = 50
-execution_mode = "child_process"  # or "in_process" (default)
+execution_mode = "child_process"
+```
+</details>
 
-# Optional: cross-server data flow isolation
+<details>
+<summary>Advanced options</summary>
+
+```toml
+# Per-server resilience
+[servers.narsil]
+command = "narsil-mcp"
+args = ["--repos", "."]
+transport = "stdio"
+timeout_secs = 30
+circuit_breaker = true
+failure_threshold = 3
+recovery_timeout_secs = 60
+
+# Cross-server data flow isolation
 [groups.internal]
-servers = ["vault", "database"]
-isolation = "strict"          # cannot flow data to other groups
-
-[groups.external]
-servers = ["slack", "github"]
+servers = ["supabase"]
 isolation = "strict"
 
-[groups.analysis]
-servers = ["narsil", "arbiter"]
-isolation = "open"            # can interact with any group
+[groups.external]
+servers = ["notion", "linear", "atlassian"]
+isolation = "strict"
+
+[groups.tools]
+servers = ["narsil", "playwright", "github"]
+isolation = "open"
 ```
+</details>
 
 ## How It Works
 
