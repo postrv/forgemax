@@ -12,7 +12,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "FSL-1.1-ALv2"
 rust-version = "1.91.1"
@@ -52,8 +52,8 @@ uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 
 # Internal crates
-forge-sandbox = { path = "crates/forge-sandbox", version = "0.1.0" }
-forge-manifest = { path = "crates/forge-manifest", version = "0.1.0" }
-forge-server = { path = "crates/forge-server", version = "0.1.0" }
-forge-client = { path = "crates/forge-client", version = "0.1.0" }
-forge-config = { path = "crates/forge-config", version = "0.1.0" }
+forge-sandbox = { path = "crates/forge-sandbox", version = "0.1.1" }
+forge-manifest = { path = "crates/forge-manifest", version = "0.1.1" }
+forge-server = { path = "crates/forge-server", version = "0.1.1" }
+forge-client = { path = "crates/forge-client", version = "0.1.1" }
+forge-config = { path = "crates/forge-config", version = "0.1.1" }

@@ -1,6 +1,6 @@
 {
   "name": "forgemax",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Code Mode MCP Gateway — collapses N servers x M tools into 2 tools",
   "keywords": [
     "mcp",
