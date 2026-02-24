@@ -1,4 +1,4 @@
-//! Full-stack integration tests for the Forge Code Mode Gateway.
+//! Full-stack integration tests for the Forgemax Code Mode Gateway.
 //!
 //! These tests exercise the complete pipeline:
 //! ForgeServer -> SandboxExecutor -> V8 -> ops -> ToolDispatcher

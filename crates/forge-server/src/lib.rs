@@ -2,7 +2,7 @@
 
 //! # forge-server
 //!
-//! MCP server for the Forge Code Mode Gateway.
+//! MCP server for the Forgemax Code Mode Gateway.
 //!
 //! Exposes exactly two tools to agents:
 //! - `search` — query the capability manifest to discover tools
@@ -175,7 +175,7 @@ impl ServerHandler for ForgeServer {
         ServerInfo {
             capabilities: ServerCapabilities::builder().enable_tools().build(),
             instructions: Some(format!(
-                "Forge Code Mode Gateway ({stats}). \
+                "Forgemax Code Mode Gateway ({stats}). \
                  Use search() to discover available tools, then execute() to call them.\n\
                  \n\
                  Both tools take a `code` parameter containing a JavaScript async arrow function.\n\

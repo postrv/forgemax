@@ -152,10 +152,10 @@ main() {
   echo "  2. Configure your MCP client (Claude Desktop, Cursor, VS Code):"
   echo ""
   echo "     Claude Desktop (~/.claude/claude_desktop_config.json):"
-  echo '     { "mcpServers": { "forge": { "command": "forgemax" } } }'
+  echo '     { "mcpServers": { "forgemax": { "command": "forgemax" } } }'
   echo ""
   echo "     VS Code / Cursor (.mcp.json):"
-  echo '     { "servers": { "forge": { "command": "forgemax", "type": "stdio" } } }'
+  echo '     { "servers": { "forgemax": { "command": "forgemax", "type": "stdio" } } }'
   echo ""
 }
 

@@ -109,10 +109,10 @@ function Install-Forgemax {
     Write-Host "  2. Configure your MCP client:"
     Write-Host ""
     Write-Host "     Claude Desktop (%APPDATA%\Claude\claude_desktop_config.json):"
-    Write-Host '     { "mcpServers": { "forge": { "command": "forgemax" } } }'
+    Write-Host '     { "mcpServers": { "forgemax": { "command": "forgemax" } } }'
     Write-Host ""
     Write-Host "     VS Code / Cursor (.mcp.json):"
-    Write-Host '     { "servers": { "forge": { "command": "forgemax", "type": "stdio" } } }'
+    Write-Host '     { "servers": { "forgemax": { "command": "forgemax", "type": "stdio" } } }'
     Write-Host ""
 }
 

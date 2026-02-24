@@ -1,10 +1,10 @@
-# Forge Architecture — Security Considerations
+# Forgemax Architecture — Security Considerations
 
 ## Cross-Server Isolation
 
 ### The Problem
 
-Forge collapses N MCP servers into a single sandbox execution context. When an LLM writes `execute()` code, it can call tools on _any_ connected server within the same JavaScript execution:
+Forgemax collapses N MCP servers into a single sandbox execution context. When an LLM writes `execute()` code, it can call tools on _any_ connected server within the same JavaScript execution:
 
 ```javascript
 async () => {
@@ -32,7 +32,7 @@ This is fundamentally an **authorization design question**, not a bug. Consider 
 
 ### Design Decision: Trust the LLM, Constrain the Blast Radius
 
-Forge's position: **the LLM is the user's agent**. If the user connects both a vault server and a Slack server, they are implicitly granting the LLM access to both. Restricting cross-server calls would break the core value proposition — multi-tool chaining in a single execution.
+Forgemax's position: **the LLM is the user's agent**. If the user connects both a vault server and a Slack server, they are implicitly granting the LLM access to both. Restricting cross-server calls would break the core value proposition — multi-tool chaining in a single execution.
 
 However, we can provide **opt-in isolation** for security-conscious deployments:
 
@@ -93,14 +93,14 @@ Timeouts trip the circuit breaker (a timeout is a failure), so a persistently sl
 
 Security best practice says: **never expose internal error details to untrusted consumers** — stack traces, file paths, database schemas, and connection strings are all information that aids attackers.
 
-But Forge's consumer is an LLM that needs to **self-correct**. A redacted error like `"tool call failed"` gives the LLM nothing to work with. A verbose error like `"narsil: symbol 'handleRequet' not found, did you mean 'handleRequest'?"` lets it fix the typo and retry.
+But Forgemax's consumer is an LLM that needs to **self-correct**. A redacted error like `"tool call failed"` gives the LLM nothing to work with. A verbose error like `"narsil: symbol 'handleRequet' not found, did you mean 'handleRequest'?"` lets it fix the typo and retry.
 
 ### Design Decision: Layered Redaction
 
 Errors flow through three layers, each with different redaction needs:
 
 ```
-Downstream Server  →  Forge Gateway  →  LLM (via MCP)  →  User
+Downstream Server  →  Forgemax Gateway  →  LLM (via MCP)  →  User
 ```
 
 **Layer 1: Downstream → Gateway** (internal, full detail)
@@ -112,7 +112,7 @@ No redaction. The gateway needs full error context for logging and debugging. Th
 This is where the balance matters. The LLM needs enough to self-correct, but we should strip:
 
 - **Connection strings and URLs**: Replace with server name (`"server 'narsil' is unreachable"` not `"connection refused: 127.0.0.1:9876"`)
-- **File system paths on the gateway host**: The LLM doesn't need to know where Forge is installed
+- **File system paths on the gateway host**: The LLM doesn't need to know where Forgemax is installed
 - **Stack traces**: Replace with the top-level error message only
 - **Credentials in error context**: Should never appear, but strip patterns like `Bearer ...`, API keys
 
@@ -180,7 +180,7 @@ Legend: WU = warm-up, C = code review, SR = security review, Phase = implementat
 
 ## Deployment Checklist
 
-Before connecting Forge to untrusted or external MCP servers:
+Before connecting Forgemax to untrusted or external MCP servers:
 
 - [ ] Use `execution_mode = "child_process"` (OS-level isolation)
 - [ ] Set `timeout_secs` per server (30s for security tools, 5s for simple lookups)

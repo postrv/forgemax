@@ -2,7 +2,7 @@
 
 //! # forge-client
 //!
-//! MCP client connections to downstream servers for the Forge Code Mode Gateway.
+//! MCP client connections to downstream servers for the Forgemax Code Mode Gateway.
 //!
 //! Provides [`McpClient`] for connecting to individual MCP servers over stdio
 //! or HTTP transports, and [`RouterDispatcher`] for routing tool calls to the

@@ -2,7 +2,7 @@
 
 //! # forge-sandbox
 //!
-//! V8 sandbox for the Forge Code Mode Gateway.
+//! V8 sandbox for the Forgemax Code Mode Gateway.
 //!
 //! Executes LLM-generated JavaScript in a deno_core isolate with no filesystem,
 //! network, or environment access. The only bridge to the host is through

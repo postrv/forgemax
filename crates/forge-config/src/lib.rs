@@ -2,7 +2,7 @@
 
 //! # forge-config
 //!
-//! Configuration loading for the Forge Code Mode MCP Gateway.
+//! Configuration loading for the Forgemax Code Mode MCP Gateway.
 //!
 //! Supports TOML configuration files with environment variable expansion.
 //!

@@ -155,7 +155,7 @@ Quick start:
   2. Add to your MCP client config:
      {
        "mcpServers": {
-         "forge": {
+         "forgemax": {
            "command": "forgemax",
            "args": []
          }

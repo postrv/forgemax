@@ -1,6 +1,6 @@
 [package]
 name = "forge-config"
-description = "Configuration loading for Forge Code Mode MCP Gateway"
+description = "Configuration loading for Forgemax Code Mode MCP Gateway"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -2,7 +2,7 @@
 
 //! # forge-manifest
 //!
-//! Hierarchical capability manifest for the Forge Code Mode Gateway.
+//! Hierarchical capability manifest for the Forgemax Code Mode Gateway.
 //!
 //! The manifest is the queryable index of all tools across all connected MCP
 //! servers. It lives in the V8 sandbox (not the LLM context window), enabling

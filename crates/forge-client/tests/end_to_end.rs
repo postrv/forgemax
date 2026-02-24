@@ -1,4 +1,4 @@
-//! End-to-end integration tests for the Forge Code Mode Gateway.
+//! End-to-end integration tests for the Forgemax Code Mode Gateway.
 //!
 //! These tests spawn a real mock MCP server (forge-test-server) as a child
 //! process, connect to it via McpClient, build a manifest from live tool

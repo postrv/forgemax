@@ -1,6 +1,6 @@
 [package]
 name = "forge-cli"
-description = "Forge Code Mode MCP Gateway - CLI entry point"
+description = "Forgemax Code Mode MCP Gateway - CLI entry point"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

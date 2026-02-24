@@ -1,6 +1,6 @@
 #![warn(missing_docs)]
 
-//! Forge Code Mode MCP Gateway
+//! Forgemax Code Mode MCP Gateway
 //!
 //! Give your agent every tool. Use 1,000 tokens.
 
@@ -193,7 +193,7 @@ async fn main() -> Result<()> {
     tracing::info!(
         servers = manifest.total_servers(),
         tools = manifest.total_tools(),
-        "Forge Code Mode Gateway starting"
+        "Forgemax Code Mode Gateway starting"
     );
 
     // Build group policy if groups are configured

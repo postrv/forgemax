@@ -1,19 +1,19 @@
-# Forge
+# Forgemax
 
 **Code Mode MCP Gateway** — collapses N servers x M tools into 2 tools (~1,000 tokens).
 
-Instead of dumping every tool schema into the LLM's context window, Forge exposes exactly two MCP tools:
+Instead of dumping every tool schema into the LLM's context window, Forgemax exposes exactly two MCP tools:
 
 - **`search`** — query a capability manifest to discover tools (read-only, sandboxed)
 - **`execute`** — run JavaScript against the tool API in a sandboxed V8 isolate
 
 The LLM writes JavaScript that calls through typed proxy objects. Credentials, file paths, and internal state never leave the host — the sandbox only sees opaque bindings.
 
-Forge's Code Mode approach draws inspiration from [Cloudflare's sandbox tool-calling pattern](https://blog.cloudflare.com/code-mode/) — their implementation of sandboxed code execution for MCP tool orchestration is excellent and well worth studying. We encourage supporting their work.
+Forgemax's Code Mode approach draws inspiration from [Cloudflare's sandbox tool-calling pattern](https://blog.cloudflare.com/code-mode/) — their implementation of sandboxed code execution for MCP tool orchestration is excellent and well worth studying. We encourage supporting their work.
 
 ## Why
 
-| Traditional MCP | Forge Code Mode |
+| Traditional MCP | Forgemax Code Mode |
 |---|---|
 | 76 tools = ~15,000 tokens of schema | 2 tools = ~1,000 tokens |
 | 5-10 sequential round-trips | 1 `execute()` call with chaining |
@@ -309,4 +309,4 @@ cargo test --workspace
 
 [FSL-1.1-ALv2](LICENSE) — Functional Source License, Version 1.1, with Apache License 2.0 future grant.
 
-You can use, modify, and redistribute Forge for any purpose **except** offering a competing commercial product or service. After two years from each release, that version converts to Apache 2.0.
+You can use, modify, and redistribute Forgemax for any purpose **except** offering a competing commercial product or service. After two years from each release, that version converts to Apache 2.0.
