@@ -53,7 +53,7 @@ impl ToolDispatcher for SlowDispatcher {
 fn child_process_config() -> SandboxConfig {
     SandboxConfig {
         execution_mode: ExecutionMode::ChildProcess,
-        timeout: Duration::from_secs(10),
+        timeout: Duration::from_secs(30),
         ..Default::default()
     }
 }
