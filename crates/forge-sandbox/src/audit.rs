@@ -314,7 +314,7 @@ mod tests {
     #[test]
     fn code_preview_all_emoji() {
         // 200 × U+1F600 (4 bytes each) = 800 bytes
-        let code: String = std::iter::repeat('\u{1F600}').take(200).collect();
+        let code: String = "\u{1F600}".repeat(200);
         let preview = code_preview(&code);
         assert!(preview.ends_with("..."));
         // Verify valid UTF-8 (would panic on invalid)
@@ -331,7 +331,7 @@ mod tests {
     #[test]
     fn code_preview_cjk_boundary() {
         // CJK chars are 3 bytes each: 167 × 3 = 501 bytes, crosses 500
-        let code: String = std::iter::repeat('\u{4E00}').take(200).collect(); // 600 bytes
+        let code: String = "\u{4E00}".repeat(200); // 600 bytes
         let preview = code_preview(&code);
         assert!(preview.ends_with("..."));
         // Verify valid UTF-8
