@@ -148,11 +148,7 @@ impl ForgeServer {
             None => self.dispatcher.clone(),
         };
 
-        match self
-            .executor
-            .execute_code(&input.code, dispatcher)
-            .await
-        {
+        match self.executor.execute_code(&input.code, dispatcher).await {
             Ok(result) => {
                 let json = serde_json::to_string_pretty(&result)
                     .map_err(|e| format!("result serialization failed: {e}"))?;

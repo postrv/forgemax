@@ -219,9 +219,7 @@ mod tests {
     async fn passes_through_on_success() {
         let inner = Arc::new(OkDispatcher);
         let cb = CircuitBreakerDispatcher::new(inner, test_config(3, 1000), "test");
-        let result = cb
-            .call_tool("test", "echo", serde_json::json!({}))
-            .await;
+        let result = cb.call_tool("test", "echo", serde_json::json!({})).await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap()["status"], "ok");
     }
@@ -233,21 +231,21 @@ mod tests {
 
         // 3 failures to trip the breaker
         for _ in 0..3 {
-            let _ = cb
-                .call_tool("flaky", "tool", serde_json::json!({}))
-                .await;
+            let _ = cb.call_tool("flaky", "tool", serde_json::json!({})).await;
         }
         assert_eq!(inner.call_count(), 3);
 
         // 4th call should be rejected without reaching inner
-        let result = cb
-            .call_tool("flaky", "tool", serde_json::json!({}))
-            .await;
+        let result = cb.call_tool("flaky", "tool", serde_json::json!({})).await;
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("circuit breaker open"), "got: {msg}");
         assert!(msg.contains("flaky"), "should mention server: {msg}");
-        assert_eq!(inner.call_count(), 3, "inner should not be called when open");
+        assert_eq!(
+            inner.call_count(),
+            3,
+            "inner should not be called when open"
+        );
     }
 
     #[tokio::test]
@@ -265,7 +263,11 @@ mod tests {
             let result = cb.call_tool("s", "t", serde_json::json!({})).await;
             assert!(result.is_err());
         }
-        assert_eq!(inner.call_count(), 2, "no additional calls should reach inner");
+        assert_eq!(
+            inner.call_count(),
+            2,
+            "no additional calls should reach inner"
+        );
     }
 
     #[tokio::test]
@@ -346,8 +348,7 @@ mod tests {
     #[tokio::test]
     async fn error_message_includes_server_and_failure_count() {
         let inner = Arc::new(FailDispatcher::new());
-        let cb =
-            CircuitBreakerDispatcher::new(inner, test_config(2, 60_000), "my-server");
+        let cb = CircuitBreakerDispatcher::new(inner, test_config(2, 60_000), "my-server");
 
         for _ in 0..2 {
             let _ = cb

@@ -10,24 +10,21 @@ use regex::Regex;
 
 // --- Compiled regex patterns (initialized once) ---
 
-static URL_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"https?://[^\s'")\]}>]+"#).unwrap()
-});
+static URL_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"https?://[^\s'")\]}>]+"#).unwrap());
 
-static IP_PORT_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}(:\d+)?").unwrap()
-});
+static IP_PORT_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}(:\d+)?").unwrap());
 
-static UNIX_PATH_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(/[\w.\-]+){2,}").unwrap()
-});
+static UNIX_PATH_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(/[\w.\-]+){2,}").unwrap());
 
-static WINDOWS_PATH_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"[A-Z]:\\[\w.\\\-]+").unwrap()
-});
+static WINDOWS_PATH_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"[A-Z]:\\[\w.\\\-]+").unwrap());
 
 static CREDENTIAL_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)(Bearer\s+\S+|api_key\s*=\s*\S+|token\s*=\s*\S+|password\s*=\s*\S+|secret\s*=\s*\S+)").unwrap()
+    Regex::new(
+        r"(?i)(Bearer\s+\S+|api_key\s*=\s*\S+|token\s*=\s*\S+|password\s*=\s*\S+|secret\s*=\s*\S+)",
+    )
+    .unwrap()
 });
 
 static STACK_TRACE_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -41,7 +38,10 @@ static STACK_TRACE_RE: LazyLock<Regex> = LazyLock::new(|| {
 /// and stack traces are stripped.
 pub fn redact_error_for_llm(server: &str, tool: &str, error: &str) -> String {
     let redacted = redact_error_message(error);
-    format!("tool '{}' on server '{}' failed: {}", tool, server, redacted)
+    format!(
+        "tool '{}' on server '{}' failed: {}",
+        tool, server, redacted
+    )
 }
 
 /// Redact sensitive patterns from an error message.
@@ -66,10 +66,7 @@ pub fn redact_error_message(error: &str) -> String {
     msg = STACK_TRACE_RE.replace_all(&msg, "").to_string();
 
     // Clean up blank lines left by stack trace removal
-    let lines: Vec<&str> = msg
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .collect();
+    let lines: Vec<&str> = msg.lines().filter(|l| !l.trim().is_empty()).collect();
     lines.join("\n")
 }
 
@@ -115,7 +112,10 @@ mod tests {
         let msg = "connection refused: 192.168.1.100:5432";
         let result = redact_error_message(msg);
         assert!(result.contains("[addr]"), "should redact IP: {result}");
-        assert!(!result.contains("192.168"), "should not contain IP: {result}");
+        assert!(
+            !result.contains("192.168"),
+            "should not contain IP: {result}"
+        );
     }
 
     // --- File path redaction ---

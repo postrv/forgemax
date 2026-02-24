@@ -128,9 +128,8 @@ pub fn validate_code(code: &str, max_size: Option<usize>) -> Result<(), SandboxE
 
     // 4. Banned patterns — check against normalized code to catch evasion attempts.
     //    The normalization pipeline: Unicode confusables → comment stripping → whitespace collapse.
-    let normalized = collapse_whitespace_before_parens(
-        &strip_js_comments(&normalize_unicode_confusables(code)),
-    );
+    let normalized =
+        collapse_whitespace_before_parens(&strip_js_comments(&normalize_unicode_confusables(code)));
     for pattern in BANNED_PATTERNS {
         if normalized.contains(pattern) {
             return Err(SandboxError::BannedPattern {

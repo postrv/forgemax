@@ -12,7 +12,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use forge_sandbox::ipc::{read_message, read_message_with_limit, write_message, ChildMessage, ParentMessage};
+use forge_sandbox::ipc::{
+    read_message, read_message_with_limit, write_message, ChildMessage, ParentMessage,
+};
 use forge_sandbox::ToolDispatcher;
 use tokio::io::{self, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, oneshot};

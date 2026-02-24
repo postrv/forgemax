@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use forge_client::{
-    CircuitBreakerConfig, CircuitBreakerDispatcher, McpClient, RouterDispatcher,
-    TimeoutDispatcher, TransportConfig,
+    CircuitBreakerConfig, CircuitBreakerDispatcher, McpClient, RouterDispatcher, TimeoutDispatcher,
+    TransportConfig,
 };
 use forge_config::ForgeConfig;
 use forge_manifest::{server_entry_from_tools, ManifestBuilder, McpTool};
@@ -167,22 +167,21 @@ async fn main() -> Result<()> {
         };
 
         // Wrap with circuit breaker if enabled (outside timeout so timeouts trip the breaker)
-        let client: Arc<dyn ToolDispatcher> =
-            if server_config.circuit_breaker == Some(true) {
-                let cb_config = CircuitBreakerConfig {
-                    failure_threshold: server_config.failure_threshold.unwrap_or(3),
-                    recovery_timeout: std::time::Duration::from_secs(
-                        server_config.recovery_timeout_secs.unwrap_or(30),
-                    ),
-                };
-                Arc::new(CircuitBreakerDispatcher::new(
-                    client,
-                    cb_config,
-                    name.clone(),
-                ))
-            } else {
-                client
+        let client: Arc<dyn ToolDispatcher> = if server_config.circuit_breaker == Some(true) {
+            let cb_config = CircuitBreakerConfig {
+                failure_threshold: server_config.failure_threshold.unwrap_or(3),
+                recovery_timeout: std::time::Duration::from_secs(
+                    server_config.recovery_timeout_secs.unwrap_or(30),
+                ),
             };
+            Arc::new(CircuitBreakerDispatcher::new(
+                client,
+                cb_config,
+                name.clone(),
+            ))
+        } else {
+            client
+        };
 
         // Add client to router
         router.add_client(name.clone(), client);
@@ -202,12 +201,7 @@ async fn main() -> Result<()> {
         let groups: std::collections::HashMap<String, (Vec<String>, String)> = config
             .groups
             .iter()
-            .map(|(name, gc)| {
-                (
-                    name.clone(),
-                    (gc.servers.clone(), gc.isolation.clone()),
-                )
-            })
+            .map(|(name, gc)| (name.clone(), (gc.servers.clone(), gc.isolation.clone())))
             .collect();
         Some(GroupPolicy::from_config(&groups))
     } else {

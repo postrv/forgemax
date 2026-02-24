@@ -121,10 +121,7 @@ mod tests {
             msg.contains("symbols.find"),
             "should mention tool name: {msg}"
         );
-        assert!(
-            msg.contains("narsil"),
-            "should mention server name: {msg}"
-        );
+        assert!(msg.contains("narsil"), "should mention server name: {msg}");
     }
 
     #[tokio::test]
