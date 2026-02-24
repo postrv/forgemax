@@ -131,7 +131,7 @@ jobs:
           mkdir -p release
 
           # Unix targets → tar.gz
-          for dir in forgemax-linux-x86_64 forgemax-linux-x86_64-musl forgemax-macos-x86_64 forgemax-macos-aarch64; do
+          for dir in forgemax-linux-x86_64 forgemax-macos-x86_64 forgemax-macos-aarch64; do
             if [ -d "artifacts/$dir" ]; then
               tar czf "release/forgemax-v${VERSION}-${dir#forgemax-}.tar.gz" \
                 -C "artifacts/$dir" .

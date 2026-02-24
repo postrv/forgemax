@@ -9,6 +9,8 @@ Instead of dumping every tool schema into the LLM's context window, Forge expose
 
 The LLM writes JavaScript that calls through typed proxy objects. Credentials, file paths, and internal state never leave the host — the sandbox only sees opaque bindings.
 
+Forge's Code Mode approach draws inspiration from [Cloudflare's sandbox tool-calling pattern](https://blog.cloudflare.com/code-mode/) — their implementation of sandboxed code execution for MCP tool orchestration is excellent and well worth studying. We encourage supporting their work.
+
 ## Why
 
 | Traditional MCP | Forge Code Mode |
@@ -302,10 +304,6 @@ cargo test --workspace
 | schemars | 1.0 | JSON Schema (matches rmcp) |
 | sha2 | 0.10 | Code hashing for audit log |
 | chrono | 0.4 | Audit timestamps |
-
-## Acknowledgements
-
-Forge's Code Mode approach draws inspiration from [Cloudflare's Sandbox tool-calling pattern](https://developers.cloudflare.com/agents/model-context-protocol/) — their implementation of sandboxed code execution for MCP tool orchestration is excellent and well worth studying. We encourage supporting their work.
 
 ## License
 
