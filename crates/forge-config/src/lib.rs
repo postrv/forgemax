@@ -144,6 +144,42 @@ pub struct SandboxOverrides {
     /// Execution mode: "in_process" (default) or "child_process".
     #[serde(default)]
     pub execution_mode: Option<String>,
+
+    /// Maximum resource content size in megabytes (default: 64 MB).
+    #[serde(default)]
+    pub max_resource_size_mb: Option<usize>,
+
+    /// Maximum concurrent calls in forge.parallel() (default: 8).
+    #[serde(default)]
+    pub max_parallel: Option<usize>,
+
+    /// Stash configuration overrides.
+    #[serde(default)]
+    pub stash: Option<StashOverrides>,
+}
+
+/// Configuration overrides for the ephemeral stash.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct StashOverrides {
+    /// Maximum number of stash entries per session.
+    #[serde(default)]
+    pub max_keys: Option<usize>,
+
+    /// Maximum size of a single stash value in megabytes.
+    #[serde(default)]
+    pub max_value_size_mb: Option<usize>,
+
+    /// Maximum total stash size in megabytes.
+    #[serde(default)]
+    pub max_total_size_mb: Option<usize>,
+
+    /// Default TTL for stash entries in seconds.
+    #[serde(default)]
+    pub default_ttl_secs: Option<u64>,
+
+    /// Maximum TTL for stash entries in seconds.
+    #[serde(default)]
+    pub max_ttl_secs: Option<u64>,
 }
 
 impl ForgeConfig {
@@ -230,6 +266,91 @@ impl ForgeConfig {
                     )));
                 }
                 seen_servers.insert(server_ref, group_name);
+            }
+        }
+
+        // Validate sandbox v0.2 fields
+        self.validate_sandbox_v2()?;
+
+        Ok(())
+    }
+
+    fn validate_sandbox_v2(&self) -> Result<(), ConfigError> {
+        // CV-01: max_resource_size_mb must be > 0 and <= 512
+        if let Some(size) = self.sandbox.max_resource_size_mb {
+            if size == 0 || size > 512 {
+                return Err(ConfigError::Invalid(
+                    "sandbox.max_resource_size_mb must be > 0 and <= 512".into(),
+                ));
+            }
+        }
+
+        // CV-02: max_parallel must be >= 1 and <= max_concurrent (or default 8)
+        if let Some(parallel) = self.sandbox.max_parallel {
+            let max_concurrent = self.sandbox.max_concurrent.unwrap_or(8);
+            if parallel < 1 || parallel > max_concurrent {
+                return Err(ConfigError::Invalid(format!(
+                    "sandbox.max_parallel must be >= 1 and <= max_concurrent ({})",
+                    max_concurrent
+                )));
+            }
+        }
+
+        if let Some(ref stash) = self.sandbox.stash {
+            // CV-03: stash.max_value_size_mb must be > 0 and <= 256
+            if let Some(size) = stash.max_value_size_mb {
+                if size == 0 || size > 256 {
+                    return Err(ConfigError::Invalid(
+                        "sandbox.stash.max_value_size_mb must be > 0 and <= 256".into(),
+                    ));
+                }
+            }
+
+            // CV-04: stash.max_total_size_mb must be >= stash.max_value_size_mb
+            if let (Some(total), Some(value)) = (stash.max_total_size_mb, stash.max_value_size_mb) {
+                if total < value {
+                    return Err(ConfigError::Invalid(
+                        "sandbox.stash.max_total_size_mb must be >= sandbox.stash.max_value_size_mb"
+                            .into(),
+                    ));
+                }
+            }
+
+            // CV-05: stash.default_ttl_secs must be > 0 and <= stash.max_ttl_secs
+            if let Some(default_ttl) = stash.default_ttl_secs {
+                if default_ttl == 0 {
+                    return Err(ConfigError::Invalid(
+                        "sandbox.stash.default_ttl_secs must be > 0".into(),
+                    ));
+                }
+                let max_ttl = stash.max_ttl_secs.unwrap_or(86400);
+                if default_ttl > max_ttl {
+                    return Err(ConfigError::Invalid(format!(
+                        "sandbox.stash.default_ttl_secs ({}) must be <= max_ttl_secs ({})",
+                        default_ttl, max_ttl
+                    )));
+                }
+            }
+
+            // CV-06: stash.max_ttl_secs must be > 0 and <= 604800 (7 days)
+            if let Some(max_ttl) = stash.max_ttl_secs {
+                if max_ttl == 0 || max_ttl > 604800 {
+                    return Err(ConfigError::Invalid(
+                        "sandbox.stash.max_ttl_secs must be > 0 and <= 604800 (7 days)".into(),
+                    ));
+                }
+            }
+        }
+
+        // CV-07: max_resource_size_mb + 1 must fit within IPC message size (64 MB default)
+        // In child_process mode, resource content flows over IPC
+        if let Some(resource_mb) = self.sandbox.max_resource_size_mb {
+            let ipc_limit_mb = 64; // DEFAULT_MAX_IPC_MESSAGE_SIZE is 64 MB
+            if resource_mb + 1 > ipc_limit_mb {
+                return Err(ConfigError::Invalid(format!(
+                    "sandbox.max_resource_size_mb ({}) + 1 MB overhead exceeds IPC message limit ({} MB)",
+                    resource_mb, ipc_limit_mb
+                )));
             }
         }
 
@@ -648,5 +769,143 @@ mod tests {
 
         let config = ForgeConfig::from_toml(toml).unwrap();
         assert!(config.sandbox.execution_mode.is_none());
+    }
+
+    // --- v0.2 Config Validation Tests (CV-01..CV-07) ---
+
+    #[test]
+    fn cv01_max_resource_size_mb_range() {
+        // Valid (must fit within IPC limit too)
+        let toml = "[sandbox]\nmax_resource_size_mb = 32";
+        assert!(ForgeConfig::from_toml(toml).is_ok());
+
+        // Zero is invalid
+        let toml = "[sandbox]\nmax_resource_size_mb = 0";
+        let err = ForgeConfig::from_toml(toml).unwrap_err().to_string();
+        assert!(err.contains("max_resource_size_mb"), "got: {err}");
+
+        // Over 512 is invalid
+        let toml = "[sandbox]\nmax_resource_size_mb = 513";
+        let err = ForgeConfig::from_toml(toml).unwrap_err().to_string();
+        assert!(err.contains("max_resource_size_mb"), "got: {err}");
+    }
+
+    #[test]
+    fn cv02_max_parallel_range() {
+        // Valid: within default max_concurrent (8)
+        let toml = "[sandbox]\nmax_parallel = 4";
+        assert!(ForgeConfig::from_toml(toml).is_ok());
+
+        // Zero is invalid
+        let toml = "[sandbox]\nmax_parallel = 0";
+        let err = ForgeConfig::from_toml(toml).unwrap_err().to_string();
+        assert!(err.contains("max_parallel"), "got: {err}");
+
+        // Exceeding max_concurrent is invalid
+        let toml = "[sandbox]\nmax_concurrent = 4\nmax_parallel = 5";
+        let err = ForgeConfig::from_toml(toml).unwrap_err().to_string();
+        assert!(err.contains("max_parallel"), "got: {err}");
+    }
+
+    #[test]
+    fn cv03_stash_max_value_size_mb_range() {
+        // Valid
+        let toml = "[sandbox.stash]\nmax_value_size_mb = 16";
+        assert!(ForgeConfig::from_toml(toml).is_ok());
+
+        // Zero is invalid
+        let toml = "[sandbox.stash]\nmax_value_size_mb = 0";
+        let err = ForgeConfig::from_toml(toml).unwrap_err().to_string();
+        assert!(err.contains("max_value_size_mb"), "got: {err}");
+
+        // Over 256 is invalid
+        let toml = "[sandbox.stash]\nmax_value_size_mb = 257";
+        let err = ForgeConfig::from_toml(toml).unwrap_err().to_string();
+        assert!(err.contains("max_value_size_mb"), "got: {err}");
+    }
+
+    #[test]
+    fn cv04_stash_total_size_gte_value_size() {
+        // Valid: total >= value
+        let toml = "[sandbox.stash]\nmax_value_size_mb = 16\nmax_total_size_mb = 128";
+        assert!(ForgeConfig::from_toml(toml).is_ok());
+
+        // Invalid: total < value
+        let toml = "[sandbox.stash]\nmax_value_size_mb = 32\nmax_total_size_mb = 16";
+        let err = ForgeConfig::from_toml(toml).unwrap_err().to_string();
+        assert!(err.contains("max_total_size_mb"), "got: {err}");
+    }
+
+    #[test]
+    fn cv05_stash_default_ttl_range() {
+        // Valid
+        let toml = "[sandbox.stash]\ndefault_ttl_secs = 3600";
+        assert!(ForgeConfig::from_toml(toml).is_ok());
+
+        // Zero is invalid
+        let toml = "[sandbox.stash]\ndefault_ttl_secs = 0";
+        let err = ForgeConfig::from_toml(toml).unwrap_err().to_string();
+        assert!(err.contains("default_ttl_secs"), "got: {err}");
+
+        // Exceeding max_ttl is invalid
+        let toml = "[sandbox.stash]\ndefault_ttl_secs = 100000\nmax_ttl_secs = 86400";
+        let err = ForgeConfig::from_toml(toml).unwrap_err().to_string();
+        assert!(err.contains("default_ttl_secs"), "got: {err}");
+    }
+
+    #[test]
+    fn cv06_stash_max_ttl_range() {
+        // Valid
+        let toml = "[sandbox.stash]\nmax_ttl_secs = 86400";
+        assert!(ForgeConfig::from_toml(toml).is_ok());
+
+        // Zero is invalid
+        let toml = "[sandbox.stash]\nmax_ttl_secs = 0";
+        let err = ForgeConfig::from_toml(toml).unwrap_err().to_string();
+        assert!(err.contains("max_ttl_secs"), "got: {err}");
+
+        // Over 7 days is invalid
+        let toml = "[sandbox.stash]\nmax_ttl_secs = 604801";
+        let err = ForgeConfig::from_toml(toml).unwrap_err().to_string();
+        assert!(err.contains("max_ttl_secs"), "got: {err}");
+    }
+
+    #[test]
+    fn cv07_max_resource_size_fits_ipc() {
+        // Valid: 63 MB + 1 MB overhead = 64 MB = fits
+        let toml = "[sandbox]\nmax_resource_size_mb = 63";
+        assert!(ForgeConfig::from_toml(toml).is_ok());
+
+        // Invalid: 64 MB + 1 MB overhead = 65 MB > 64 MB IPC limit
+        let toml = "[sandbox]\nmax_resource_size_mb = 64";
+        let err = ForgeConfig::from_toml(toml).unwrap_err().to_string();
+        assert!(err.contains("IPC"), "got: {err}");
+    }
+
+    #[test]
+    fn config_parses_v02_sandbox_fields() {
+        let toml = r#"
+            [sandbox]
+            max_resource_size_mb = 32
+            max_parallel = 4
+
+            [sandbox.stash]
+            max_keys = 128
+            max_value_size_mb = 8
+            max_total_size_mb = 64
+            default_ttl_secs = 1800
+            max_ttl_secs = 43200
+        "#;
+
+        let config = ForgeConfig::from_toml(toml).unwrap();
+        assert_eq!(config.sandbox.max_resource_size_mb, Some(32));
+        assert_eq!(config.sandbox.max_parallel, Some(4));
+
+        let stash = config.sandbox.stash.unwrap();
+        assert_eq!(stash.max_keys, Some(128));
+        assert_eq!(stash.max_value_size_mb, Some(8));
+        assert_eq!(stash.max_total_size_mb, Some(64));
+        assert_eq!(stash.default_ttl_secs, Some(1800));
+        assert_eq!(stash.max_ttl_secs, Some(43200));
     }
 }

@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use forge_sandbox::ToolDispatcher;
+use forge_sandbox::{ResourceDispatcher, ToolDispatcher};
 use serde_json::Value;
 use tokio::sync::Mutex;
 
@@ -30,16 +30,17 @@ impl Default for CircuitBreakerConfig {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CircuitState {
+pub(crate) enum CircuitState {
     Closed,
     Open,
     HalfOpen,
 }
 
-struct CircuitBreakerState {
-    state: CircuitState,
-    consecutive_failures: u32,
-    last_failure_time: Option<Instant>,
+/// Internal state for the circuit breaker (shared between tool and resource dispatchers).
+pub(crate) struct CircuitBreakerState {
+    pub(crate) state: CircuitState,
+    pub(crate) consecutive_failures: u32,
+    pub(crate) last_failure_time: Option<Instant>,
 }
 
 /// A [`ToolDispatcher`] that implements the circuit breaker pattern.
@@ -144,6 +145,88 @@ impl ToolDispatcher for CircuitBreakerDispatcher {
                             failures = st.consecutive_failures,
                             "circuit breaker opened"
                         );
+                    }
+                }
+            }
+        }
+
+        result
+    }
+}
+
+/// A [`ResourceDispatcher`] wrapper with independent circuit breaker state.
+///
+/// Uses the same circuit breaker pattern as [`CircuitBreakerDispatcher`] but
+/// tracks resource failures independently from tool call failures.
+pub struct CircuitBreakerResourceDispatcher {
+    inner: Arc<dyn ResourceDispatcher>,
+    server_name: String,
+    config: CircuitBreakerConfig,
+    state: Arc<Mutex<CircuitBreakerState>>,
+}
+
+impl CircuitBreakerResourceDispatcher {
+    /// Wrap a resource dispatcher with circuit breaker logic.
+    pub fn new(
+        inner: Arc<dyn ResourceDispatcher>,
+        config: CircuitBreakerConfig,
+        server_name: impl Into<String>,
+    ) -> Self {
+        Self {
+            inner,
+            config,
+            server_name: server_name.into(),
+            state: Arc::new(Mutex::new(CircuitBreakerState {
+                state: CircuitState::Closed,
+                consecutive_failures: 0,
+                last_failure_time: None,
+            })),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ResourceDispatcher for CircuitBreakerResourceDispatcher {
+    async fn read_resource(&self, server: &str, uri: &str) -> Result<serde_json::Value> {
+        // Check circuit state before calling
+        {
+            let mut st = self.state.lock().await;
+            match st.state {
+                CircuitState::Open => {
+                    if let Some(last_fail) = st.last_failure_time {
+                        if last_fail.elapsed() >= self.config.recovery_timeout {
+                            st.state = CircuitState::HalfOpen;
+                        } else {
+                            return Err(anyhow::anyhow!(
+                                "circuit breaker open for server '{}': {} consecutive failures",
+                                self.server_name,
+                                st.consecutive_failures,
+                            ));
+                        }
+                    }
+                }
+                CircuitState::HalfOpen | CircuitState::Closed => {}
+            }
+        }
+
+        let result = self.inner.read_resource(server, uri).await;
+
+        // Update state based on result
+        {
+            let mut st = self.state.lock().await;
+            match &result {
+                Ok(_) => {
+                    st.state = CircuitState::Closed;
+                    st.consecutive_failures = 0;
+                    st.last_failure_time = None;
+                }
+                Err(_) => {
+                    st.consecutive_failures += 1;
+                    st.last_failure_time = Some(Instant::now());
+                    if st.state == CircuitState::HalfOpen
+                        || st.consecutive_failures >= self.config.failure_threshold
+                    {
+                        st.state = CircuitState::Open;
                     }
                 }
             }
@@ -366,6 +449,34 @@ mod tests {
             msg.contains("2 consecutive failures"),
             "should mention failure count: {msg}"
         );
+    }
+
+    // --- v0.2 Resource Circuit Breaker Test (RS-C08) ---
+
+    struct FailResourceDispatcher;
+
+    #[async_trait::async_trait]
+    impl ResourceDispatcher for FailResourceDispatcher {
+        async fn read_resource(&self, _server: &str, _uri: &str) -> Result<Value> {
+            Err(anyhow::anyhow!("resource read failed"))
+        }
+    }
+
+    #[tokio::test]
+    async fn rs_c08_circuit_breaker_trips_on_repeated_resource_failures() {
+        let inner: Arc<dyn ResourceDispatcher> = Arc::new(FailResourceDispatcher);
+        let cb = CircuitBreakerResourceDispatcher::new(inner, test_config(2, 60_000), "flaky");
+
+        // 2 failures to trip
+        for _ in 0..2 {
+            let _ = cb.read_resource("flaky", "file:///log").await;
+        }
+
+        // 3rd call rejected without reaching inner
+        let result = cb.read_resource("flaky", "file:///log").await;
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("circuit breaker open"), "got: {msg}");
     }
 
     #[tokio::test]

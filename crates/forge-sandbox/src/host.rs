@@ -13,7 +13,7 @@ use tokio::process::Command;
 
 use crate::error::SandboxError;
 use crate::ipc::{read_message, write_message, ChildMessage, ParentMessage, WorkerConfig};
-use crate::ToolDispatcher;
+use crate::{ResourceDispatcher, StashDispatcher, ToolDispatcher};
 
 /// Manages spawning and communicating with sandbox worker child processes.
 pub struct SandboxHost;
@@ -25,10 +25,13 @@ impl SandboxHost {
     /// 2. Sends the code and config via IPC
     /// 3. Routes tool call requests through the parent's dispatcher
     /// 4. Returns the execution result (or kills the child on timeout)
+    ///
     pub async fn execute_in_child(
         code: &str,
         config: &crate::SandboxConfig,
         dispatcher: Arc<dyn ToolDispatcher>,
+        resource_dispatcher: Option<Arc<dyn ResourceDispatcher>>,
+        stash_dispatcher: Option<Arc<dyn StashDispatcher>>,
     ) -> Result<serde_json::Value, SandboxError> {
         let worker_bin = find_worker_binary()?;
         let worker_config = WorkerConfig::from(config);
@@ -81,7 +84,13 @@ impl SandboxHost {
             // Give the child a bit more time than its internal timeout,
             // so the child can report its own timeout error cleanly.
             timeout + Duration::from_secs(2),
-            ipc_event_loop(&mut child_stdin, &mut child_stdout, dispatcher),
+            ipc_event_loop(
+                &mut child_stdin,
+                &mut child_stdout,
+                dispatcher,
+                resource_dispatcher,
+                stash_dispatcher,
+            ),
         )
         .await;
 
@@ -99,11 +108,13 @@ impl SandboxHost {
 }
 
 /// Run the IPC event loop: read messages from the child, dispatch tool calls,
-/// return the final result.
+/// resource reads, and stash operations, then return the final result.
 async fn ipc_event_loop(
     child_stdin: &mut tokio::process::ChildStdin,
     child_stdout: &mut BufReader<tokio::process::ChildStdout>,
     dispatcher: Arc<dyn ToolDispatcher>,
+    resource_dispatcher: Option<Arc<dyn ResourceDispatcher>>,
+    stash_dispatcher: Option<Arc<dyn StashDispatcher>>,
 ) -> Result<serde_json::Value, SandboxError> {
     loop {
         let msg: Option<ChildMessage> = read_message(child_stdout)
@@ -133,6 +144,80 @@ async fn ipc_event_loop(
 
                 write_message(child_stdin, &response).await.map_err(|e| {
                     SandboxError::Execution(anyhow::anyhow!("failed to send tool result: {}", e))
+                })?;
+            }
+            Some(ChildMessage::ResourceReadRequest {
+                request_id,
+                server,
+                uri,
+            }) => {
+                let result = match &resource_dispatcher {
+                    Some(rd) => rd
+                        .read_resource(&server, &uri)
+                        .await
+                        .map_err(|e| e.to_string()),
+                    None => Err("resource dispatcher not available".to_string()),
+                };
+
+                let response = ParentMessage::ResourceReadResult { request_id, result };
+
+                write_message(child_stdin, &response).await.map_err(|e| {
+                    SandboxError::Execution(anyhow::anyhow!(
+                        "failed to send resource result: {}",
+                        e
+                    ))
+                })?;
+            }
+            Some(ChildMessage::StashPut {
+                request_id,
+                key,
+                value,
+                ttl_secs,
+            }) => {
+                let result = match &stash_dispatcher {
+                    Some(sd) => sd
+                        .put(&key, value, ttl_secs, None)
+                        .await
+                        .map_err(|e| e.to_string()),
+                    None => Err("stash dispatcher not available".to_string()),
+                };
+
+                let response = ParentMessage::StashResult { request_id, result };
+                write_message(child_stdin, &response).await.map_err(|e| {
+                    SandboxError::Execution(anyhow::anyhow!("failed to send stash result: {}", e))
+                })?;
+            }
+            Some(ChildMessage::StashGet { request_id, key }) => {
+                let result = match &stash_dispatcher {
+                    Some(sd) => sd.get(&key, None).await.map_err(|e| e.to_string()),
+                    None => Err("stash dispatcher not available".to_string()),
+                };
+
+                let response = ParentMessage::StashResult { request_id, result };
+                write_message(child_stdin, &response).await.map_err(|e| {
+                    SandboxError::Execution(anyhow::anyhow!("failed to send stash result: {}", e))
+                })?;
+            }
+            Some(ChildMessage::StashDelete { request_id, key }) => {
+                let result = match &stash_dispatcher {
+                    Some(sd) => sd.delete(&key, None).await.map_err(|e| e.to_string()),
+                    None => Err("stash dispatcher not available".to_string()),
+                };
+
+                let response = ParentMessage::StashResult { request_id, result };
+                write_message(child_stdin, &response).await.map_err(|e| {
+                    SandboxError::Execution(anyhow::anyhow!("failed to send stash result: {}", e))
+                })?;
+            }
+            Some(ChildMessage::StashKeys { request_id }) => {
+                let result = match &stash_dispatcher {
+                    Some(sd) => sd.keys(None).await.map_err(|e| e.to_string()),
+                    None => Err("stash dispatcher not available".to_string()),
+                };
+
+                let response = ParentMessage::StashResult { request_id, result };
+                write_message(child_stdin, &response).await.map_err(|e| {
+                    SandboxError::Execution(anyhow::anyhow!("failed to send stash result: {}", e))
                 })?;
             }
             Some(ChildMessage::Log { message }) => {

@@ -57,7 +57,7 @@ async fn setup_forge_with_test_server() -> (ForgeServer, Arc<McpClient>) {
     router.add_client("test-server", client.clone() as Arc<dyn ToolDispatcher>);
 
     let dispatcher: Arc<dyn ToolDispatcher> = Arc::new(router);
-    let server = ForgeServer::new(SandboxConfig::default(), manifest, dispatcher);
+    let server = ForgeServer::new(SandboxConfig::default(), manifest, dispatcher, None);
 
     (server, client)
 }
@@ -257,4 +257,88 @@ async fn end_to_end_execute_via_proxy_api() {
     let symbols = parsed.as_array().unwrap();
     assert_eq!(symbols.len(), 3);
     assert_eq!(symbols[0]["name"], "main_0");
+}
+
+// ---------------------------------------------------------------------------
+// RS-C: McpClient resource tests
+// ---------------------------------------------------------------------------
+
+// RS-C01: list_resources returns items from test server
+#[tokio::test]
+async fn mcpclient_list_resources_returns_items() {
+    let bin = test_server_bin();
+    let client = McpClient::connect_stdio("test-server", &bin, &[])
+        .await
+        .expect("failed to connect to test server");
+
+    let resources = client
+        .list_resources()
+        .await
+        .expect("failed to list resources");
+
+    assert_eq!(resources.len(), 2, "test server should expose 2 resources");
+
+    let uris: Vec<&str> = resources.iter().map(|r| r.uri.as_str()).collect();
+    assert!(
+        uris.contains(&"file:///logs/app.log"),
+        "should have app.log resource"
+    );
+    assert!(
+        uris.contains(&"db://schema/users"),
+        "should have users schema resource"
+    );
+
+    // Verify names
+    let log_resource = resources
+        .iter()
+        .find(|r| r.uri == "file:///logs/app.log")
+        .unwrap();
+    assert_eq!(log_resource.name, "Application Log");
+
+    client.disconnect().await.ok();
+}
+
+// RS-C02 disposition: Covered by graceful degradation logic at lib.rs:265-276 + RS-I07.
+// The error-matching code path requires a server that does NOT support resources/list,
+// which would require a separate test server binary or deep rmcp mocking.
+
+// RS-C03: read_resource returns content
+#[tokio::test]
+async fn mcpclient_read_resource_returns_content() {
+    let bin = test_server_bin();
+    let client = McpClient::connect_stdio("test-server", &bin, &[])
+        .await
+        .expect("failed to connect to test server");
+
+    let content = client
+        .read_resource("file:///logs/app.log")
+        .await
+        .expect("failed to read resource");
+
+    let text = content.as_str().unwrap_or("");
+    assert!(
+        text.contains("startup complete"),
+        "resource should contain log text, got: {content}"
+    );
+
+    client.disconnect().await.ok();
+}
+
+// RS-C04: read_resource propagates error for unknown URI
+#[tokio::test]
+async fn mcpclient_read_resource_propagates_error() {
+    let bin = test_server_bin();
+    let client = McpClient::connect_stdio("test-server", &bin, &[])
+        .await
+        .expect("failed to connect to test server");
+
+    let result = client.read_resource("nonexistent://missing").await;
+    assert!(result.is_err(), "reading nonexistent resource should fail");
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("resource") || err.contains("not found") || err.contains("error"),
+        "error should be meaningful: {err}"
+    );
+
+    client.disconnect().await.ok();
 }

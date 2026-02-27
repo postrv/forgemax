@@ -54,6 +54,8 @@ isolation = "open"  # Can interact with any group
 
 `GroupPolicy` (compiled once from config, shared across executions) and `GroupEnforcingDispatcher` (fresh per `execute()` call) enforce data flow policies at the `callTool()` boundary. When a strict-group server is called, the execution is "locked" to that group — subsequent calls to servers in a different strict group are rejected. Open-group and ungrouped servers are always accessible. The dispatcher state is fresh per execution, so there is no cross-execution leakage.
 
+In v0.2, group isolation extends to resource reads (`GroupEnforcingResourceDispatcher`) and stash operations. A `SharedGroupLock` (`Arc<Mutex<Option<String>>>`) is shared between tool and resource dispatchers per execution, ensuring that reading a resource from a strict group also locks tool calls to that same group.
+
 #### Additional Mitigations
 
 1. **Audit logging**: Every `callTool()` invocation is logged with server, tool name, args hash, and timestamp. Cross-server flows are visible in the audit trail.
@@ -172,6 +174,11 @@ Error Redaction          URLs, IPs, paths, creds, stack traces     Done (Phase 4
 Server Groups            Cross-server data flow policies            Done (Phase 4)
 Circuit Breakers         Cascade failure prevention                 Done (Phase 4)
 Per-Server Timeouts      Hanging server isolation                   Done (Phase 4)
+Resource URI Validation  Path traversal, null bytes, control chars  Done (v0.2)
+Resource Size Limits     Truncation at configurable max             Done (v0.2)
+Session Stash Security   Key validation, size limits, TTL, groups   Done (v0.2)
+Parallel Concurrency     Bounded concurrency, shared rate limits    Done (v0.2)
+Bootstrap Integrity      Frozen objects, deleted constructors        Done (v0.2)
 ```
 
 Legend: WU = warm-up, C = code review, SR = security review, Phase = implementation phase
@@ -191,6 +198,10 @@ Before connecting Forgemax to untrusted or external MCP servers:
 - [ ] Configure `[groups]` with `isolation = "strict"` for servers that should not share data
 - [ ] Set `RUST_LOG=info` to capture connection lifecycle events
 - [ ] Protect `forge.toml` with appropriate file permissions — env var expansion (`${VAR}`) means a writable config file could exfiltrate environment variables via server URLs
+
+- [ ] Configure `[sandbox.stash]` limits if the default (256 keys, 128 MB total) is too generous for your deployment
+- [ ] Set `max_resource_size_mb` to limit resource content sizes (default: 64 MB)
+- [ ] Set `max_parallel` to control bounded concurrency in `forge.parallel()` (default: 8)
 
 ### What's Built In (no action needed)
 

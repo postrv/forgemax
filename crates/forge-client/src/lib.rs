@@ -16,7 +16,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
-use forge_sandbox::ToolDispatcher;
+use forge_sandbox::{ResourceDispatcher, ToolDispatcher};
 use rmcp::model::{CallToolRequestParams, CallToolResult, Content, RawContent};
 use rmcp::service::RunningService;
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
@@ -25,9 +25,11 @@ use rmcp::{RoleClient, ServiceExt};
 use serde_json::Value;
 use tokio::process::Command;
 
-pub use circuit_breaker::{CircuitBreakerConfig, CircuitBreakerDispatcher};
-pub use router::RouterDispatcher;
-pub use timeout::TimeoutDispatcher;
+pub use circuit_breaker::{
+    CircuitBreakerConfig, CircuitBreakerDispatcher, CircuitBreakerResourceDispatcher,
+};
+pub use router::{RouterDispatcher, RouterResourceDispatcher};
+pub use timeout::{TimeoutDispatcher, TimeoutResourceDispatcher};
 
 /// Configuration for connecting to a downstream MCP server.
 #[derive(Debug, Clone)]
@@ -80,6 +82,19 @@ pub struct ToolInfo {
     pub description: Option<String>,
     /// JSON Schema for the tool's input parameters.
     pub input_schema: Value,
+}
+
+/// Information about a resource discovered from a downstream server.
+#[derive(Debug, Clone)]
+pub struct ResourceInfo {
+    /// Resource URI.
+    pub uri: String,
+    /// Human-readable name.
+    pub name: String,
+    /// Description.
+    pub description: Option<String>,
+    /// MIME type.
+    pub mime_type: Option<String>,
 }
 
 impl McpClient {
@@ -229,6 +244,81 @@ impl McpClient {
             .collect())
     }
 
+    /// List all resources available on this server.
+    ///
+    /// Returns an empty Vec if the server does not support resources
+    /// (graceful degradation — not all MCP servers implement resources/list).
+    pub async fn list_resources(&self) -> Result<Vec<ResourceInfo>> {
+        let result = self.inner.peer().list_resources(None).await;
+
+        match result {
+            Ok(list) => Ok(list
+                .resources
+                .into_iter()
+                .map(|r| ResourceInfo {
+                    uri: r.uri.clone(),
+                    name: r.name.clone(),
+                    description: r.description.clone(),
+                    mime_type: r.mime_type.clone(),
+                })
+                .collect()),
+            Err(e) => {
+                let err_str = e.to_string();
+                // Graceful degradation: treat "method not found" as "no resources"
+                if err_str.contains("Method not found")
+                    || err_str.contains("method not found")
+                    || err_str.contains("-32601")
+                {
+                    tracing::debug!(
+                        server = %self.name,
+                        "server does not support resources/list, returning empty"
+                    );
+                    Ok(vec![])
+                } else {
+                    Err(anyhow::anyhow!(
+                        "failed to list resources for server '{}': {}",
+                        self.name,
+                        e
+                    ))
+                }
+            }
+        }
+    }
+
+    /// Read a specific resource by URI.
+    pub async fn read_resource(&self, uri: &str) -> Result<Value> {
+        let result = self
+            .inner
+            .peer()
+            .read_resource(rmcp::model::ReadResourceRequestParams {
+                uri: uri.to_string(),
+                meta: None,
+            })
+            .await
+            .with_context(|| {
+                format!(
+                    "resource read failed: server='{}', uri='{}'",
+                    self.name, uri
+                )
+            })?;
+
+        // Convert resource contents to JSON
+        let contents = result.contents;
+        if contents.is_empty() {
+            return Ok(Value::Null);
+        }
+
+        if contents.len() == 1 {
+            resource_content_to_value(&contents[0])
+        } else {
+            let values: Vec<Value> = contents
+                .iter()
+                .filter_map(|c| resource_content_to_value(c).ok())
+                .collect();
+            Ok(Value::Array(values))
+        }
+    }
+
     /// Get the server name.
     pub fn name(&self) -> &str {
         &self.name
@@ -275,6 +365,31 @@ impl ToolDispatcher for McpClient {
             })?;
 
         call_tool_result_to_value(result)
+    }
+}
+
+#[async_trait::async_trait]
+impl ResourceDispatcher for McpClient {
+    async fn read_resource(&self, _server: &str, uri: &str) -> Result<Value> {
+        self.read_resource(uri).await
+    }
+}
+
+/// Convert a resource content item to a JSON Value.
+fn resource_content_to_value(content: &rmcp::model::ResourceContents) -> Result<Value> {
+    match content {
+        rmcp::model::ResourceContents::TextResourceContents { text, .. } => {
+            // Try to parse as JSON first, fall back to string
+            serde_json::from_str(text).or_else(|_| Ok(Value::String(text.clone())))
+        }
+        rmcp::model::ResourceContents::BlobResourceContents {
+            blob, mime_type, ..
+        } => Ok(serde_json::json!({
+            "_type": "blob",
+            "_encoding": "base64",
+            "data": blob,
+            "mime_type": mime_type.as_deref().unwrap_or("application/octet-stream"),
+        })),
     }
 }
 

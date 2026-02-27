@@ -116,6 +116,20 @@ max_heap_mb = 64
 max_concurrent = 8
 max_tool_calls = 50
 execution_mode = "child_process"
+max_resource_size_mb = 64   # Max size of a single resource read (default: 64 MB)
+max_parallel = 8            # Max concurrent calls in forge.parallel() (default: 8)
+
+# ─── Session Stash (optional) ──────────────────────────────────────────
+#
+# In-memory key-value store shared across execute() calls within a session.
+# Useful for caching discovered schemas, intermediate results, etc.
+#
+# [sandbox.stash]
+# max_keys = 256             # Maximum number of stash entries (default: 256)
+# max_value_size_mb = 16     # Maximum size of a single value (default: 16 MB)
+# max_total_size_mb = 128    # Maximum total stash size (default: 128 MB)
+# default_ttl_secs = 3600    # Default TTL when not specified (default: 1 hour)
+# max_ttl_secs = 86400       # Maximum allowed TTL (default: 24 hours)
 
 # ─── Server Groups (optional) ────────────────────────────────────────
 #

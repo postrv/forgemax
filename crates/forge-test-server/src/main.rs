@@ -1,13 +1,20 @@
 //! Minimal MCP server for integration testing.
 //!
-//! Exposes a few tools that can be called via stdio transport.
+//! Exposes a few tools and resources that can be called via stdio transport.
 //! Used by forge-client integration tests.
+
+use std::future::Future;
 
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
+use rmcp::model::{
+    Implementation, ListResourcesResult, PaginatedRequestParams, RawResource,
+    ReadResourceRequestParams, ReadResourceResult, Resource, ResourceContents, ServerCapabilities,
+    ServerInfo,
+};
 use rmcp::schemars::JsonSchema;
-use rmcp::{tool, tool_handler, tool_router, ServerHandler, ServiceExt};
+use rmcp::service::RequestContext;
+use rmcp::{tool, tool_handler, tool_router, ErrorData, RoleServer, ServerHandler, ServiceExt};
 use serde::Deserialize;
 
 #[derive(Clone)]
@@ -97,7 +104,10 @@ impl TestServer {
 impl ServerHandler for TestServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
+            capabilities: ServerCapabilities::builder()
+                .enable_tools()
+                .enable_resources()
+                .build(),
             instructions: Some("Test MCP server for Forge integration tests".into()),
             server_info: Implementation {
                 name: "forge-test-server".into(),
@@ -109,6 +119,58 @@ impl ServerHandler for TestServer {
             },
             ..Default::default()
         }
+    }
+
+    fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<ListResourcesResult, ErrorData>> + Send + '_ {
+        std::future::ready(Ok(ListResourcesResult {
+            meta: None,
+            next_cursor: None,
+            resources: vec![
+                {
+                    let mut r = RawResource::new("file:///logs/app.log", "Application Log");
+                    r.description = Some("Recent application log entries".into());
+                    r.mime_type = Some("text/plain".into());
+                    Resource::new(r, None)
+                },
+                {
+                    let mut r = RawResource::new("db://schema/users", "Users Table Schema");
+                    r.description = Some("Schema for the users table".into());
+                    r.mime_type = Some("application/json".into());
+                    Resource::new(r, None)
+                },
+            ],
+        }))
+    }
+
+    fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<ReadResourceResult, ErrorData>> + Send + '_ {
+        std::future::ready(match request.uri.as_str() {
+            "file:///logs/app.log" => Ok(ReadResourceResult {
+                contents: vec![ResourceContents::text(
+                    "2024-01-01 INFO startup complete",
+                    "file:///logs/app.log",
+                )],
+            }),
+            "db://schema/users" => Ok(ReadResourceResult {
+                contents: vec![ResourceContents::TextResourceContents {
+                    uri: "db://schema/users".into(),
+                    mime_type: Some("application/json".into()),
+                    text: r#"{"table":"users","columns":["id","name","email"]}"#.into(),
+                    meta: None,
+                }],
+            }),
+            _ => Err(ErrorData::resource_not_found(
+                format!("resource not found: {}", request.uri),
+                None,
+            )),
+        })
     }
 }
 

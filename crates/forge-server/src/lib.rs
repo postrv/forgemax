@@ -11,10 +11,16 @@
 //! This collapses N servers x M tools into a fixed ~1,000 token footprint.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use forge_manifest::Manifest;
-use forge_sandbox::groups::{GroupEnforcingDispatcher, GroupPolicy};
-use forge_sandbox::{SandboxConfig, SandboxExecutor, ToolDispatcher};
+use forge_sandbox::groups::{
+    GroupEnforcingDispatcher, GroupEnforcingResourceDispatcher, GroupPolicy,
+};
+use forge_sandbox::stash::{SessionStash, StashConfig};
+use forge_sandbox::{
+    ResourceDispatcher, SandboxConfig, SandboxExecutor, StashDispatcher, ToolDispatcher,
+};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
@@ -31,22 +37,86 @@ pub struct ForgeServer {
     executor: Arc<SandboxExecutor>,
     manifest: Arc<Manifest>,
     dispatcher: Arc<dyn ToolDispatcher>,
+    resource_dispatcher: Option<Arc<dyn ResourceDispatcher>>,
     group_policy: Option<Arc<GroupPolicy>>,
+    session_stash: Option<Arc<tokio::sync::Mutex<SessionStash>>>,
     tool_router: ToolRouter<Self>,
 }
 
+/// Stash dispatcher that wraps a shared [`SessionStash`] behind a Mutex.
+///
+/// Created per-execution by `ForgeServer::execute()` to provide the stash API
+/// to sandbox code. The `current_group` is set from the server group context.
+struct ServerStashDispatcher {
+    stash: Arc<tokio::sync::Mutex<SessionStash>>,
+    current_group: Option<String>,
+}
+
+#[async_trait::async_trait]
+impl StashDispatcher for ServerStashDispatcher {
+    async fn put(
+        &self,
+        key: &str,
+        value: serde_json::Value,
+        ttl_secs: Option<u32>,
+        _current_group: Option<String>,
+    ) -> Result<serde_json::Value, anyhow::Error> {
+        let ttl = ttl_secs
+            .filter(|&s| s > 0)
+            .map(|s| Duration::from_secs(s as u64));
+        let mut stash = self.stash.lock().await;
+        stash.put(key, value, ttl, self.current_group.as_deref())?;
+        Ok(serde_json::json!({"ok": true}))
+    }
+
+    async fn get(
+        &self,
+        key: &str,
+        _current_group: Option<String>,
+    ) -> Result<serde_json::Value, anyhow::Error> {
+        let stash = self.stash.lock().await;
+        match stash.get(key, self.current_group.as_deref())? {
+            Some(v) => Ok(v.clone()),
+            None => Ok(serde_json::Value::Null),
+        }
+    }
+
+    async fn delete(
+        &self,
+        key: &str,
+        _current_group: Option<String>,
+    ) -> Result<serde_json::Value, anyhow::Error> {
+        let mut stash = self.stash.lock().await;
+        let deleted = stash.delete(key, self.current_group.as_deref())?;
+        Ok(serde_json::json!({"deleted": deleted}))
+    }
+
+    async fn keys(
+        &self,
+        _current_group: Option<String>,
+    ) -> Result<serde_json::Value, anyhow::Error> {
+        let stash = self.stash.lock().await;
+        let keys: Vec<&str> = stash.keys(self.current_group.as_deref());
+        Ok(serde_json::json!(keys))
+    }
+}
+
 impl ForgeServer {
-    /// Create a new Forge server with the given config, manifest, and dispatcher.
+    /// Create a new Forge server with the given config, manifest, dispatcher,
+    /// and optional resource dispatcher.
     pub fn new(
         config: SandboxConfig,
         manifest: Manifest,
         dispatcher: Arc<dyn ToolDispatcher>,
+        resource_dispatcher: Option<Arc<dyn ResourceDispatcher>>,
     ) -> Self {
         Self {
             executor: Arc::new(SandboxExecutor::new(config)),
             manifest: Arc::new(manifest),
             dispatcher,
+            resource_dispatcher,
             group_policy: None,
+            session_stash: None,
             tool_router: Self::tool_router(),
         }
     }
@@ -55,10 +125,21 @@ impl ForgeServer {
     ///
     /// When set, each `execute()` call wraps the dispatcher with a fresh
     /// [`GroupEnforcingDispatcher`] that tracks group access for that execution.
+    /// If a resource dispatcher is also configured, it is wrapped with a
+    /// [`GroupEnforcingResourceDispatcher`] sharing the same lock.
     pub fn with_group_policy(mut self, policy: GroupPolicy) -> Self {
         if !policy.is_empty() {
             self.group_policy = Some(Arc::new(policy));
         }
+        self
+    }
+
+    /// Enable the session stash with the given configuration.
+    ///
+    /// When enabled, `forge.stash.put/get/delete/keys()` are available in
+    /// sandbox execute mode.
+    pub fn with_stash(mut self, config: StashConfig) -> Self {
+        self.session_stash = Some(Arc::new(tokio::sync::Mutex::new(SessionStash::new(config))));
         self
     }
 }
@@ -129,7 +210,7 @@ impl ForgeServer {
     /// Execute code against the tool API in a sandboxed V8 isolate.
     #[tool(
         name = "execute",
-        description = "Execute JavaScript against the tool API. Use `forge.server('name').category.tool(args)` or `forge.callTool(server, tool, args)` to call tools on connected servers. Chain multiple operations in a single call.\n\nIMPORTANT: Code runs in a sandboxed V8 isolate with NO filesystem, network, or module access. import(), require(), eval(), and Deno.* are all blocked. Use forge.callTool() for all external operations.\n\nExample: `async () => { const result = await forge.callTool('narsil', 'scan_security', { repo: 'MyProject' }); return result; }`"
+        description = "Execute JavaScript against the tool API. Use `forge.server('name').category.tool(args)` or `forge.callTool(server, tool, args)` to call tools on connected servers. Chain multiple operations in a single call.\n\nIMPORTANT: Code runs in a sandboxed V8 isolate with NO filesystem, network, or module access. import(), require(), eval(), and Deno.* are all blocked. Use forge.callTool() for all external operations.\n\nExample: `async () => { const result = await forge.callTool('narsil', 'scan_security', { repo: 'MyProject' }); return result; }`\n\nAdditional APIs:\n- `forge.readResource(server, uri)` — read MCP resources\n- `forge.stash.put(key, value, {ttl?})` / `.get(key)` / `.delete(key)` / `.keys()` — session key-value store\n- `forge.parallel(calls, opts)` — bounded concurrent execution"
     )]
     pub async fn execute(
         &self,
@@ -137,18 +218,60 @@ impl ForgeServer {
     ) -> Result<String, String> {
         tracing::info!(code_len = input.code.len(), "execute: starting");
 
-        // Wrap dispatcher with group enforcement if a policy is configured.
-        // A fresh GroupEnforcingDispatcher is created per-execution so that
-        // group locking state doesn't leak between executions.
-        let dispatcher: Arc<dyn ToolDispatcher> = match &self.group_policy {
-            Some(policy) => Arc::new(GroupEnforcingDispatcher::new(
-                self.dispatcher.clone(),
-                policy.clone(),
-            )),
-            None => self.dispatcher.clone(),
+        // Wrap dispatcher(s) with group enforcement if a policy is configured.
+        // A fresh pair of GroupEnforcingDispatcher/GroupEnforcingResourceDispatcher
+        // is created per-execution so that group locking state doesn't leak
+        // between executions. Both share the same lock for consistent enforcement.
+        let (dispatcher, resource_dispatcher): (
+            Arc<dyn ToolDispatcher>,
+            Option<Arc<dyn ResourceDispatcher>>,
+        ) = match &self.group_policy {
+            Some(policy) => {
+                let tool_enforcer =
+                    GroupEnforcingDispatcher::new(self.dispatcher.clone(), policy.clone());
+                let shared_lock = tool_enforcer.shared_lock();
+
+                let resource = self.resource_dispatcher.as_ref().map(|rd| {
+                    Arc::new(GroupEnforcingResourceDispatcher::new(
+                        rd.clone(),
+                        policy.clone(),
+                        shared_lock,
+                    )) as Arc<dyn ResourceDispatcher>
+                });
+
+                (Arc::new(tool_enforcer), resource)
+            }
+            None => (self.dispatcher.clone(), self.resource_dispatcher.clone()),
         };
 
-        match self.executor.execute_code(&input.code, dispatcher).await {
+        // Create stash dispatcher if session stash is configured
+        let stash_dispatcher: Option<Arc<dyn StashDispatcher>> =
+            self.session_stash.as_ref().map(|stash| {
+                Arc::new(ServerStashDispatcher {
+                    stash: stash.clone(),
+                    current_group: None, // Group tracking done at ForgeServer level
+                }) as Arc<dyn StashDispatcher>
+            });
+
+        // SR-R6: Collect known server names from manifest for op-level validation
+        let known_servers: std::collections::HashSet<String> = self
+            .manifest
+            .servers
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+
+        match self
+            .executor
+            .execute_code_with_options(
+                &input.code,
+                dispatcher,
+                resource_dispatcher,
+                stash_dispatcher,
+                Some(known_servers),
+            )
+            .await
+        {
             Ok(result) => {
                 let json = serde_json::to_string_pretty(&result)
                     .map_err(|e| format!("result serialization failed: {e}"))?;
@@ -189,7 +312,13 @@ impl ServerHandler for ForgeServer {
                  - Always check a tool's input_schema.required before calling it\n\
                  \n\
                  Sandboxed environment — no filesystem, network, or module imports (import/require/eval are blocked). \
-                 Use forge.callTool(server, tool, args) for all external operations."
+                 Use forge.callTool(server, tool, args) for all external operations.\n\
+                 \n\
+                 Additional APIs (execute mode only):\n\
+                 - forge.readResource(server, uri) — read MCP resources from downstream servers\n\
+                 - forge.stash.put(key, value, {{ttl?}}) / .get(key) / .delete(key) / .keys() — \
+                 session-scoped key-value store for sharing data across executions\n\
+                 - forge.parallel(calls, opts) — bounded concurrent execution of tool/resource calls"
             )),
             server_info: Implementation {
                 name: "forge".into(),
@@ -247,7 +376,7 @@ mod tests {
             )
             .build();
         let dispatcher: Arc<dyn ToolDispatcher> = Arc::new(TestDispatcher);
-        ForgeServer::new(SandboxConfig::default(), manifest, dispatcher)
+        ForgeServer::new(SandboxConfig::default(), manifest, dispatcher, None)
     }
 
     #[test]

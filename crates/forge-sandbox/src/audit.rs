@@ -37,6 +37,11 @@ pub struct AuditEntry {
     pub operation: AuditOperation,
     /// Tool calls made during execution.
     pub tool_calls: Vec<ToolCallAudit>,
+    /// Resource reads made during execution.
+    pub resource_reads: Vec<ResourceReadAudit>,
+    /// Stash operations made during execution (SR-ST9).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stash_operations: Vec<StashOperationAudit>,
     /// Total execution duration in milliseconds.
     pub duration_ms: u64,
     /// Size of the result in bytes.
@@ -67,6 +72,52 @@ pub struct ToolCallAudit {
     /// Duration of this tool call in milliseconds.
     pub duration_ms: u64,
     /// Whether the tool call succeeded.
+    pub success: bool,
+}
+
+/// Audit record for a single resource read within an execution.
+#[derive(Debug, Clone, Serialize)]
+pub struct ResourceReadAudit {
+    /// Target server name.
+    pub server: String,
+    /// SHA-256 hash of the resource URI (URIs never stored raw in audit logs).
+    pub uri_hash: String,
+    /// Size of the resource content in bytes.
+    pub size_bytes: usize,
+    /// Duration of this resource read in milliseconds.
+    pub duration_ms: u64,
+    /// Whether the resource read succeeded.
+    pub success: bool,
+}
+
+/// Type of stash operation for audit logging.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StashOpType {
+    /// Store a value.
+    Put,
+    /// Retrieve a value.
+    Get,
+    /// Delete an entry.
+    Delete,
+    /// List visible keys.
+    Keys,
+}
+
+/// Audit record for a single stash operation within an execution.
+///
+/// Per SR-ST9: key name is logged but value content is NOT — only `size_bytes`.
+#[derive(Debug, Clone, Serialize)]
+pub struct StashOperationAudit {
+    /// Type of stash operation.
+    pub op_type: StashOpType,
+    /// The stash key (name only, never the value).
+    pub key: String,
+    /// Size of the value in bytes (for put), 0 for other operations.
+    pub size_bytes: usize,
+    /// Duration of this operation in milliseconds.
+    pub duration_ms: u64,
+    /// Whether the operation succeeded.
     pub success: bool,
 }
 
@@ -168,6 +219,8 @@ pub struct AuditEntryBuilder {
     code_preview: String,
     operation: AuditOperation,
     tool_calls: Vec<ToolCallAudit>,
+    resource_reads: Vec<ResourceReadAudit>,
+    stash_operations: Vec<StashOperationAudit>,
     start: Instant,
 }
 
@@ -181,6 +234,8 @@ impl AuditEntryBuilder {
             code_preview: code_preview(code),
             operation,
             tool_calls: Vec::new(),
+            resource_reads: Vec::new(),
+            stash_operations: Vec::new(),
             start: Instant::now(),
         }
     }
@@ -188,6 +243,16 @@ impl AuditEntryBuilder {
     /// Record a tool call.
     pub fn record_tool_call(&mut self, audit: ToolCallAudit) {
         self.tool_calls.push(audit);
+    }
+
+    /// Record a resource read.
+    pub fn record_resource_read(&mut self, audit: ResourceReadAudit) {
+        self.resource_reads.push(audit);
+    }
+
+    /// Record a stash operation.
+    pub fn record_stash_op(&mut self, audit: StashOperationAudit) {
+        self.stash_operations.push(audit);
     }
 
     /// Finalize the audit entry with the execution result.
@@ -214,6 +279,8 @@ impl AuditEntryBuilder {
             code_preview: self.code_preview,
             operation: self.operation,
             tool_calls: self.tool_calls,
+            resource_reads: self.resource_reads,
+            stash_operations: self.stash_operations,
             duration_ms,
             result_size_bytes,
             outcome,
@@ -271,9 +338,165 @@ impl crate::ToolDispatcher for AuditingDispatcher {
     }
 }
 
+/// An audit-logging wrapper around a [`ResourceDispatcher`] that records resource read metrics.
+pub struct AuditingResourceDispatcher {
+    inner: Arc<dyn crate::ResourceDispatcher>,
+    audit_tx: tokio::sync::mpsc::UnboundedSender<ResourceReadAudit>,
+}
+
+impl AuditingResourceDispatcher {
+    /// Wrap a resource dispatcher with audit recording.
+    pub fn new(
+        inner: Arc<dyn crate::ResourceDispatcher>,
+        audit_tx: tokio::sync::mpsc::UnboundedSender<ResourceReadAudit>,
+    ) -> Self {
+        Self { inner, audit_tx }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::ResourceDispatcher for AuditingResourceDispatcher {
+    async fn read_resource(
+        &self,
+        server: &str,
+        uri: &str,
+    ) -> Result<serde_json::Value, anyhow::Error> {
+        let uri_hash = sha256_hex(uri);
+        let start = Instant::now();
+
+        let result = self.inner.read_resource(server, uri).await;
+
+        let size_bytes = result
+            .as_ref()
+            .ok()
+            .and_then(|v| serde_json::to_string(v).ok())
+            .map(|s| s.len())
+            .unwrap_or(0);
+
+        let audit = ResourceReadAudit {
+            server: server.to_string(),
+            uri_hash,
+            size_bytes,
+            duration_ms: start.elapsed().as_millis() as u64,
+            success: result.is_ok(),
+        };
+        let _ = self.audit_tx.send(audit);
+
+        result
+    }
+}
+
+/// An audit-logging wrapper around a [`StashDispatcher`] that records stash operation metrics.
+///
+/// Per SR-ST9: logs key name and value size, never the value content itself.
+pub struct AuditingStashDispatcher {
+    inner: Arc<dyn crate::StashDispatcher>,
+    audit_tx: tokio::sync::mpsc::UnboundedSender<StashOperationAudit>,
+}
+
+impl AuditingStashDispatcher {
+    /// Wrap a stash dispatcher with audit recording.
+    pub fn new(
+        inner: Arc<dyn crate::StashDispatcher>,
+        audit_tx: tokio::sync::mpsc::UnboundedSender<StashOperationAudit>,
+    ) -> Self {
+        Self { inner, audit_tx }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::StashDispatcher for AuditingStashDispatcher {
+    async fn put(
+        &self,
+        key: &str,
+        value: serde_json::Value,
+        ttl_secs: Option<u32>,
+        current_group: Option<String>,
+    ) -> Result<serde_json::Value, anyhow::Error> {
+        let size_bytes = serde_json::to_string(&value).map(|s| s.len()).unwrap_or(0);
+        let start = Instant::now();
+
+        let result = self.inner.put(key, value, ttl_secs, current_group).await;
+
+        let audit = StashOperationAudit {
+            op_type: StashOpType::Put,
+            key: key.to_string(),
+            size_bytes,
+            duration_ms: start.elapsed().as_millis() as u64,
+            success: result.is_ok(),
+        };
+        let _ = self.audit_tx.send(audit);
+
+        result
+    }
+
+    async fn get(
+        &self,
+        key: &str,
+        current_group: Option<String>,
+    ) -> Result<serde_json::Value, anyhow::Error> {
+        let start = Instant::now();
+
+        let result = self.inner.get(key, current_group).await;
+
+        let audit = StashOperationAudit {
+            op_type: StashOpType::Get,
+            key: key.to_string(),
+            size_bytes: 0,
+            duration_ms: start.elapsed().as_millis() as u64,
+            success: result.is_ok(),
+        };
+        let _ = self.audit_tx.send(audit);
+
+        result
+    }
+
+    async fn delete(
+        &self,
+        key: &str,
+        current_group: Option<String>,
+    ) -> Result<serde_json::Value, anyhow::Error> {
+        let start = Instant::now();
+
+        let result = self.inner.delete(key, current_group).await;
+
+        let audit = StashOperationAudit {
+            op_type: StashOpType::Delete,
+            key: key.to_string(),
+            size_bytes: 0,
+            duration_ms: start.elapsed().as_millis() as u64,
+            success: result.is_ok(),
+        };
+        let _ = self.audit_tx.send(audit);
+
+        result
+    }
+
+    async fn keys(
+        &self,
+        current_group: Option<String>,
+    ) -> Result<serde_json::Value, anyhow::Error> {
+        let start = Instant::now();
+
+        let result = self.inner.keys(current_group).await;
+
+        let audit = StashOperationAudit {
+            op_type: StashOpType::Keys,
+            key: String::new(),
+            size_bytes: 0,
+            duration_ms: start.elapsed().as_millis() as u64,
+            success: result.is_ok(),
+        };
+        let _ = self.audit_tx.send(audit);
+
+        result
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::StashDispatcher;
 
     #[test]
     fn sha256_hex_produces_correct_hash() {
@@ -390,6 +613,8 @@ mod tests {
             code_preview: "async () => {}".into(),
             operation: AuditOperation::Execute,
             tool_calls: vec![],
+            resource_reads: vec![],
+            stash_operations: vec![],
             duration_ms: 42,
             result_size_bytes: 10,
             outcome: AuditOutcome::Success,
@@ -434,6 +659,8 @@ mod tests {
                     success: false,
                 },
             ],
+            resource_reads: vec![],
+            stash_operations: vec![],
             duration_ms: 100,
             result_size_bytes: 500,
             outcome: AuditOutcome::Success,
@@ -465,6 +692,8 @@ mod tests {
                 duration_ms: 1,
                 success: true,
             }],
+            resource_reads: vec![],
+            stash_operations: vec![],
             duration_ms: 1,
             result_size_bytes: 0,
             outcome: AuditOutcome::Success,
@@ -474,5 +703,124 @@ mod tests {
         // Verify that the JSON contains "args_hash" field, not "args"
         assert!(json.contains("args_hash"));
         assert!(!json.contains("\"args\""));
+    }
+
+    #[test]
+    fn stash_operations_omitted_when_empty() {
+        let entry = AuditEntry {
+            execution_id: "id".into(),
+            timestamp: Utc::now(),
+            code_hash: "hash".into(),
+            code_preview: "preview".into(),
+            operation: AuditOperation::Execute,
+            tool_calls: vec![],
+            resource_reads: vec![],
+            stash_operations: vec![],
+            duration_ms: 1,
+            result_size_bytes: 0,
+            outcome: AuditOutcome::Success,
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(
+            !json.contains("stash_operations"),
+            "stash_operations should be omitted when empty"
+        );
+    }
+
+    #[test]
+    fn stash_operations_included_when_present() {
+        let entry = AuditEntry {
+            execution_id: "id".into(),
+            timestamp: Utc::now(),
+            code_hash: "hash".into(),
+            code_preview: "preview".into(),
+            operation: AuditOperation::Execute,
+            tool_calls: vec![],
+            resource_reads: vec![],
+            stash_operations: vec![StashOperationAudit {
+                op_type: StashOpType::Put,
+                key: "mykey".into(),
+                size_bytes: 42,
+                duration_ms: 1,
+                success: true,
+            }],
+            duration_ms: 1,
+            result_size_bytes: 0,
+            outcome: AuditOutcome::Success,
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(json.contains("stash_operations"));
+        assert!(json.contains("mykey"));
+        assert!(json.contains("\"size_bytes\":42"));
+        // Value content must NOT appear in audit
+        assert!(!json.contains("\"value\""));
+    }
+
+    #[tokio::test]
+    async fn auditing_stash_dispatcher_records_operations() {
+        use tokio::sync::mpsc;
+
+        /// Minimal stash dispatcher that records nothing.
+        struct NoopStash;
+
+        #[async_trait::async_trait]
+        impl crate::StashDispatcher for NoopStash {
+            async fn put(
+                &self,
+                _key: &str,
+                _value: serde_json::Value,
+                _ttl_secs: Option<u32>,
+                _current_group: Option<String>,
+            ) -> Result<serde_json::Value, anyhow::Error> {
+                Ok(serde_json::json!({"ok": true}))
+            }
+            async fn get(
+                &self,
+                _key: &str,
+                _current_group: Option<String>,
+            ) -> Result<serde_json::Value, anyhow::Error> {
+                Ok(serde_json::Value::Null)
+            }
+            async fn delete(
+                &self,
+                _key: &str,
+                _current_group: Option<String>,
+            ) -> Result<serde_json::Value, anyhow::Error> {
+                Ok(serde_json::json!({"deleted": false}))
+            }
+            async fn keys(
+                &self,
+                _current_group: Option<String>,
+            ) -> Result<serde_json::Value, anyhow::Error> {
+                Ok(serde_json::json!([]))
+            }
+        }
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let dispatcher = AuditingStashDispatcher::new(Arc::new(NoopStash), tx);
+
+        // Exercise all four operations
+        dispatcher
+            .put("k1", serde_json::json!("hello"), None, None)
+            .await
+            .unwrap();
+        dispatcher.get("k1", None).await.unwrap();
+        dispatcher.delete("k1", None).await.unwrap();
+        dispatcher.keys(None).await.unwrap();
+
+        let mut audits = Vec::new();
+        while let Ok(a) = rx.try_recv() {
+            audits.push(a);
+        }
+
+        assert_eq!(audits.len(), 4, "should have 4 audit entries");
+        assert!(matches!(audits[0].op_type, StashOpType::Put));
+        assert_eq!(audits[0].key, "k1");
+        assert!(audits[0].size_bytes > 0, "put should record value size");
+        assert!(matches!(audits[1].op_type, StashOpType::Get));
+        assert!(matches!(audits[2].op_type, StashOpType::Delete));
+        assert!(matches!(audits[3].op_type, StashOpType::Keys));
+        assert_eq!(audits[3].key, "", "keys op should have empty key");
+        assert!(audits.iter().all(|a| a.success));
     }
 }

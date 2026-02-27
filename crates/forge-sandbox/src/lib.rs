@@ -26,6 +26,7 @@ pub mod host;
 pub mod ipc;
 pub mod ops;
 pub mod redact;
+pub mod stash;
 pub mod validator;
 
 pub use error::SandboxError;
@@ -49,4 +50,67 @@ pub trait ToolDispatcher: Send + Sync {
         tool: &str,
         args: serde_json::Value,
     ) -> Result<serde_json::Value, anyhow::Error>;
+}
+
+/// Trait for dispatching resource reads from the sandbox to downstream MCP servers.
+///
+/// Resources are data objects (logs, files, database rows) exposed via MCP's
+/// resources/read protocol. Unlike tool calls, resources are read-only.
+#[async_trait::async_trait]
+pub trait ResourceDispatcher: Send + Sync {
+    /// Read a resource by URI from a downstream server.
+    ///
+    /// - `server`: The server name (e.g., "postgres", "github")
+    /// - `uri`: The resource URI (e.g., "file:///logs/app.log")
+    ///
+    /// Returns the resource content as a JSON value.
+    async fn read_resource(
+        &self,
+        server: &str,
+        uri: &str,
+    ) -> Result<serde_json::Value, anyhow::Error>;
+}
+
+/// Trait for dispatching stash operations from the sandbox.
+///
+/// The stash is a per-session key/value store that persists across sandbox
+/// executions within the same session. Entries are scoped by server group
+/// for isolation.
+#[async_trait::async_trait]
+pub trait StashDispatcher: Send + Sync {
+    /// Store a value under a key with an optional TTL.
+    ///
+    /// - `key`: Alphanumeric key (plus `_`, `-`, `.`, `:`) up to 256 chars
+    /// - `value`: The JSON value to store
+    /// - `ttl_secs`: TTL in seconds (0 = use default)
+    /// - `current_group`: The server group of the current execution, if any
+    async fn put(
+        &self,
+        key: &str,
+        value: serde_json::Value,
+        ttl_secs: Option<u32>,
+        current_group: Option<String>,
+    ) -> Result<serde_json::Value, anyhow::Error>;
+
+    /// Retrieve the value stored under a key.
+    ///
+    /// Returns `null` if the key does not exist or has expired.
+    async fn get(
+        &self,
+        key: &str,
+        current_group: Option<String>,
+    ) -> Result<serde_json::Value, anyhow::Error>;
+
+    /// Delete the entry stored under a key.
+    ///
+    /// Returns `{"deleted": true}` if the entry was removed, `{"deleted": false}` otherwise.
+    async fn delete(
+        &self,
+        key: &str,
+        current_group: Option<String>,
+    ) -> Result<serde_json::Value, anyhow::Error>;
+
+    /// List all keys visible to the current group.
+    async fn keys(&self, current_group: Option<String>)
+        -> Result<serde_json::Value, anyhow::Error>;
 }

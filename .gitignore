@@ -26,3 +26,6 @@ npm/bin/
 
 # Internal planning and commercial docs
 .archive/
+
+#v.02 spec
+v0.2-spec.md

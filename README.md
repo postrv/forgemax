@@ -7,6 +7,11 @@ Instead of dumping every tool schema into the LLM's context window, Forgemax exp
 - **`search`** — query a capability manifest to discover tools (read-only, sandboxed)
 - **`execute`** — run JavaScript against the tool API in a sandboxed V8 isolate
 
+v0.2 adds three new capabilities inside the sandbox (the MCP surface stays at exactly 2 tools):
+- **`forge.readResource(server, uri)`** — read MCP resources from downstream servers
+- **`forge.stash`** — session-scoped key-value store for sharing data across executions
+- **`forge.parallel(calls, opts)`** — bounded concurrent execution of tool/resource calls
+
 The LLM writes JavaScript that calls through typed proxy objects. Credentials, file paths, and internal state never leave the host — the sandbox only sees opaque bindings.
 
 Forgemax's Code Mode approach draws inspiration from [Cloudflare's sandbox tool-calling pattern](https://blog.cloudflare.com/code-mode/) — their implementation of sandboxed code execution for MCP tool orchestration is excellent and well worth studying. We encourage supporting their work.
@@ -46,6 +51,9 @@ The core innovation. Uses `deno_core` to run LLM-generated JavaScript in a locke
 - Tool call rate limiting
 - Opaque bindings — credentials never exposed to sandbox code
 - Dual-mode execution: in-process (tests) or isolated child process (production)
+- Resource reading with URI validation, size truncation, and rate limiting
+- Session stash with TTL, group isolation, and size limits
+- Bounded parallel execution (`forge.parallel()`) with concurrency caps
 
 ### forgemax-worker
 
@@ -230,6 +238,25 @@ async () => {
 }
 ```
 
+**4. Reading resources and using the stash:**
+
+```javascript
+async () => {
+  // Read a resource from a downstream server
+  const schema = await forge.readResource("db", "postgres://mydb/tables");
+
+  // Store it in the session stash for later executions
+  await forge.stash.put("db_schema", schema, 3600);
+
+  // Make parallel calls
+  const { results } = await forge.parallel([
+    () => forge.callTool("narsil", "ast.parse", { file: "a.rs" }),
+    () => forge.callTool("narsil", "ast.parse", { file: "b.rs" }),
+  ]);
+  return results;
+}
+```
+
 The sandbox executes JavaScript, routes `forge.callTool()` to real MCP servers via the `ToolDispatcher` trait, and returns JSON. The LLM never sees credentials, connection details, or raw API surfaces.
 
 ## Security Model
@@ -247,6 +274,13 @@ Code Validator          Banned patterns, size limits, Unicode normalization,
 Manifest Sanitization   Tool metadata sanitized to prevent prompt injection
         |
  Content Size Limits    OOM prevention for text (10MB), binary (1MB) responses
+        |
+  Resource Validation   URI validation (path traversal, null bytes, control chars)
+        |
+  Session Stash         Key validation, value/total size limits, TTL enforcement,
+                        group isolation
+        |
+  Parallel Execution    Bounded concurrency, shared rate limit counter
         |
   Error Redaction       URLs, IPs, paths, credentials, stack traces stripped
                         before reaching the LLM — validation errors preserved
@@ -274,19 +308,19 @@ Process Isolation       Child process, clean env, kill-on-timeout (production mo
   Audit Logging         Every execution logged — code hash, tool calls, duration, outcome
 ```
 
-Three rounds of adversarial security testing (automated scanners + manual review + Arbiter prompt shield) resolved 19 findings across all severity levels. See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed security analysis.
+See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed security analysis and threat model.
 
 ## Tests
 
-222 tests across the workspace:
+354 tests across the workspace:
 
 ```
-forge-sandbox       108 unit + 10 integration (child process mode)
+forge-sandbox       215 unit + 10 integration (child process mode)
 forge-manifest       25 (builders + dynamic generation + sanitization)
-forge-config         24 (parsing, validation, env expansion, groups)
+forge-config         31 (parsing, validation, env expansion, groups, stash)
 forge-client         32 unit (router, timeout, circuit breaker, header sanitization) + 9 e2e
-forge-server          6 unit + 4 integration
-forge-cli             4 unit (config parsing)
+forge-server          6 unit + 11 integration (resource, stash, parallel)
+forge-cli             5 unit (config parsing, stash config)
 ```
 
 ```bash

@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Result;
-use forge_sandbox::ToolDispatcher;
+use forge_sandbox::{ResourceDispatcher, ToolDispatcher};
 use serde_json::Value;
 
 /// A [`ToolDispatcher`] that routes `call_tool(server, tool, args)` to the
@@ -56,6 +56,53 @@ impl ToolDispatcher for RouterDispatcher {
             )
         })?;
         client.call_tool(server, tool, args).await
+    }
+}
+
+/// A [`ResourceDispatcher`] that routes `read_resource(server, uri)` to the
+/// correct downstream MCP client based on server name.
+pub struct RouterResourceDispatcher {
+    clients: HashMap<String, Arc<dyn ResourceDispatcher>>,
+}
+
+impl RouterResourceDispatcher {
+    /// Create a new empty resource router.
+    pub fn new() -> Self {
+        Self {
+            clients: HashMap::new(),
+        }
+    }
+
+    /// Register a resource dispatcher for a named server.
+    pub fn add_client(&mut self, name: impl Into<String>, client: Arc<dyn ResourceDispatcher>) {
+        self.clients.insert(name.into(), client);
+    }
+
+    /// List all registered server names.
+    pub fn server_names(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = self.clients.keys().map(|s| s.as_str()).collect();
+        names.sort();
+        names
+    }
+}
+
+impl Default for RouterResourceDispatcher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait::async_trait]
+impl ResourceDispatcher for RouterResourceDispatcher {
+    async fn read_resource(&self, server: &str, uri: &str) -> Result<Value> {
+        let client = self.clients.get(server).ok_or_else(|| {
+            anyhow::anyhow!(
+                "unknown server '{}' for resource read, available servers: {:?}",
+                server,
+                self.server_names()
+            )
+        })?;
+        client.read_resource(server, uri).await
     }
 }
 
@@ -239,5 +286,66 @@ mod tests {
         let result = router.call_tool("any", "tool", serde_json::json!({})).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("unknown server"));
+    }
+
+    // --- v0.2 Resource Router Tests (RS-C05..RS-C06) ---
+
+    struct MockResourceDispatcher {
+        name: String,
+    }
+
+    #[async_trait::async_trait]
+    impl ResourceDispatcher for MockResourceDispatcher {
+        async fn read_resource(&self, server: &str, uri: &str) -> Result<Value> {
+            Ok(serde_json::json!({
+                "dispatcher": self.name,
+                "server": server,
+                "uri": uri,
+                "content": "mock data"
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn rs_c05_resource_router_dispatches_to_correct_client() {
+        let client_a = Arc::new(MockResourceDispatcher {
+            name: "client-a".into(),
+        });
+        let client_b = Arc::new(MockResourceDispatcher {
+            name: "client-b".into(),
+        });
+
+        let mut router = RouterResourceDispatcher::new();
+        router.add_client("server-a", client_a);
+        router.add_client("server-b", client_b);
+
+        let result = router
+            .read_resource("server-a", "file:///log")
+            .await
+            .unwrap();
+        assert_eq!(result["dispatcher"], "client-a");
+
+        let result = router
+            .read_resource("server-b", "db://table")
+            .await
+            .unwrap();
+        assert_eq!(result["dispatcher"], "client-b");
+    }
+
+    #[tokio::test]
+    async fn rs_c06_resource_router_returns_error_for_unknown_server() {
+        let mut router = RouterResourceDispatcher::new();
+        router.add_client(
+            "known",
+            Arc::new(MockResourceDispatcher {
+                name: "known".into(),
+            }),
+        );
+
+        let result = router.read_resource("nonexistent", "uri").await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("nonexistent"), "got: {err}");
+        assert!(err.contains("known"), "should list available: {err}");
     }
 }

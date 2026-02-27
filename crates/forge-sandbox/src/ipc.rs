@@ -28,6 +28,20 @@ pub enum ParentMessage {
         /// The tool call result, or an error message.
         result: Result<Value, String>,
     },
+    /// Response to a resource read request from the child.
+    ResourceReadResult {
+        /// Matches the request_id from ChildMessage::ResourceReadRequest.
+        request_id: u64,
+        /// The resource content, or an error message.
+        result: Result<Value, String>,
+    },
+    /// Response to a stash operation from the child.
+    StashResult {
+        /// Matches the request_id from the stash request.
+        request_id: u64,
+        /// The stash operation result, or an error message.
+        result: Result<Value, String>,
+    },
 }
 
 /// Messages sent from the worker child to the parent process.
@@ -44,6 +58,45 @@ pub enum ChildMessage {
         tool: String,
         /// Tool arguments.
         args: Value,
+    },
+    /// Request the parent to read a resource.
+    ResourceReadRequest {
+        /// Unique ID for correlating request ↔ response.
+        request_id: u64,
+        /// Target server name.
+        server: String,
+        /// Resource URI.
+        uri: String,
+    },
+    /// Request the parent to put a value in the stash.
+    StashPut {
+        /// Unique ID for correlating request ↔ response.
+        request_id: u64,
+        /// Stash key.
+        key: String,
+        /// Value to store.
+        value: Value,
+        /// TTL in seconds (None = use default).
+        ttl_secs: Option<u32>,
+    },
+    /// Request the parent to get a value from the stash.
+    StashGet {
+        /// Unique ID for correlating request ↔ response.
+        request_id: u64,
+        /// Stash key.
+        key: String,
+    },
+    /// Request the parent to delete a value from the stash.
+    StashDelete {
+        /// Unique ID for correlating request ↔ response.
+        request_id: u64,
+        /// Stash key.
+        key: String,
+    },
+    /// Request the parent to list stash keys.
+    StashKeys {
+        /// Unique ID for correlating request ↔ response.
+        request_id: u64,
     },
     /// The execution has finished.
     ExecutionComplete {
@@ -75,10 +128,24 @@ pub struct WorkerConfig {
     /// Maximum IPC message size in bytes. Defaults to [`DEFAULT_MAX_IPC_MESSAGE_SIZE`].
     #[serde(default = "default_max_ipc_message_size")]
     pub max_ipc_message_size: usize,
+    /// Maximum resource content size in bytes.
+    #[serde(default = "default_max_resource_size")]
+    pub max_resource_size: usize,
+    /// Maximum concurrent calls in forge.parallel().
+    #[serde(default = "default_max_parallel")]
+    pub max_parallel: usize,
 }
 
 fn default_max_ipc_message_size() -> usize {
     DEFAULT_MAX_IPC_MESSAGE_SIZE
+}
+
+fn default_max_resource_size() -> usize {
+    64 * 1024 * 1024 // 64 MB
+}
+
+fn default_max_parallel() -> usize {
+    8
 }
 
 impl From<&crate::SandboxConfig> for WorkerConfig {
@@ -91,6 +158,8 @@ impl From<&crate::SandboxConfig> for WorkerConfig {
             max_output_size: config.max_output_size,
             max_code_size: config.max_code_size,
             max_ipc_message_size: DEFAULT_MAX_IPC_MESSAGE_SIZE,
+            max_resource_size: config.max_resource_size,
+            max_parallel: config.max_parallel,
         }
     }
 }
@@ -107,6 +176,8 @@ impl WorkerConfig {
             max_tool_calls: self.max_tool_calls,
             max_tool_call_args_size: self.max_tool_call_args_size,
             execution_mode: crate::executor::ExecutionMode::InProcess, // worker always runs in-process
+            max_resource_size: self.max_resource_size,
+            max_parallel: self.max_parallel,
         }
     }
 }
@@ -203,6 +274,8 @@ mod tests {
                 max_output_size: 1024 * 1024,
                 max_code_size: 64 * 1024,
                 max_ipc_message_size: DEFAULT_MAX_IPC_MESSAGE_SIZE,
+                max_resource_size: 64 * 1024 * 1024,
+                max_parallel: 8,
             },
         };
 
@@ -503,5 +576,278 @@ mod tests {
         }"#;
         let config: WorkerConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.max_ipc_message_size, DEFAULT_MAX_IPC_MESSAGE_SIZE);
+    }
+
+    // --- IPC-01: ResourceReadRequest round-trip ---
+    #[tokio::test]
+    async fn ipc_01_resource_read_request_roundtrip() {
+        let msg = ChildMessage::ResourceReadRequest {
+            request_id: 10,
+            server: "postgres".into(),
+            uri: "file:///logs/app.log".into(),
+        };
+
+        let mut buf = Vec::new();
+        write_message(&mut buf, &msg).await.unwrap();
+
+        let mut cursor = Cursor::new(buf);
+        let decoded: ChildMessage = read_message(&mut cursor).await.unwrap().unwrap();
+
+        match decoded {
+            ChildMessage::ResourceReadRequest {
+                request_id,
+                server,
+                uri,
+            } => {
+                assert_eq!(request_id, 10);
+                assert_eq!(server, "postgres");
+                assert_eq!(uri, "file:///logs/app.log");
+            }
+            other => panic!("expected ResourceReadRequest, got: {:?}", other),
+        }
+    }
+
+    // --- IPC-02: ResourceReadResult (success) round-trip ---
+    #[tokio::test]
+    async fn ipc_02_resource_read_result_success_roundtrip() {
+        let msg = ParentMessage::ResourceReadResult {
+            request_id: 11,
+            result: Ok(serde_json::json!({"content": "log data here"})),
+        };
+
+        let mut buf = Vec::new();
+        write_message(&mut buf, &msg).await.unwrap();
+
+        let mut cursor = Cursor::new(buf);
+        let decoded: ParentMessage = read_message(&mut cursor).await.unwrap().unwrap();
+
+        match decoded {
+            ParentMessage::ResourceReadResult { request_id, result } => {
+                assert_eq!(request_id, 11);
+                let val = result.unwrap();
+                assert_eq!(val["content"], "log data here");
+            }
+            other => panic!("expected ResourceReadResult, got: {:?}", other),
+        }
+    }
+
+    // --- IPC-03: ResourceReadResult (error) round-trip ---
+    #[tokio::test]
+    async fn ipc_03_resource_read_result_error_roundtrip() {
+        let msg = ParentMessage::ResourceReadResult {
+            request_id: 12,
+            result: Err("resource not found".into()),
+        };
+
+        let mut buf = Vec::new();
+        write_message(&mut buf, &msg).await.unwrap();
+
+        let mut cursor = Cursor::new(buf);
+        let decoded: ParentMessage = read_message(&mut cursor).await.unwrap().unwrap();
+
+        match decoded {
+            ParentMessage::ResourceReadResult { request_id, result } => {
+                assert_eq!(request_id, 12);
+                assert_eq!(result.unwrap_err(), "resource not found");
+            }
+            other => panic!("expected ResourceReadResult, got: {:?}", other),
+        }
+    }
+
+    // --- IPC-04: StashPut round-trip ---
+    #[tokio::test]
+    async fn ipc_04_stash_put_roundtrip() {
+        let msg = ChildMessage::StashPut {
+            request_id: 20,
+            key: "my-key".into(),
+            value: serde_json::json!({"data": 42}),
+            ttl_secs: Some(60),
+        };
+
+        let mut buf = Vec::new();
+        write_message(&mut buf, &msg).await.unwrap();
+
+        let mut cursor = Cursor::new(buf);
+        let decoded: ChildMessage = read_message(&mut cursor).await.unwrap().unwrap();
+
+        match decoded {
+            ChildMessage::StashPut {
+                request_id,
+                key,
+                value,
+                ttl_secs,
+            } => {
+                assert_eq!(request_id, 20);
+                assert_eq!(key, "my-key");
+                assert_eq!(value["data"], 42);
+                assert_eq!(ttl_secs, Some(60));
+            }
+            other => panic!("expected StashPut, got: {:?}", other),
+        }
+    }
+
+    // --- IPC-05: StashGet round-trip ---
+    #[tokio::test]
+    async fn ipc_05_stash_get_roundtrip() {
+        let msg = ChildMessage::StashGet {
+            request_id: 21,
+            key: "lookup-key".into(),
+        };
+
+        let mut buf = Vec::new();
+        write_message(&mut buf, &msg).await.unwrap();
+
+        let mut cursor = Cursor::new(buf);
+        let decoded: ChildMessage = read_message(&mut cursor).await.unwrap().unwrap();
+
+        match decoded {
+            ChildMessage::StashGet { request_id, key } => {
+                assert_eq!(request_id, 21);
+                assert_eq!(key, "lookup-key");
+            }
+            other => panic!("expected StashGet, got: {:?}", other),
+        }
+    }
+
+    // --- IPC-06: StashDelete round-trip ---
+    #[tokio::test]
+    async fn ipc_06_stash_delete_roundtrip() {
+        let msg = ChildMessage::StashDelete {
+            request_id: 22,
+            key: "delete-me".into(),
+        };
+
+        let mut buf = Vec::new();
+        write_message(&mut buf, &msg).await.unwrap();
+
+        let mut cursor = Cursor::new(buf);
+        let decoded: ChildMessage = read_message(&mut cursor).await.unwrap().unwrap();
+
+        match decoded {
+            ChildMessage::StashDelete { request_id, key } => {
+                assert_eq!(request_id, 22);
+                assert_eq!(key, "delete-me");
+            }
+            other => panic!("expected StashDelete, got: {:?}", other),
+        }
+    }
+
+    // --- IPC-07: StashKeys round-trip ---
+    #[tokio::test]
+    async fn ipc_07_stash_keys_roundtrip() {
+        let msg = ChildMessage::StashKeys { request_id: 23 };
+
+        let mut buf = Vec::new();
+        write_message(&mut buf, &msg).await.unwrap();
+
+        let mut cursor = Cursor::new(buf);
+        let decoded: ChildMessage = read_message(&mut cursor).await.unwrap().unwrap();
+
+        match decoded {
+            ChildMessage::StashKeys { request_id } => {
+                assert_eq!(request_id, 23);
+            }
+            other => panic!("expected StashKeys, got: {:?}", other),
+        }
+    }
+
+    // --- IPC-08: StashResult round-trip ---
+    #[tokio::test]
+    async fn ipc_08_stash_result_roundtrip() {
+        let msg = ParentMessage::StashResult {
+            request_id: 24,
+            result: Ok(serde_json::json!({"ok": true})),
+        };
+
+        let mut buf = Vec::new();
+        write_message(&mut buf, &msg).await.unwrap();
+
+        let mut cursor = Cursor::new(buf);
+        let decoded: ParentMessage = read_message(&mut cursor).await.unwrap().unwrap();
+
+        match decoded {
+            ParentMessage::StashResult { request_id, result } => {
+                assert_eq!(request_id, 24);
+                assert_eq!(result.unwrap(), serde_json::json!({"ok": true}));
+            }
+            other => panic!("expected StashResult, got: {:?}", other),
+        }
+    }
+
+    // --- IPC-09: Mixed message interleaving (tool + resource + stash in single stream) ---
+    #[tokio::test]
+    async fn ipc_09_mixed_message_interleaving() {
+        let msg1 = ChildMessage::ToolCallRequest {
+            request_id: 1,
+            server: "s".into(),
+            tool: "t".into(),
+            args: serde_json::json!({}),
+        };
+        let msg2 = ChildMessage::ResourceReadRequest {
+            request_id: 2,
+            server: "pg".into(),
+            uri: "file:///data".into(),
+        };
+        let msg3 = ChildMessage::StashPut {
+            request_id: 3,
+            key: "k".into(),
+            value: serde_json::json!("v"),
+            ttl_secs: None,
+        };
+        let msg4 = ChildMessage::StashGet {
+            request_id: 4,
+            key: "k".into(),
+        };
+        let msg5 = ChildMessage::ExecutionComplete {
+            result: Ok(serde_json::json!("done")),
+        };
+
+        let mut buf = Vec::new();
+        write_message(&mut buf, &msg1).await.unwrap();
+        write_message(&mut buf, &msg2).await.unwrap();
+        write_message(&mut buf, &msg3).await.unwrap();
+        write_message(&mut buf, &msg4).await.unwrap();
+        write_message(&mut buf, &msg5).await.unwrap();
+
+        let mut cursor = Cursor::new(buf);
+        let d1: ChildMessage = read_message(&mut cursor).await.unwrap().unwrap();
+        let d2: ChildMessage = read_message(&mut cursor).await.unwrap().unwrap();
+        let d3: ChildMessage = read_message(&mut cursor).await.unwrap().unwrap();
+        let d4: ChildMessage = read_message(&mut cursor).await.unwrap().unwrap();
+        let d5: ChildMessage = read_message(&mut cursor).await.unwrap().unwrap();
+
+        assert!(matches!(d1, ChildMessage::ToolCallRequest { .. }));
+        assert!(matches!(d2, ChildMessage::ResourceReadRequest { .. }));
+        assert!(matches!(d3, ChildMessage::StashPut { .. }));
+        assert!(matches!(d4, ChildMessage::StashGet { .. }));
+        assert!(matches!(d5, ChildMessage::ExecutionComplete { .. }));
+
+        // EOF after all messages
+        let d6: Option<ChildMessage> = read_message(&mut cursor).await.unwrap();
+        assert!(d6.is_none());
+    }
+
+    // --- IPC-10: Oversized stash message rejected by read_message_with_limit ---
+    #[tokio::test]
+    async fn ipc_10_oversized_stash_message_rejected() {
+        let msg = ChildMessage::StashPut {
+            request_id: 100,
+            key: "k".into(),
+            value: serde_json::json!("x".repeat(2048)),
+            ttl_secs: Some(60),
+        };
+        let mut buf = Vec::new();
+        write_message(&mut buf, &msg).await.unwrap();
+
+        // Set limit smaller than the message payload
+        let mut cursor = Cursor::new(buf);
+        let result: Result<Option<ChildMessage>, _> =
+            read_message_with_limit(&mut cursor, 64).await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("too large"),
+            "error should mention 'too large': {err_msg}"
+        );
     }
 }
