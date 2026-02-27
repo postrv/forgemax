@@ -145,6 +145,10 @@ pub struct SandboxOverrides {
     #[serde(default)]
     pub execution_mode: Option<String>,
 
+    /// Maximum IPC message size in megabytes (default: 8 MB).
+    #[serde(default)]
+    pub max_ipc_message_size_mb: Option<usize>,
+
     /// Maximum resource content size in megabytes (default: 64 MB).
     #[serde(default)]
     pub max_resource_size_mb: Option<usize>,
@@ -342,10 +346,10 @@ impl ForgeConfig {
             }
         }
 
-        // CV-07: max_resource_size_mb + 1 must fit within IPC message size (64 MB default)
+        // CV-07: max_resource_size_mb + 1 must fit within IPC message size
         // In child_process mode, resource content flows over IPC
         if let Some(resource_mb) = self.sandbox.max_resource_size_mb {
-            let ipc_limit_mb = 64; // DEFAULT_MAX_IPC_MESSAGE_SIZE is 64 MB
+            let ipc_limit_mb = self.sandbox.max_ipc_message_size_mb.unwrap_or(8); // default 8 MB
             if resource_mb + 1 > ipc_limit_mb {
                 return Err(ConfigError::Invalid(format!(
                     "sandbox.max_resource_size_mb ({}) + 1 MB overhead exceeds IPC message limit ({} MB)",
@@ -440,21 +444,21 @@ mod tests {
 
     #[test]
     fn config_expands_environment_variables() {
-        std::env::set_var("FORGE_TEST_TOKEN", "secret123");
-        let toml = r#"
-            [servers.github]
-            url = "https://mcp.github.com/sse"
-            transport = "sse"
-            headers = { Authorization = "Bearer ${FORGE_TEST_TOKEN}" }
-        "#;
+        temp_env::with_var("FORGE_TEST_TOKEN", Some("secret123"), || {
+            let toml = r#"
+                [servers.github]
+                url = "https://mcp.github.com/sse"
+                transport = "sse"
+                headers = { Authorization = "Bearer ${FORGE_TEST_TOKEN}" }
+            "#;
 
-        let config = ForgeConfig::from_toml_with_env(toml).unwrap();
-        let github = &config.servers["github"];
-        assert_eq!(
-            github.headers.get("Authorization").unwrap(),
-            "Bearer secret123"
-        );
-        std::env::remove_var("FORGE_TEST_TOKEN");
+            let config = ForgeConfig::from_toml_with_env(toml).unwrap();
+            let github = &config.servers["github"];
+            assert_eq!(
+                github.headers.get("Authorization").unwrap(),
+                "Bearer secret123"
+            );
+        });
     }
 
     #[test]
@@ -775,8 +779,8 @@ mod tests {
 
     #[test]
     fn cv01_max_resource_size_mb_range() {
-        // Valid (must fit within IPC limit too)
-        let toml = "[sandbox]\nmax_resource_size_mb = 32";
+        // Valid (must fit within IPC limit — default 8 MB)
+        let toml = "[sandbox]\nmax_resource_size_mb = 7";
         assert!(ForgeConfig::from_toml(toml).is_ok());
 
         // Zero is invalid
@@ -872,21 +876,26 @@ mod tests {
 
     #[test]
     fn cv07_max_resource_size_fits_ipc() {
-        // Valid: 63 MB + 1 MB overhead = 64 MB = fits
-        let toml = "[sandbox]\nmax_resource_size_mb = 63";
+        // Valid: 7 MB + 1 MB overhead = 8 MB = fits default IPC limit
+        let toml = "[sandbox]\nmax_resource_size_mb = 7";
         assert!(ForgeConfig::from_toml(toml).is_ok());
 
-        // Invalid: 64 MB + 1 MB overhead = 65 MB > 64 MB IPC limit
-        let toml = "[sandbox]\nmax_resource_size_mb = 64";
+        // Invalid: 8 MB + 1 MB overhead = 9 MB > 8 MB default IPC limit
+        let toml = "[sandbox]\nmax_resource_size_mb = 8";
         let err = ForgeConfig::from_toml(toml).unwrap_err().to_string();
         assert!(err.contains("IPC"), "got: {err}");
+
+        // Valid with explicit larger IPC limit
+        let toml = "[sandbox]\nmax_resource_size_mb = 32\nmax_ipc_message_size_mb = 64";
+        assert!(ForgeConfig::from_toml(toml).is_ok());
     }
 
     #[test]
     fn config_parses_v02_sandbox_fields() {
         let toml = r#"
             [sandbox]
-            max_resource_size_mb = 32
+            max_resource_size_mb = 7
+            max_ipc_message_size_mb = 64
             max_parallel = 4
 
             [sandbox.stash]
@@ -898,7 +907,8 @@ mod tests {
         "#;
 
         let config = ForgeConfig::from_toml(toml).unwrap();
-        assert_eq!(config.sandbox.max_resource_size_mb, Some(32));
+        assert_eq!(config.sandbox.max_resource_size_mb, Some(7));
+        assert_eq!(config.sandbox.max_ipc_message_size_mb, Some(64));
         assert_eq!(config.sandbox.max_parallel, Some(4));
 
         let stash = config.sandbox.stash.unwrap();

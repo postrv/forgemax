@@ -15,7 +15,9 @@ static URL_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"https?://[^\s'")
 static IP_PORT_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}(:\d+)?").unwrap());
 
-static UNIX_PATH_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(/[\w.\-]+){2,}").unwrap());
+static UNIX_PATH_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"/(home|Users|etc|var|tmp|opt|usr|root|mnt|srv|proc|sys|dev|run|boot|snap|nix)(/[\w.\-]+)+").unwrap()
+});
 
 static WINDOWS_PATH_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"[A-Z]:\\[\w.\\\-]+").unwrap());
@@ -26,6 +28,28 @@ static CREDENTIAL_RE: LazyLock<Regex> = LazyLock::new(|| {
     )
     .unwrap()
 });
+
+/// AWS access key IDs (always start with AKIA, ABIA, ACCA, or ASIA + 16 alphanumeric chars).
+static AWS_KEY_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?:AKIA|ABIA|ACCA|ASIA)[0-9A-Z]{16}").unwrap());
+
+/// PEM-encoded private key headers.
+static PEM_KEY_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"-----BEGIN[A-Z\s]+PRIVATE KEY-----[\s\S]*?-----END[A-Z\s]+PRIVATE KEY-----")
+        .unwrap()
+});
+
+/// GitHub tokens: PATs (ghp_), OAuth (gho_), and fine-grained (github_pat_).
+static GITHUB_TOKEN_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?:ghp_|gho_|ghs_|ghr_|github_pat_)[a-zA-Z0-9_]{20,}").unwrap());
+
+/// Long hex strings (64+ chars) that look like secret keys or hashes used as tokens.
+static HEX_TOKEN_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b[0-9a-fA-F]{64,}\b").unwrap());
+
+/// JWT tokens (three base64url-encoded segments separated by dots).
+static JWT_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"eyJ[a-zA-Z0-9_-]+\.eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+").unwrap());
 
 static STACK_TRACE_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?m)^\s*(at\s+.+|Caused by:.*|[\w.$]+Exception.*|\.{3}\s*\d+\s*more)$").unwrap()
@@ -57,8 +81,14 @@ pub fn redact_error_for_llm(server: &str, tool: &str, error: &str) -> String {
 pub fn redact_error_message(error: &str) -> String {
     let mut msg = error.to_string();
 
-    // Order matters: strip credentials before URLs (credentials may contain URLs)
+    // Order matters: strip most specific credential patterns first, then general ones,
+    // then URLs (credentials may contain URLs).
+    msg = PEM_KEY_RE.replace_all(&msg, "[REDACTED]").to_string();
+    msg = JWT_RE.replace_all(&msg, "[REDACTED]").to_string();
+    msg = AWS_KEY_RE.replace_all(&msg, "[REDACTED]").to_string();
+    msg = GITHUB_TOKEN_RE.replace_all(&msg, "[REDACTED]").to_string();
     msg = CREDENTIAL_RE.replace_all(&msg, "[REDACTED]").to_string();
+    msg = HEX_TOKEN_RE.replace_all(&msg, "[REDACTED]").to_string();
     msg = URL_RE.replace_all(&msg, "[url]").to_string();
     msg = IP_PORT_RE.replace_all(&msg, "[addr]").to_string();
     msg = WINDOWS_PATH_RE.replace_all(&msg, "[path]").to_string();
@@ -234,6 +264,123 @@ mod tests {
         let msg = "no results found";
         let result = redact_error_message(msg);
         assert_eq!(result, msg);
+    }
+
+    // --- CR-01: AWS access key redaction ---
+    #[test]
+    fn cr01_redacts_aws_access_keys() {
+        let msg = "invalid credentials: AKIAIOSFODNN7EXAMPLE";
+        let result = redact_error_message(msg);
+        assert!(
+            result.contains("[REDACTED]"),
+            "should redact AWS key: {result}"
+        );
+        assert!(
+            !result.contains("AKIAIOSFODNN7"),
+            "should not contain AWS key: {result}"
+        );
+    }
+
+    // --- CR-02: connection string credential redaction ---
+    #[test]
+    fn cr02_redacts_connection_string_passwords() {
+        let msg = "connection failed: password=s3cr3t&host=db.internal";
+        let result = redact_error_message(msg);
+        assert!(
+            result.contains("[REDACTED]"),
+            "should redact password: {result}"
+        );
+        assert!(
+            !result.contains("s3cr3t"),
+            "should not contain password: {result}"
+        );
+    }
+
+    // --- CR-03: PEM private key redaction ---
+    #[test]
+    fn cr03_redacts_pem_private_keys() {
+        let msg = "cert error: -----BEGIN RSA PRIVATE KEY-----\nMIIBogIB...\n-----END RSA PRIVATE KEY-----";
+        let result = redact_error_message(msg);
+        assert!(result.contains("[REDACTED]"), "should redact PEM: {result}");
+        assert!(
+            !result.contains("MIIBogIB"),
+            "should not contain key data: {result}"
+        );
+    }
+
+    // --- CR-04: GitHub token redaction ---
+    #[test]
+    fn cr04_redacts_github_tokens() {
+        let msg = "auth failed with token ghp_ABCDEFGHIJKLMNOPQRSTuvwxyz1234";
+        let result = redact_error_message(msg);
+        assert!(
+            result.contains("[REDACTED]"),
+            "should redact GitHub token: {result}"
+        );
+        assert!(
+            !result.contains("ghp_ABCDE"),
+            "should not contain token: {result}"
+        );
+
+        // Fine-grained PAT
+        let msg2 = "rejected github_pat_ABCDEFGHIJKLMNOPQRSTUV1234567890abcdef";
+        let result2 = redact_error_message(msg2);
+        assert!(
+            result2.contains("[REDACTED]"),
+            "should redact fine-grained PAT: {result2}"
+        );
+    }
+
+    // --- CR-05: long hex token redaction ---
+    #[test]
+    fn cr05_redacts_long_hex_tokens() {
+        let hex_token = "a".repeat(64);
+        let msg = format!("using secret key {hex_token} for encryption");
+        let result = redact_error_message(&msg);
+        assert!(
+            result.contains("[REDACTED]"),
+            "should redact hex token: {result}"
+        );
+        assert!(
+            !result.contains(&hex_token),
+            "should not contain hex token: {result}"
+        );
+    }
+
+    // --- CR-06: JWT token redaction ---
+    #[test]
+    fn cr06_redacts_jwt_tokens() {
+        let msg = "auth failed: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
+        let result = redact_error_message(msg);
+        assert!(result.contains("[REDACTED]"), "should redact JWT: {result}");
+        assert!(
+            !result.contains("eyJhbGci"),
+            "should not contain JWT: {result}"
+        );
+    }
+
+    // --- CR-07: no over-redaction of short hex strings ---
+    #[test]
+    fn cr07_no_over_redaction() {
+        // Short hex strings (like error codes) should NOT be redacted
+        let msg = "error code 0xDEADBEEF at offset 0x1234";
+        let result = redact_error_message(msg);
+        assert_eq!(result, msg, "short hex should not be redacted");
+
+        // Normal words should not trigger credential patterns
+        let msg2 = "the password field is required";
+        let result2 = redact_error_message(msg2);
+        assert_eq!(result2, msg2, "field names should not be redacted");
+    }
+
+    // --- WI-3c: Tightened path regex preserves tool error context ---
+
+    #[test]
+    fn preserves_tool_error_context() {
+        // Tool/server names and error context should not be mangled by path regex
+        let msg = "tool 'ast.parse' on server 'narsil' failed: missing field 'pattern'";
+        let result = redact_error_message(msg);
+        assert_eq!(result, msg, "tool error context should be fully preserved");
     }
 
     // --- Combined patterns ---

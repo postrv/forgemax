@@ -385,3 +385,31 @@ async fn child_process_stash_put_get_through_ipc() {
         .unwrap();
     assert_eq!(r2["data"], "from_child");
 }
+
+// --- WI-3a: JS errors should not have double "javascript error:" prefix ---
+#[tokio::test]
+#[serial]
+async fn child_process_no_double_js_error_prefix() {
+    let exec = SandboxExecutor::new(child_process_config());
+    let dispatcher: Arc<dyn ToolDispatcher> = Arc::new(EchoDispatcher);
+
+    let code = r#"async () => {
+        throw new Error("something went wrong");
+    }"#;
+
+    let err = exec
+        .execute_code(code, dispatcher, None, None)
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+
+    // Should contain the prefix at most once
+    assert!(
+        msg.contains("something went wrong"),
+        "should contain the error message, got: {msg}"
+    );
+    assert!(
+        !msg.contains("javascript error: javascript error:"),
+        "should not have double 'javascript error:' prefix, got: {msg}"
+    );
+}

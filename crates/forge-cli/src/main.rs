@@ -43,6 +43,9 @@ fn build_sandbox_config(overrides: &forge_config::SandboxOverrides) -> SandboxCo
             _ => ExecutionMode::InProcess,
         };
     }
+    if let Some(size) = overrides.max_ipc_message_size_mb {
+        config.max_ipc_message_size = size * 1024 * 1024;
+    }
     if let Some(size) = overrides.max_resource_size_mb {
         config.max_resource_size = size * 1024 * 1024;
     }

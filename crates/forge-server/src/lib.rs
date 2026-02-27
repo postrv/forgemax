@@ -28,6 +28,37 @@ use rmcp::schemars::JsonSchema;
 use rmcp::{tool, tool_handler, tool_router, ServerHandler};
 use serde::Deserialize;
 
+/// Maximum result size in characters before truncation.
+///
+/// Results exceeding this limit are wrapped in a JSON envelope with metadata
+/// about the truncation. This prevents oversized results from consuming the
+/// LLM's entire context window.
+const MAX_RESULT_CHARS: usize = 100_000;
+
+/// Truncate an oversized JSON result string, wrapping it with metadata.
+///
+/// Short results pass through unchanged. Results exceeding [`MAX_RESULT_CHARS`]
+/// are cut at the last valid character boundary before the limit and wrapped in
+/// a JSON object with `_truncated`, `_original_chars`, `_shown_chars`, and `data`.
+fn truncate_result_if_needed(json: String) -> String {
+    if json.len() <= MAX_RESULT_CHARS {
+        return json;
+    }
+    let shown = MAX_RESULT_CHARS.saturating_sub(200);
+    let end = json[..shown]
+        .char_indices()
+        .last()
+        .map(|(i, c)| i + c.len_utf8())
+        .unwrap_or(0);
+    serde_json::json!({
+        "_truncated": true,
+        "_original_chars": json.len(),
+        "_shown_chars": end,
+        "data": &json[..end]
+    })
+    .to_string()
+}
+
 /// The Forge MCP server handler.
 ///
 /// Implements `ServerHandler` from rmcp to serve the `search` and `execute`
@@ -198,11 +229,15 @@ impl ForgeServer {
                 let json = serde_json::to_string_pretty(&result)
                     .map_err(|e| format!("result serialization failed: {e}"))?;
                 tracing::info!(result_len = json.len(), "search: complete");
-                Ok(json)
+                Ok(truncate_result_if_needed(json))
             }
             Err(e) => {
                 tracing::warn!(error = %e, "search: failed");
-                Err(forge_sandbox::redact::redact_error_message(&format!("{e}")))
+                let msg = format!("{e}");
+                // JsError messages are already redacted at the op level; strip
+                // the internal "javascript error:" prefix for cleaner LLM output.
+                let clean = msg.strip_prefix("javascript error: ").unwrap_or(&msg);
+                Ok(serde_json::json!({"error": clean}).to_string())
             }
         }
     }
@@ -210,7 +245,7 @@ impl ForgeServer {
     /// Execute code against the tool API in a sandboxed V8 isolate.
     #[tool(
         name = "execute",
-        description = "Execute JavaScript against the tool API. Use `forge.server('name').category.tool(args)` or `forge.callTool(server, tool, args)` to call tools on connected servers. Chain multiple operations in a single call.\n\nIMPORTANT: Code runs in a sandboxed V8 isolate with NO filesystem, network, or module access. import(), require(), eval(), and Deno.* are all blocked. Use forge.callTool() for all external operations.\n\nExample: `async () => { const result = await forge.callTool('narsil', 'scan_security', { repo: 'MyProject' }); return result; }`\n\nAdditional APIs:\n- `forge.readResource(server, uri)` — read MCP resources\n- `forge.stash.put(key, value, {ttl?})` / `.get(key)` / `.delete(key)` / `.keys()` — session key-value store\n- `forge.parallel(calls, opts)` — bounded concurrent execution"
+        description = "Execute JavaScript against the tool API. Use `forge.server('name').category.tool(args)` or `forge.callTool(server, tool, args)` to call tools on connected servers. Chain multiple operations in a single call.\n\nIMPORTANT: Code runs in a sandboxed V8 isolate with NO filesystem, network, or module access. import(), require(), eval(), and Deno.* are all blocked. Use forge.callTool() for all external operations.\n\nExample: `async () => { const result = await forge.callTool('narsil', 'scan_security', { repo: 'MyProject' }); return result; }`\n\nAdditional APIs:\n- `forge.readResource(server, uri)` — read MCP resources\n- `forge.stash.put(key, value, {ttl?})` / `.get(key)` / `.delete(key)` / `.keys()` — session key-value store\n- `forge.parallel(calls, opts)` — bounded concurrent execution\n\nAlways check tool input_schema via search() before calling unfamiliar tools."
     )]
     pub async fn execute(
         &self,
@@ -276,11 +311,15 @@ impl ForgeServer {
                 let json = serde_json::to_string_pretty(&result)
                     .map_err(|e| format!("result serialization failed: {e}"))?;
                 tracing::info!(result_len = json.len(), "execute: complete");
-                Ok(json)
+                Ok(truncate_result_if_needed(json))
             }
             Err(e) => {
                 tracing::warn!(error = %e, "execute: failed");
-                Err(forge_sandbox::redact::redact_error_message(&format!("{e}")))
+                let msg = format!("{e}");
+                // JsError messages are already redacted at the op level; strip
+                // the internal "javascript error:" prefix for cleaner LLM output.
+                let clean = msg.strip_prefix("javascript error: ").unwrap_or(&msg);
+                Ok(serde_json::json!({"error": clean}).to_string())
             }
         }
     }
@@ -435,8 +474,15 @@ mod tests {
                 code: r#"async () => { return eval("bad"); }"#.into(),
             }))
             .await;
-        assert!(result.is_err(), "search with banned code should fail");
-        assert!(result.unwrap_err().contains("banned pattern"));
+        // WI-1: Errors return Ok with JSON error field (not Err) to prevent
+        // sibling tool call cascade failures.
+        assert!(result.is_ok(), "should return Ok with error JSON");
+        let json = result.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(
+            parsed["error"].as_str().unwrap().contains("banned pattern"),
+            "error should mention banned pattern: {parsed}"
+        );
     }
 
     #[tokio::test]
@@ -469,8 +515,14 @@ mod tests {
                 code: r#"async () => { return eval("bad"); }"#.into(),
             }))
             .await;
-        assert!(result.is_err(), "execute with banned code should fail");
-        assert!(result.unwrap_err().contains("banned pattern"));
+        // WI-1: Errors return Ok with JSON error field (not Err)
+        assert!(result.is_ok(), "should return Ok with error JSON");
+        let json = result.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(
+            parsed["error"].as_str().unwrap().contains("banned pattern"),
+            "error should mention banned pattern: {parsed}"
+        );
     }
 
     #[tokio::test]
@@ -479,7 +531,43 @@ mod tests {
         let result = server
             .search(Parameters(SearchInput { code: "   ".into() }))
             .await;
-        assert!(result.is_err(), "empty code should fail");
-        assert!(result.unwrap_err().contains("empty"));
+        // WI-1: Errors return Ok with JSON error field (not Err)
+        assert!(result.is_ok(), "should return Ok with error JSON");
+        let json = result.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(
+            parsed["error"].as_str().unwrap().contains("empty"),
+            "error should mention empty: {parsed}"
+        );
+    }
+
+    // --- WI-2: Output truncation tests ---
+
+    #[test]
+    fn truncate_result_short_passthrough() {
+        let short = r#"{"data": "hello"}"#.to_string();
+        let result = truncate_result_if_needed(short.clone());
+        assert_eq!(result, short, "short strings should pass through unchanged");
+    }
+
+    #[test]
+    fn truncate_result_long_truncates() {
+        // Create a string longer than MAX_RESULT_CHARS
+        let long = "x".repeat(MAX_RESULT_CHARS + 1000);
+        let result = truncate_result_if_needed(long.clone());
+
+        // Should be valid JSON with truncation metadata
+        let parsed: serde_json::Value =
+            serde_json::from_str(&result).expect("truncated result should be valid JSON");
+        assert_eq!(parsed["_truncated"], true);
+        assert_eq!(parsed["_original_chars"], long.len());
+        let shown = parsed["_shown_chars"].as_u64().unwrap() as usize;
+        assert!(
+            shown < long.len(),
+            "shown chars should be less than original"
+        );
+        assert!(shown > 0, "should show some content");
+        let data = parsed["data"].as_str().unwrap();
+        assert_eq!(data.len(), shown, "data length should match _shown_chars");
     }
 }

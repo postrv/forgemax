@@ -59,6 +59,8 @@ pub struct SandboxConfig {
     pub max_resource_size: usize,
     /// Maximum concurrent calls in forge.parallel() (default: 8).
     pub max_parallel: usize,
+    /// Maximum IPC message size in bytes (default: 8 MB).
+    pub max_ipc_message_size: usize,
 }
 
 impl Default for SandboxConfig {
@@ -74,6 +76,7 @@ impl Default for SandboxConfig {
             execution_mode: ExecutionMode::default(),
             max_resource_size: 64 * 1024 * 1024, // 64 MB
             max_parallel: 8,
+            max_ipc_message_size: crate::ipc::DEFAULT_MAX_IPC_MESSAGE_SIZE,
         }
     }
 }
@@ -667,9 +670,7 @@ fn build_execute_bootstrap(has_resource: bool, has_stash: bool, max_parallel: us
 }
 
 /// Create a fresh JsRuntime with the forge extension loaded and V8 heap limits set.
-///
-/// Public for reuse in the worker binary.
-pub fn create_runtime(
+pub(crate) fn create_runtime(
     dispatcher: Option<Arc<dyn ToolDispatcher>>,
     resource_dispatcher: Option<Arc<dyn ResourceDispatcher>>,
     max_heap_size: usize,

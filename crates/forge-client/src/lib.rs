@@ -165,7 +165,12 @@ impl McpClient {
 
         let mut config = StreamableHttpClientTransportConfig::with_uri(url);
 
-        // Strip sensitive headers on plain HTTP to prevent credential leakage
+        // Fail-closed: reject credentials on plain HTTP
+        if let Some(ref hdrs) = headers {
+            check_http_credential_safety(url, hdrs)?;
+        }
+
+        // Defense-in-depth belt: also strip sensitive headers on plain HTTP
         let headers = headers.map(|mut h| {
             sanitize_headers_for_transport(url, &mut h);
             h
@@ -512,8 +517,35 @@ fn is_sensitive_header(name: &str) -> bool {
         .any(|pattern| lower.contains(pattern))
 }
 
+/// Check that credentials are not being sent over plain HTTP.
+///
+/// Returns an error if any sensitive headers are present on an `http://` connection.
+/// This is fail-closed: operators must fix their config to use HTTPS before credentials
+/// will be sent.
+fn check_http_credential_safety(
+    url: &str,
+    headers: &HashMap<String, String>,
+) -> Result<(), anyhow::Error> {
+    if url.starts_with("http://") {
+        let sensitive: Vec<&String> = headers.keys().filter(|k| is_sensitive_header(k)).collect();
+        if !sensitive.is_empty() {
+            return Err(anyhow::anyhow!(
+                "refusing to send credentials over plain HTTP (headers: {}). \
+                 Use HTTPS or remove sensitive headers.",
+                sensitive
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Strip sensitive headers from HTTP connections over plain HTTP.
 ///
+/// Defense-in-depth belt behind [`check_http_credential_safety`].
 /// Strips any header whose name contains "auth", "token", "secret", "key",
 /// "cookie", "credential", or "password" (case-insensitive) to prevent
 /// accidental credential leakage over unencrypted transports.
@@ -666,6 +698,39 @@ mod tests {
         assert!(headers.contains_key("Authorization"));
         assert!(headers.contains_key("X-Api-Key"));
         assert!(headers.contains_key("Cookie"));
+    }
+
+    // --- HTTP-SEC-01: rejects credentials on plain HTTP ---
+    #[test]
+    fn http_sec_01_rejects_creds_on_http() {
+        let mut headers = HashMap::new();
+        headers.insert("Authorization".into(), "Bearer secret".into());
+        let err = check_http_credential_safety("http://example.com/mcp", &headers);
+        assert!(err.is_err(), "should reject creds on HTTP");
+        let msg = err.unwrap_err().to_string();
+        assert!(
+            msg.contains("plain HTTP"),
+            "error should mention plain HTTP: {msg}"
+        );
+    }
+
+    // --- HTTP-SEC-02: allows HTTP without credentials ---
+    #[test]
+    fn http_sec_02_allows_http_without_creds() {
+        let mut headers = HashMap::new();
+        headers.insert("Content-Type".into(), "application/json".into());
+        assert!(check_http_credential_safety("http://example.com/mcp", &headers).is_ok());
+        // Empty headers also OK
+        assert!(check_http_credential_safety("http://example.com/mcp", &HashMap::new()).is_ok());
+    }
+
+    // --- HTTP-SEC-03: allows HTTPS with credentials ---
+    #[test]
+    fn http_sec_03_allows_https_with_creds() {
+        let mut headers = HashMap::new();
+        headers.insert("Authorization".into(), "Bearer secret".into());
+        headers.insert("X-Api-Key".into(), "sk-123".into());
+        assert!(check_http_credential_safety("https://example.com/mcp", &headers).is_ok());
     }
 
     #[test]

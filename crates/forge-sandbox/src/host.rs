@@ -125,7 +125,16 @@ async fn ipc_event_loop(
             Some(ChildMessage::ExecutionComplete { result }) => {
                 return match result {
                     Ok(value) => Ok(value),
-                    Err(err) => Err(SandboxError::JsError { message: err }),
+                    Err(err) => {
+                        // Strip "javascript error: " prefix if already applied by the
+                        // worker's SandboxError::JsError.to_string(), preventing double
+                        // wrapping like "javascript error: javascript error: <msg>".
+                        let message = err
+                            .strip_prefix("javascript error: ")
+                            .unwrap_or(&err)
+                            .to_string();
+                        Err(SandboxError::JsError { message })
+                    }
                 };
             }
             Some(ChildMessage::ToolCallRequest {
@@ -282,11 +291,16 @@ fn find_worker_binary() -> Result<PathBuf, SandboxError> {
 
 /// Validate binary file permissions (Unix only).
 ///
-/// Rejects world-writable binaries to prevent PATH substitution attacks.
+/// Rejects:
+/// - World-writable binaries (mode & 0o002)
+/// - Binaries in world-writable directories without the sticky bit,
+///   which would allow binary replacement attacks.
 fn validate_binary_permissions(_path: &std::path::Path) -> Result<(), SandboxError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
+
+        // Check the binary itself (follows symlinks via std::fs::metadata)
         let metadata = std::fs::metadata(_path).map_err(|e| {
             SandboxError::Execution(anyhow::anyhow!(
                 "cannot read metadata for {}: {}",
@@ -301,6 +315,27 @@ fn validate_binary_permissions(_path: &std::path::Path) -> Result<(), SandboxErr
                 _path.display(),
                 mode,
             )));
+        }
+
+        // Check the parent directory — world-writable without sticky bit allows replacement
+        if let Some(parent) = _path.parent() {
+            let dir_metadata = std::fs::metadata(parent).map_err(|e| {
+                SandboxError::Execution(anyhow::anyhow!(
+                    "cannot read metadata for parent directory {}: {}",
+                    parent.display(),
+                    e
+                ))
+            })?;
+            let dir_mode = dir_metadata.permissions().mode();
+            // World-writable (0o002) without sticky bit (0o1000) is insecure
+            if dir_mode & 0o002 != 0 && dir_mode & 0o1000 == 0 {
+                return Err(SandboxError::Execution(anyhow::anyhow!(
+                    "insecure directory for worker binary {}: parent {} mode {:o} is world-writable without sticky bit",
+                    _path.display(),
+                    parent.display(),
+                    dir_mode,
+                )));
+            }
         }
     }
     Ok(())
@@ -322,36 +357,35 @@ mod tests {
     #[test]
     fn find_worker_binary_rejects_relative_env_var() {
         // A relative path in FORGE_WORKER_BIN should be rejected
-        std::env::set_var("FORGE_WORKER_BIN", "./relative/path");
-        let result = find_worker_binary();
-        std::env::remove_var("FORGE_WORKER_BIN");
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("absolute"),
-            "expected 'absolute' in error: {err}"
-        );
+        temp_env::with_var("FORGE_WORKER_BIN", Some("./relative/path"), || {
+            let result = find_worker_binary();
+            let err = result.unwrap_err().to_string();
+            assert!(
+                err.contains("absolute"),
+                "expected 'absolute' in error: {err}"
+            );
+        });
     }
 
     #[test]
     fn find_worker_binary_no_which_fallback() {
         // With no binary anywhere and no env var, should get a clear error
         // (not a random system path from `which`)
-        std::env::remove_var("FORGE_WORKER_BIN");
-        // We can't easily remove the binary from the exe dir, but we can verify
-        // the error message doesn't mention PATH
-        let result = find_worker_binary();
-        if let Err(e) = result {
-            let msg = e.to_string();
-            assert!(
-                !msg.contains("PATH"),
-                "error should not mention PATH: {msg}"
-            );
-            assert!(
-                msg.contains("FORGE_WORKER_BIN") || msg.contains("forge-cli"),
-                "error should guide user: {msg}"
-            );
-        }
-        // If Ok, the binary was found via exe dir — that's fine
+        temp_env::with_var_unset("FORGE_WORKER_BIN", || {
+            let result = find_worker_binary();
+            if let Err(e) = result {
+                let msg = e.to_string();
+                assert!(
+                    !msg.contains("PATH"),
+                    "error should not mention PATH: {msg}"
+                );
+                assert!(
+                    msg.contains("FORGE_WORKER_BIN") || msg.contains("forge-cli"),
+                    "error should guide user: {msg}"
+                );
+            }
+            // If Ok, the binary was found via exe dir — that's fine
+        });
     }
 
     #[cfg(unix)]
@@ -364,15 +398,14 @@ mod tests {
         std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o777)).unwrap();
 
-        std::env::set_var("FORGE_WORKER_BIN", bin.to_str().unwrap());
-        let result = find_worker_binary();
-        std::env::remove_var("FORGE_WORKER_BIN");
-
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("insecure"),
-            "expected 'insecure' in error: {err}"
-        );
+        temp_env::with_var("FORGE_WORKER_BIN", Some(bin.to_str().unwrap()), || {
+            let result = find_worker_binary();
+            let err = result.unwrap_err().to_string();
+            assert!(
+                err.contains("insecure"),
+                "expected 'insecure' in error: {err}"
+            );
+        });
     }
 
     #[cfg(unix)]
@@ -385,32 +418,95 @@ mod tests {
         std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        std::env::set_var("FORGE_WORKER_BIN", bin.to_str().unwrap());
-        let result = find_worker_binary();
-        std::env::remove_var("FORGE_WORKER_BIN");
+        temp_env::with_var("FORGE_WORKER_BIN", Some(bin.to_str().unwrap()), || {
+            let result = find_worker_binary();
+            assert!(result.is_ok(), "expected Ok, got: {:?}", result);
+        });
+    }
 
-        assert!(result.is_ok(), "expected Ok, got: {:?}", result);
+    // --- BIN-SEC-01: symlink to world-writable binary is rejected ---
+    #[cfg(unix)]
+    #[test]
+    fn bin_sec_01_symlink_to_world_writable_rejected() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real_bin = dir.path().join("real-worker");
+        std::fs::write(&real_bin, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&real_bin, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        let link = dir.path().join("forgemax-worker");
+        std::os::unix::fs::symlink(&real_bin, &link).unwrap();
+
+        // validate_binary_permissions follows symlinks (uses std::fs::metadata)
+        let result = validate_binary_permissions(&link);
+        assert!(
+            result.is_err(),
+            "should reject symlink to world-writable binary"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("insecure"), "should say insecure: {msg}");
+    }
+
+    // --- BIN-SEC-02: symlink to secure binary in secure dir is accepted ---
+    #[cfg(unix)]
+    #[test]
+    fn bin_sec_02_symlink_to_secure_accepted() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real_bin = dir.path().join("real-worker");
+        std::fs::write(&real_bin, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&real_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let link = dir.path().join("forgemax-worker");
+        std::os::unix::fs::symlink(&real_bin, &link).unwrap();
+
+        let result = validate_binary_permissions(&link);
+        assert!(
+            result.is_ok(),
+            "should accept symlink to secure binary: {:?}",
+            result
+        );
+    }
+
+    // --- BIN-SEC-03: world-writable directory without sticky bit is rejected ---
+    #[cfg(unix)]
+    #[test]
+    fn bin_sec_03_world_writable_dir_without_sticky_rejected() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        // Make the directory world-writable without sticky bit
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        let bin = dir.path().join("forgemax-worker");
+        std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let result = validate_binary_permissions(&bin);
+        assert!(
+            result.is_err(),
+            "should reject binary in world-writable dir"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("world-writable"),
+            "should say world-writable: {msg}"
+        );
     }
 
     #[test]
     fn worker_stderr_is_conditional_on_debug() {
         // Verify the stderr configuration logic
-        // Without FORGE_DEBUG: should be null
-        std::env::remove_var("FORGE_DEBUG");
-        let stderr_debug_off = if std::env::var("FORGE_DEBUG").is_ok() {
-            std::process::Stdio::inherit()
-        } else {
-            std::process::Stdio::null()
-        };
-        // We can't directly compare Stdio, but we can verify the logic path
-        // by checking that FORGE_DEBUG controls the branch
-        assert!(std::env::var("FORGE_DEBUG").is_err());
+        // Without FORGE_DEBUG: should take the null path
+        temp_env::with_var_unset("FORGE_DEBUG", || {
+            assert!(std::env::var("FORGE_DEBUG").is_err());
+        });
 
-        // With FORGE_DEBUG: should be inherit
-        std::env::set_var("FORGE_DEBUG", "1");
-        assert!(std::env::var("FORGE_DEBUG").is_ok());
-        std::env::remove_var("FORGE_DEBUG");
-        // The fact that these assertions pass proves the conditional logic works
-        let _ = stderr_debug_off;
+        // With FORGE_DEBUG: should take the inherit path
+        temp_env::with_var("FORGE_DEBUG", Some("1"), || {
+            assert!(std::env::var("FORGE_DEBUG").is_ok());
+        });
     }
 }

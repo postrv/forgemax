@@ -157,7 +157,7 @@ impl From<&crate::SandboxConfig> for WorkerConfig {
             max_tool_call_args_size: config.max_tool_call_args_size,
             max_output_size: config.max_output_size,
             max_code_size: config.max_code_size,
-            max_ipc_message_size: DEFAULT_MAX_IPC_MESSAGE_SIZE,
+            max_ipc_message_size: config.max_ipc_message_size,
             max_resource_size: config.max_resource_size,
             max_parallel: config.max_parallel,
         }
@@ -178,6 +178,7 @@ impl WorkerConfig {
             execution_mode: crate::executor::ExecutionMode::InProcess, // worker always runs in-process
             max_resource_size: self.max_resource_size,
             max_parallel: self.max_parallel,
+            max_ipc_message_size: self.max_ipc_message_size,
         }
     }
 }
@@ -207,8 +208,11 @@ pub async fn write_message<T: Serialize, W: AsyncWrite + Unpin>(
     Ok(())
 }
 
-/// Default maximum IPC message size: 64 MB.
-pub const DEFAULT_MAX_IPC_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
+/// Default maximum IPC message size: 8 MB.
+///
+/// Reduced from 64 MB to prevent single messages from causing memory pressure.
+/// Configurable via `sandbox.max_ipc_message_size_mb` in config.
+pub const DEFAULT_MAX_IPC_MESSAGE_SIZE: usize = 8 * 1024 * 1024;
 
 /// Read a length-delimited JSON message from an async reader.
 ///
@@ -530,6 +534,7 @@ mod tests {
         assert_eq!(sandbox.max_tool_calls, back.max_tool_calls);
         assert_eq!(sandbox.max_output_size, back.max_output_size);
         assert_eq!(worker.max_ipc_message_size, DEFAULT_MAX_IPC_MESSAGE_SIZE);
+        assert_eq!(worker.max_ipc_message_size, 8 * 1024 * 1024); // 8 MB default
     }
 
     #[tokio::test]

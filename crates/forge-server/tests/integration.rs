@@ -522,9 +522,16 @@ async fn rs_i06_read_resource_timeout_enforcement() {
         }))
         .await;
 
-    // Should fail with timeout error
-    assert!(result.is_err(), "should timeout, got: {:?}", result);
-    let err = result.unwrap_err();
+    // WI-1: Errors return Ok with JSON error field (not Err) to prevent
+    // sibling tool call cascade failures.
+    assert!(
+        result.is_ok(),
+        "should return Ok with error JSON, got: {:?}",
+        result
+    );
+    let json = result.unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let err = parsed["error"].as_str().expect("should have error field");
     assert!(
         err.contains("timed out") || err.contains("timeout") || err.contains("Timed out"),
         "error should mention timeout, got: {err}"

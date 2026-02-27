@@ -131,7 +131,7 @@ pub enum StashError {
 // ---------------------------------------------------------------------------
 
 /// Validate a stash key, returning an appropriate error on failure.
-fn validate_key(key: &str) -> Result<(), StashError> {
+pub(crate) fn validate_key(key: &str) -> Result<(), StashError> {
     if key.is_empty() {
         return Err(StashError::InvalidKey);
     }

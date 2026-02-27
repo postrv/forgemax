@@ -37,6 +37,9 @@ const BANNED_PATTERNS: &[&str] = &[
     "process.stderr",
     "process.kill",
     "process.binding",
+    "String.raw",         // Tagged template code generation
+    "WebAssembly",        // WASM execution
+    "Symbol.toPrimitive", // Type confusion attacks
 ];
 
 /// Strip JS comments from code for pattern matching.
@@ -89,6 +92,88 @@ fn normalize_unicode_confusables(code: &str) -> String {
         .collect()
 }
 
+/// Strip the contents of string literals for pattern matching.
+///
+/// Replaces the contents (not delimiters) of single-quoted, double-quoted, and
+/// template literal strings with spaces, so that banned patterns appearing inside
+/// tool arguments (e.g. `{ pattern: "Deno.readFile" }`) are not flagged.
+///
+/// Template literal expressions (`${...}`) are preserved since they contain
+/// executable code. This is defense-in-depth — false negatives are acceptable
+/// since V8 blocks the APIs regardless.
+fn strip_string_contents(code: &str) -> String {
+    let mut result = String::with_capacity(code.len());
+    let chars: Vec<char> = code.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+
+    while i < len {
+        match chars[i] {
+            // Single or double quoted strings
+            q @ ('\'' | '"') => {
+                result.push(q);
+                i += 1;
+                while i < len && chars[i] != q {
+                    if chars[i] == '\\' && i + 1 < len {
+                        // Escaped character — replace both with spaces
+                        result.push(' ');
+                        result.push(' ');
+                        i += 2;
+                    } else {
+                        result.push(' ');
+                        i += 1;
+                    }
+                }
+                if i < len {
+                    result.push(q); // closing quote
+                    i += 1;
+                }
+            }
+            // Template literals
+            '`' => {
+                result.push('`');
+                i += 1;
+                while i < len && chars[i] != '`' {
+                    if chars[i] == '\\' && i + 1 < len {
+                        // Escaped character — replace both with spaces
+                        result.push(' ');
+                        result.push(' ');
+                        i += 2;
+                    } else if chars[i] == '$' && i + 1 < len && chars[i + 1] == '{' {
+                        // Template expression — preserve contents
+                        result.push('$');
+                        result.push('{');
+                        i += 2;
+                        let mut depth = 1;
+                        while i < len && depth > 0 {
+                            if chars[i] == '{' {
+                                depth += 1;
+                            } else if chars[i] == '}' {
+                                depth -= 1;
+                            }
+                            result.push(chars[i]);
+                            i += 1;
+                        }
+                    } else {
+                        result.push(' ');
+                        i += 1;
+                    }
+                }
+                if i < len {
+                    result.push('`'); // closing backtick
+                    i += 1;
+                }
+            }
+            other => {
+                result.push(other);
+                i += 1;
+            }
+        }
+    }
+
+    result
+}
+
 /// Collapse whitespace between identifier characters and `(` for pattern matching.
 ///
 /// Catches attempts like `eval (` or `eval\t(` that try to evade `eval(`.
@@ -127,9 +212,12 @@ pub fn validate_code(code: &str, max_size: Option<usize>) -> Result<(), SandboxE
     }
 
     // 4. Banned patterns — check against normalized code to catch evasion attempts.
-    //    The normalization pipeline: Unicode confusables → comment stripping → whitespace collapse.
-    let normalized =
-        collapse_whitespace_before_parens(&strip_js_comments(&normalize_unicode_confusables(code)));
+    //    The normalization pipeline: Unicode confusables → comment stripping → string content
+    //    stripping → whitespace collapse. String stripping prevents false positives when
+    //    banned patterns appear as tool arguments (e.g. { pattern: "Deno.readFile" }).
+    let normalized = collapse_whitespace_before_parens(&strip_string_contents(&strip_js_comments(
+        &normalize_unicode_confusables(code),
+    )));
     for pattern in BANNED_PATTERNS {
         if normalized.contains(pattern) {
             return Err(SandboxError::BannedPattern {
@@ -341,11 +429,109 @@ mod tests {
         assert!(matches!(err, SandboxError::BannedPattern { .. }));
     }
 
+    // --- VP-01: rejects String.raw ---
+    #[test]
+    fn vp01_rejects_string_raw() {
+        let code = r#"async () => { return String.raw`\x61\x62\x63`; }"#;
+        let err = validate_code(code, None).unwrap_err();
+        assert!(matches!(err, SandboxError::BannedPattern { .. }));
+    }
+
+    // --- VP-02: rejects WebAssembly ---
+    #[test]
+    fn vp02_rejects_webassembly() {
+        let code = r#"async () => { const m = new WebAssembly.Module(buf); }"#;
+        let err = validate_code(code, None).unwrap_err();
+        assert!(matches!(err, SandboxError::BannedPattern { .. }));
+    }
+
+    // --- VP-03: rejects Symbol.toPrimitive ---
+    #[test]
+    fn vp03_rejects_symbol_toprimitive() {
+        let code = r#"async () => { obj[Symbol.toPrimitive] = () => "exploit"; }"#;
+        let err = validate_code(code, None).unwrap_err();
+        assert!(matches!(err, SandboxError::BannedPattern { .. }));
+    }
+
+    // --- VP-04: no false positives on similar patterns ---
+    #[test]
+    fn vp04_no_false_positives() {
+        // "Symbol.iterator" should NOT be banned (legitimate JS usage)
+        let code = r#"async () => { for (const x of obj[Symbol.iterator]()) {} }"#;
+        assert!(validate_code(code, None).is_ok());
+
+        // Test that normal strings containing "raw" don't trigger
+        let code2 = r#"async () => { return "raw data"; }"#;
+        assert!(validate_code(code2, None).is_ok());
+    }
+
     #[test]
     fn legitimate_comments_dont_cause_false_positives() {
         // A normal comment that happens to mention eval should be fine
         // because after stripping, the code itself doesn't contain eval(
         let code = r#"async () => { /* this does not use eval */ return 42; }"#;
         assert!(validate_code(code, None).is_ok());
+    }
+
+    // --- WI-5: String literal content should not trigger banned patterns ---
+
+    #[test]
+    fn wi5_accepts_deno_in_string_literal() {
+        let code = r#"async () => { return { pattern: "Deno.readFile" }; }"#;
+        assert!(validate_code(code, None).is_ok());
+    }
+
+    #[test]
+    fn wi5_accepts_eval_in_string_literal() {
+        let code = r#"async () => { return "eval(is bad)"; }"#;
+        assert!(validate_code(code, None).is_ok());
+    }
+
+    #[test]
+    fn wi5_still_rejects_eval_outside_string() {
+        // eval() in code, even with "eval" also in a string, should be caught
+        let code = r#"async () => { const x = "eval"; return eval("1"); }"#;
+        let err = validate_code(code, None).unwrap_err();
+        assert!(matches!(err, SandboxError::BannedPattern { .. }));
+    }
+
+    #[test]
+    fn wi5_accepts_process_env_in_string_literal() {
+        let code = r#"async () => { return { query: "process.env search" }; }"#;
+        assert!(validate_code(code, None).is_ok());
+    }
+
+    #[test]
+    fn wi5_accepts_import_in_template_literal_text() {
+        let code = r#"async () => { return `import("x") is banned`; }"#;
+        assert!(validate_code(code, None).is_ok());
+    }
+
+    #[test]
+    fn wi5_still_catches_eval_in_template_expression() {
+        let code = r#"async () => { return `${eval("1")}`; }"#;
+        let err = validate_code(code, None).unwrap_err();
+        assert!(matches!(err, SandboxError::BannedPattern { .. }));
+    }
+
+    #[test]
+    fn wi5_handles_escaped_quotes_in_strings() {
+        let code = r#"async () => { return 'it\'s fine to mention Deno.'; }"#;
+        assert!(validate_code(code, None).is_ok());
+    }
+
+    #[test]
+    fn wi5_strip_string_contents_unit() {
+        // Direct function test
+        let input = r#"foo("Deno.readFile") + bar('eval(') + `import(`"#;
+        let stripped = strip_string_contents(input);
+        assert!(!stripped.contains("Deno"));
+        assert!(!stripped.contains("eval"));
+        // Template literal content stripped
+        assert!(!stripped.contains("import"));
+        // Delimiters preserved
+        assert!(stripped.contains('"'));
+        assert!(stripped.contains('\''));
+        assert!(stripped.contains('`'));
     }
 }

@@ -21,7 +21,9 @@ sha2.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 regex = "1"
+percent-encoding = "2"
 
 [dev-dependencies]
 tempfile = "3"
 serial_test = "3"
+temp-env = "0.3"

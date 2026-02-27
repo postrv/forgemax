@@ -15,16 +15,17 @@ use deno_error::JsErrorBox;
 
 use std::collections::HashSet;
 
+use crate::stash::validate_key;
 use crate::{ResourceDispatcher, StashDispatcher, ToolDispatcher};
 
 /// Rate limiting state for tool calls within a single execution.
-pub struct ToolCallLimits {
+pub(crate) struct ToolCallLimits {
     /// Maximum number of tool calls allowed.
-    pub max_calls: usize,
+    pub(crate) max_calls: usize,
     /// Maximum size of serialized arguments per call.
-    pub max_args_size: usize,
+    pub(crate) max_args_size: usize,
     /// Number of tool calls made so far.
-    pub calls_made: usize,
+    pub(crate) calls_made: usize,
 }
 
 /// Log a message from sandbox code.
@@ -102,26 +103,26 @@ pub async fn op_forge_call_tool(
 }
 
 /// Wrapper for execution results stored in OpState.
-pub struct ExecutionResult(pub String);
+pub(crate) struct ExecutionResult(pub(crate) String);
 
 /// Wrapper for the maximum resource content size, stored in OpState.
-pub struct MaxResourceSize(pub usize);
+pub(crate) struct MaxResourceSize(pub(crate) usize);
 
 /// Wrapper for the current server group, stored in OpState.
 ///
 /// Used by stash ops to enforce group isolation. `None` means ungrouped.
-pub struct CurrentGroup(pub Option<String>);
+pub(crate) struct CurrentGroup(pub(crate) Option<String>);
 
 /// Set of known server names for SR-R6 validation.
 ///
 /// Stored in OpState so `op_forge_read_resource` can reject unknown servers
 /// before any dispatch machinery runs.
-pub struct KnownServers(pub HashSet<String>);
+pub(crate) struct KnownServers(pub(crate) HashSet<String>);
 
 /// Validate a resource URI for security.
 ///
 /// Rejects:
-/// - URIs containing `..` (path traversal)
+/// - URIs with path traversal (`..` as a path segment, including URL-encoded variants)
 /// - URIs longer than 2048 bytes
 /// - URIs containing null bytes
 /// - URIs containing control characters (U+0000..U+001F, U+007F)
@@ -132,16 +133,60 @@ fn validate_resource_uri(uri: &str) -> Result<(), String> {
             uri.len()
         ));
     }
-    if uri.contains("..") {
-        return Err("resource URI must not contain '..' (path traversal)".into());
-    }
     if uri.bytes().any(|b| b == 0) {
         return Err("resource URI must not contain null bytes".into());
     }
     if uri.chars().any(|c| c.is_control()) {
         return Err("resource URI must not contain control characters".into());
     }
+    if has_path_traversal(uri) {
+        return Err("resource URI must not contain path traversal".into());
+    }
     Ok(())
+}
+
+/// Check if a URI contains path traversal (`..`) as a path segment.
+///
+/// Checks the raw URI, then percent-decodes and checks again (to catch `%2e%2e`),
+/// then double-decodes and checks again (to catch `%252e%252e`).
+fn has_path_traversal(uri: &str) -> bool {
+    if has_dotdot_segment(uri) {
+        return true;
+    }
+    // Decode once and check
+    let decoded = percent_encoding::percent_decode_str(uri).decode_utf8_lossy();
+    if has_dotdot_segment(&decoded) {
+        return true;
+    }
+    // Double-decode and check (catches %252e%252e → %2e%2e → ..)
+    let double_decoded = percent_encoding::percent_decode_str(&decoded).decode_utf8_lossy();
+    if double_decoded != decoded && has_dotdot_segment(&double_decoded) {
+        return true;
+    }
+    false
+}
+
+/// Check if a string contains `..` as a path segment (not as part of a filename).
+///
+/// Matches: `..`, `../`, `/../`, `/..` at end, bare `..`
+fn has_dotdot_segment(s: &str) -> bool {
+    // Exact match
+    if s == ".." {
+        return true;
+    }
+    // Starts with ../
+    if s.starts_with("../") {
+        return true;
+    }
+    // Ends with /..
+    if s.ends_with("/..") {
+        return true;
+    }
+    // Contains /../ anywhere
+    if s.contains("/../") {
+        return true;
+    }
+    false
 }
 
 /// Read a resource by URI from a downstream server via the ResourceDispatcher.
@@ -239,6 +284,9 @@ pub async fn op_forge_stash_put(
     #[string] value_json: String,
     #[smi] ttl_secs: u32,
 ) -> Result<String, JsErrorBox> {
+    // Defense-in-depth: validate key at op boundary before IPC traversal
+    validate_key(&key).map_err(|e| JsErrorBox::generic(e.to_string()))?;
+
     let (dispatcher, current_group) = {
         let st = op_state.borrow();
         let d = st.borrow::<Arc<dyn StashDispatcher>>().clone();
@@ -267,6 +315,9 @@ pub async fn op_forge_stash_get(
     op_state: Rc<RefCell<OpState>>,
     #[string] key: String,
 ) -> Result<String, JsErrorBox> {
+    // Defense-in-depth: validate key at op boundary before IPC traversal
+    validate_key(&key).map_err(|e| JsErrorBox::generic(e.to_string()))?;
+
     let (dispatcher, current_group) = {
         let st = op_state.borrow();
         let d = st.borrow::<Arc<dyn StashDispatcher>>().clone();
@@ -290,6 +341,9 @@ pub async fn op_forge_stash_delete(
     op_state: Rc<RefCell<OpState>>,
     #[string] key: String,
 ) -> Result<String, JsErrorBox> {
+    // Defense-in-depth: validate key at op boundary before IPC traversal
+    validate_key(&key).map_err(|e| JsErrorBox::generic(e.to_string()))?;
+
     let (dispatcher, current_group) = {
         let st = op_state.borrow();
         let d = st.borrow::<Arc<dyn StashDispatcher>>().clone();
@@ -344,6 +398,55 @@ deno_core::extension!(
 mod tests {
     use super::*;
 
+    // --- SK-V01: stash key validation rejects control characters ---
+    #[test]
+    fn sk_v01_stash_key_rejects_control_chars() {
+        let err = validate_key("key\x01value").unwrap_err();
+        assert!(
+            matches!(err, crate::stash::StashError::InvalidKey),
+            "expected InvalidKey, got: {err}"
+        );
+    }
+
+    // --- SK-V02: stash key validation rejects path separators ---
+    #[test]
+    fn sk_v02_stash_key_rejects_path_separators() {
+        assert!(validate_key("key/value").is_err());
+        assert!(validate_key("key\\value").is_err());
+        assert!(validate_key("../etc/passwd").is_err());
+    }
+
+    // --- SK-V03: stash key validation rejects empty and oversized keys ---
+    #[test]
+    fn sk_v03_stash_key_rejects_empty_and_oversized() {
+        assert!(validate_key("").is_err());
+        let long_key = "a".repeat(257);
+        let err = validate_key(&long_key).unwrap_err();
+        assert!(
+            matches!(err, crate::stash::StashError::KeyTooLong { len: 257 }),
+            "expected KeyTooLong, got: {err}"
+        );
+    }
+
+    // --- SK-V04: stash key validation accepts valid patterns ---
+    #[test]
+    fn sk_v04_stash_key_accepts_valid_patterns() {
+        assert!(validate_key("simple-key").is_ok());
+        assert!(validate_key("key_with.dots:colons").is_ok());
+        assert!(validate_key("CamelCase123").is_ok());
+        assert!(validate_key("a").is_ok());
+        let max_key = "x".repeat(256);
+        assert!(validate_key(&max_key).is_ok());
+    }
+
+    // --- SK-V05: stash key validation rejects unicode ---
+    #[test]
+    fn sk_v05_stash_key_rejects_unicode() {
+        assert!(validate_key("key\u{0000}null").is_err());
+        assert!(validate_key("key with space").is_err());
+        assert!(validate_key("emoji\u{1F600}").is_err());
+    }
+
     // --- RS-U04: reject URIs with path traversal (..) ---
     #[test]
     fn rs_u04_rejects_uri_with_path_traversal() {
@@ -354,6 +457,37 @@ mod tests {
         // Valid URI without traversal should pass
         assert!(validate_resource_uri("file:///logs/app.log").is_ok());
         assert!(validate_resource_uri("postgres://db/table").is_ok());
+    }
+
+    // --- URI-V01: legitimate double dots in filenames are allowed ---
+    #[test]
+    fn uri_v01_allows_legitimate_double_dots() {
+        // Double dots as part of a filename (not a path segment) should be allowed
+        assert!(validate_resource_uri("file:///v2..backup").is_ok());
+        assert!(validate_resource_uri("file:///data..2024.csv").is_ok());
+        assert!(validate_resource_uri("file:///config..old").is_ok());
+    }
+
+    // --- URI-V02: URL-encoded traversal (%2e%2e) is blocked ---
+    #[test]
+    fn uri_v02_blocks_url_encoded_traversal() {
+        // %2e = '.', so %2e%2e/%2e%2e = ../../..
+        assert!(validate_resource_uri("file:///logs/%2e%2e/%2e%2e/etc/passwd").is_err());
+        assert!(validate_resource_uri("file:///%2e%2e/secret").is_err());
+    }
+
+    // --- URI-V03: double-encoded traversal (%252e%252e) is blocked ---
+    #[test]
+    fn uri_v03_blocks_double_encoded_traversal() {
+        // %252e decodes to %2e, which decodes to '.'
+        assert!(validate_resource_uri("file:///logs/%252e%252e/%252e%252e/etc/passwd").is_err());
+    }
+
+    // --- URI-V04: mixed-case encoded traversal is blocked ---
+    #[test]
+    fn uri_v04_blocks_mixed_case_encoded_traversal() {
+        assert!(validate_resource_uri("file:///logs/%2E%2E/secret").is_err());
+        assert!(validate_resource_uri("file:///logs/%2e%2E/secret").is_err());
     }
 
     // --- RS-U05: reject URIs longer than 2048 bytes ---
@@ -398,8 +532,8 @@ mod tests {
     fn rs_s04_path_traversal_attack_variants() {
         // Classic traversal
         assert!(validate_resource_uri("../../../etc/passwd").is_err());
-        // Traversal with URL-encoded characters still contains ".."
-        assert!(validate_resource_uri("file:///logs/..%2F..%2Fetc/passwd").is_err());
+        // Encoded traversal
+        assert!(validate_resource_uri("file:///logs/%2e%2e/%2e%2e/etc/passwd").is_err());
         // Double dots at start
         assert!(validate_resource_uri("..").is_err());
         // Double dots embedded

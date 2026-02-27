@@ -608,6 +608,7 @@ version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
+ "temp-env",
  "thiserror",
  "toml",
 ]
@@ -629,11 +630,13 @@ dependencies = [
  "chrono",
  "deno_core",
  "deno_error",
+ "percent-encoding",
  "regex",
  "serde",
  "serde_json",
  "serial_test",
  "sha2",
+ "temp-env",
  "tempfile",
  "thiserror",
  "tokio",
@@ -2075,6 +2078,15 @@ name = "tap"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "55937e1799185b12863d447f42597ed69d9928686b8d88a1df17376a097d8369"
+
+[[package]]
+name = "temp-env"
+version = "0.3.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "96374855068f47402c3121c6eed88d29cb1de8f3ab27090e273e420bdabcf050"
+dependencies = [
+ "parking_lot",
+]
 
 [[package]]
 name = "tempfile"
