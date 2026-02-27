@@ -353,6 +353,9 @@ impl ServerHandler for ForgeServer {
                  Sandboxed environment — no filesystem, network, or module imports (import/require/eval are blocked). \
                  Use forge.callTool(server, tool, args) for all external operations.\n\
                  \n\
+                 When calling tools, use the tool name only (e.g. \"find_symbols\"), \
+                 not the category-prefixed form (e.g. NOT \"general.find_symbols\").\n\
+                 \n\
                  Additional APIs (execute mode only):\n\
                  - forge.readResource(server, uri) — read MCP resources from downstream servers\n\
                  - forge.stash.put(key, value, {{ttl?}}) / .get(key) / .delete(key) / .keys() — \
@@ -444,6 +447,10 @@ mod tests {
         assert!(
             instructions.contains("no filesystem"),
             "instructions should mention sandbox constraints"
+        );
+        assert!(
+            instructions.contains("use the tool name only"),
+            "instructions should clarify tool name vs category-prefixed form"
         );
     }
 

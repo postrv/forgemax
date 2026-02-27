@@ -312,15 +312,15 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed security analysis and threat
 
 ## Tests
 
-354 tests across the workspace:
+406 tests across the workspace:
 
 ```
-forge-sandbox       215 unit + 10 integration (child process mode)
-forge-manifest       25 (builders + dynamic generation + sanitization)
-forge-config         31 (parsing, validation, env expansion, groups, stash)
-forge-client         32 unit (router, timeout, circuit breaker, header sanitization) + 9 e2e
-forge-server          6 unit + 11 integration (resource, stash, parallel)
-forge-cli             5 unit (config parsing, stash config)
+forge-sandbox       252 unit + 17 integration (child process + security)
+forge-manifest       31 (builders + dynamic generation + sanitization)
+forge-config         32 (parsing, validation, env expansion, groups, stash)
+forge-client         39 unit (router, timeout, circuit breaker, header sanitization) + 12 e2e
+forge-server          8 unit + 11 integration (resource, stash, parallel)
+forge-cli             4 unit (config parsing, stash config)
 ```
 
 ```bash
