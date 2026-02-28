@@ -48,6 +48,25 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
+      - name: Fetch V8 prebuilt library
+        shell: bash
+        run: |
+          V8_VERSION=$(grep -A1 'name = "v8"' Cargo.lock | grep version | head -1 | sed 's/.*"\(.*\)"/\1/')
+          TARGET="${{ matrix.target }}"
+          if [[ "$TARGET" == *"windows"* ]]; then
+            FILENAME="rusty_v8_release_${TARGET}.lib.gz"
+          else
+            FILENAME="librusty_v8_release_${TARGET}.a.gz"
+          fi
+          ARCHIVE="${{ runner.temp }}/rusty_v8/${FILENAME}"
+          mkdir -p "$(dirname "$ARCHIVE")"
+          if [ ! -f "$ARCHIVE" ]; then
+            URL="https://github.com/denoland/rusty_v8/releases/download/v${V8_VERSION}/${FILENAME}"
+            echo "Downloading V8 v${V8_VERSION} for ${TARGET}"
+            curl -L -f --retry 3 --retry-delay 5 -o "$ARCHIVE" "$URL"
+          fi
+          echo "RUSTY_V8_ARCHIVE=${ARCHIVE}" >> $GITHUB_ENV
+
       - name: Build release binaries
         run: cargo build --release --target ${{ matrix.target }}
 

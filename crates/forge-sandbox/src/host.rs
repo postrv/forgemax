@@ -342,10 +342,7 @@ where
             }
             Some(ChildMessage::StashKeys { request_id, group }) => {
                 let result = match &stash_dispatcher {
-                    Some(sd) => sd
-                        .keys(group)
-                        .await
-                        .map_err(|e| IpcDispatchError::from(&e)),
+                    Some(sd) => sd.keys(group).await.map_err(|e| IpcDispatchError::from(&e)),
                     None => Err(IpcDispatchError::from_string(
                         "stash dispatcher not available".to_string(),
                     )),

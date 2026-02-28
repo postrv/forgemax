@@ -67,9 +67,9 @@ impl IpcDispatchError {
     /// Reconstruct the appropriate [`forge_error::DispatchError`] variant.
     pub fn to_dispatch_error(self) -> forge_error::DispatchError {
         match self.code.as_str() {
-            "SERVER_NOT_FOUND" => forge_error::DispatchError::ServerNotFound(
-                self.server.unwrap_or(self.message),
-            ),
+            "SERVER_NOT_FOUND" => {
+                forge_error::DispatchError::ServerNotFound(self.server.unwrap_or(self.message))
+            }
             "TOOL_NOT_FOUND" => forge_error::DispatchError::ToolNotFound {
                 server: self.server.unwrap_or_default(),
                 tool: self.tool.unwrap_or_default(),
@@ -78,9 +78,9 @@ impl IpcDispatchError {
                 server: self.server.unwrap_or_default(),
                 timeout_ms: self.timeout_ms.unwrap_or(0),
             },
-            "CIRCUIT_OPEN" => forge_error::DispatchError::CircuitOpen(
-                self.server.unwrap_or(self.message),
-            ),
+            "CIRCUIT_OPEN" => {
+                forge_error::DispatchError::CircuitOpen(self.server.unwrap_or(self.message))
+            }
             "GROUP_POLICY_DENIED" => forge_error::DispatchError::GroupPolicyDenied {
                 reason: self.message,
             },

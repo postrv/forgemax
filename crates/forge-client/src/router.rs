@@ -363,7 +363,10 @@ mod tests {
         let result = router
             .call_tool("server", "anything", serde_json::json!({}))
             .await;
-        assert!(result.is_ok(), "should pass through when no tools registered");
+        assert!(
+            result.is_ok(),
+            "should pass through when no tools registered"
+        );
     }
 
     // --- v0.2 Resource Router Tests (RS-C05..RS-C06) ---

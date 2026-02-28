@@ -29,8 +29,10 @@ struct IpcToolBridge {
     /// Sender for outgoing child messages (tool requests, logs).
     tx: mpsc::UnboundedSender<ChildMessage>,
     /// Sender for registering response waiters, keyed by request_id.
-    waiter_tx:
-        mpsc::UnboundedSender<(u64, oneshot::Sender<Result<serde_json::Value, IpcDispatchError>>)>,
+    waiter_tx: mpsc::UnboundedSender<(
+        u64,
+        oneshot::Sender<Result<serde_json::Value, IpcDispatchError>>,
+    )>,
     /// Atomic counter for generating unique request IDs (shared with other bridges).
     next_id: Arc<AtomicU64>,
 }
@@ -78,8 +80,10 @@ struct IpcResourceBridge {
     /// Sender for outgoing child messages.
     tx: mpsc::UnboundedSender<ChildMessage>,
     /// Sender for registering response waiters, keyed by request_id.
-    waiter_tx:
-        mpsc::UnboundedSender<(u64, oneshot::Sender<Result<serde_json::Value, IpcDispatchError>>)>,
+    waiter_tx: mpsc::UnboundedSender<(
+        u64,
+        oneshot::Sender<Result<serde_json::Value, IpcDispatchError>>,
+    )>,
     /// Atomic counter for generating unique request IDs.
     next_id: Arc<AtomicU64>,
 }
@@ -122,8 +126,10 @@ struct IpcStashBridge {
     /// Sender for outgoing child messages.
     tx: mpsc::UnboundedSender<ChildMessage>,
     /// Sender for registering response waiters, keyed by request_id.
-    waiter_tx:
-        mpsc::UnboundedSender<(u64, oneshot::Sender<Result<serde_json::Value, IpcDispatchError>>)>,
+    waiter_tx: mpsc::UnboundedSender<(
+        u64,
+        oneshot::Sender<Result<serde_json::Value, IpcDispatchError>>,
+    )>,
     /// Atomic counter for generating unique request IDs.
     next_id: Arc<AtomicU64>,
 }
