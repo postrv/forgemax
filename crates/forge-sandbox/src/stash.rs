@@ -73,6 +73,7 @@ pub struct SessionStash {
 
 /// Errors returned by [`SessionStash`] operations.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum StashError {
     /// The stash already holds the maximum number of keys.
     #[error("stash key limit exceeded (max {max} keys)")]

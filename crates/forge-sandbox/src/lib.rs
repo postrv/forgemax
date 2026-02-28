@@ -18,6 +18,8 @@
 //! - **Output size limits**: Prevents exfiltration of large data sets
 //! - **Opaque bindings**: Credentials never exposed to sandbox code
 
+#[cfg(feature = "ast-validator")]
+pub mod ast_validator;
 pub mod audit;
 pub mod error;
 pub mod executor;
@@ -25,6 +27,7 @@ pub mod groups;
 pub mod host;
 pub mod ipc;
 pub mod ops;
+pub mod pool;
 pub mod redact;
 pub mod stash;
 pub mod validator;
@@ -49,7 +52,7 @@ pub trait ToolDispatcher: Send + Sync {
         server: &str,
         tool: &str,
         args: serde_json::Value,
-    ) -> Result<serde_json::Value, anyhow::Error>;
+    ) -> Result<serde_json::Value, forge_error::DispatchError>;
 }
 
 /// Trait for dispatching resource reads from the sandbox to downstream MCP servers.
@@ -68,7 +71,7 @@ pub trait ResourceDispatcher: Send + Sync {
         &self,
         server: &str,
         uri: &str,
-    ) -> Result<serde_json::Value, anyhow::Error>;
+    ) -> Result<serde_json::Value, forge_error::DispatchError>;
 }
 
 /// Trait for dispatching stash operations from the sandbox.
@@ -90,7 +93,7 @@ pub trait StashDispatcher: Send + Sync {
         value: serde_json::Value,
         ttl_secs: Option<u32>,
         current_group: Option<String>,
-    ) -> Result<serde_json::Value, anyhow::Error>;
+    ) -> Result<serde_json::Value, forge_error::DispatchError>;
 
     /// Retrieve the value stored under a key.
     ///
@@ -99,7 +102,7 @@ pub trait StashDispatcher: Send + Sync {
         &self,
         key: &str,
         current_group: Option<String>,
-    ) -> Result<serde_json::Value, anyhow::Error>;
+    ) -> Result<serde_json::Value, forge_error::DispatchError>;
 
     /// Delete the entry stored under a key.
     ///
@@ -108,9 +111,11 @@ pub trait StashDispatcher: Send + Sync {
         &self,
         key: &str,
         current_group: Option<String>,
-    ) -> Result<serde_json::Value, anyhow::Error>;
+    ) -> Result<serde_json::Value, forge_error::DispatchError>;
 
     /// List all keys visible to the current group.
-    async fn keys(&self, current_group: Option<String>)
-        -> Result<serde_json::Value, anyhow::Error>;
+    async fn keys(
+        &self,
+        current_group: Option<String>,
+    ) -> Result<serde_json::Value, forge_error::DispatchError>;
 }

@@ -5,16 +5,14 @@
 //! error messages, and prevent prompt injection from reaching the runtime.
 
 use crate::error::SandboxError;
+#[cfg(not(feature = "ast-validator"))]
 use regex::Regex;
 
 /// Maximum code size in bytes (64 KB).
 const DEFAULT_MAX_CODE_SIZE: usize = 64 * 1024;
 
-/// Patterns that are banned from sandbox code.
-///
-/// These are belt-and-suspenders checks — the V8 sandbox itself prevents
-/// access to these APIs, but catching them early gives better error messages
-/// and prevents prompt injection from even reaching the runtime.
+/// Patterns that are banned from sandbox code (used by regex path only).
+#[cfg(not(feature = "ast-validator"))]
 const BANNED_PATTERNS: &[&str] = &[
     "eval(",
     "Function(",
@@ -42,11 +40,7 @@ const BANNED_PATTERNS: &[&str] = &[
     "Symbol.toPrimitive", // Type confusion attacks
 ];
 
-/// Strip JS comments from code for pattern matching.
-///
-/// Removes both block comments (`/* ... */`) and line comments (`// ...`)
-/// so that patterns like `eval/*bypass*/(` are still caught. This operates
-/// on the validation copy only — the original code is executed unchanged.
+#[cfg(not(feature = "ast-validator"))]
 fn strip_js_comments(code: &str) -> String {
     // Remove block comments (non-greedy to handle multiple comments)
     let block_re = Regex::new(r"/\*[\s\S]*?\*/").expect("valid regex");
@@ -92,15 +86,7 @@ fn normalize_unicode_confusables(code: &str) -> String {
         .collect()
 }
 
-/// Strip the contents of string literals for pattern matching.
-///
-/// Replaces the contents (not delimiters) of single-quoted, double-quoted, and
-/// template literal strings with spaces, so that banned patterns appearing inside
-/// tool arguments (e.g. `{ pattern: "Deno.readFile" }`) are not flagged.
-///
-/// Template literal expressions (`${...}`) are preserved since they contain
-/// executable code. This is defense-in-depth — false negatives are acceptable
-/// since V8 blocks the APIs regardless.
+#[cfg(any(not(feature = "ast-validator"), test))]
 fn strip_string_contents(code: &str) -> String {
     let mut result = String::with_capacity(code.len());
     let chars: Vec<char> = code.chars().collect();
@@ -174,9 +160,7 @@ fn strip_string_contents(code: &str) -> String {
     result
 }
 
-/// Collapse whitespace between identifier characters and `(` for pattern matching.
-///
-/// Catches attempts like `eval (` or `eval\t(` that try to evade `eval(`.
+#[cfg(not(feature = "ast-validator"))]
 fn collapse_whitespace_before_parens(code: &str) -> String {
     let re = Regex::new(r"(\w)\s+\(").expect("valid regex");
     re.replace_all(code, "$1(").into_owned()
@@ -211,10 +195,39 @@ pub fn validate_code(code: &str, max_size: Option<usize>) -> Result<(), SandboxE
         });
     }
 
-    // 4. Banned patterns — check against normalized code to catch evasion attempts.
-    //    The normalization pipeline: Unicode confusables → comment stripping → string content
-    //    stripping → whitespace collapse. String stripping prevents false positives when
-    //    banned patterns appear as tool arguments (e.g. { pattern: "Deno.readFile" }).
+    // 4. Pattern-based validation.
+    //    With ast-validator: Unicode normalize → AST parse + walk
+    //    Without ast-validator: Unicode normalize → comment strip → string strip → regex scan
+    validate_patterns(code)
+}
+
+/// AST-based pattern validation (defense-in-depth via oxc_parser AST walk).
+#[cfg(feature = "ast-validator")]
+fn validate_patterns(code: &str) -> Result<(), SandboxError> {
+    // Normalize Unicode confusables BEFORE parsing so that Cyrillic/fullwidth
+    // evasion is caught even at the AST level.
+    let normalized = normalize_unicode_confusables(code);
+
+    crate::ast_validator::validate_ast(&normalized).map_err(|v| match v {
+        crate::ast_validator::AstViolation::ParseError(msg) => SandboxError::ValidationFailed {
+            reason: format!("code could not be parsed: {msg}"),
+        },
+        crate::ast_validator::AstViolation::NestingTooDeep { max, actual } => {
+            SandboxError::ValidationFailed {
+                reason: format!("code nesting depth {actual} exceeds maximum {max}"),
+            }
+        }
+        crate::ast_validator::AstViolation::BannedPattern { description } => {
+            SandboxError::BannedPattern {
+                pattern: description,
+            }
+        }
+    })
+}
+
+/// Regex-based pattern validation (fallback when ast-validator feature is disabled).
+#[cfg(not(feature = "ast-validator"))]
+fn validate_patterns(code: &str) -> Result<(), SandboxError> {
     let normalized = collapse_whitespace_before_parens(&strip_string_contents(&strip_js_comments(
         &normalize_unicode_confusables(code),
     )));
@@ -225,7 +238,6 @@ pub fn validate_code(code: &str, max_size: Option<usize>) -> Result<(), SandboxE
             });
         }
     }
-
     Ok(())
 }
 

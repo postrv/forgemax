@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use anyhow::Result;
+use forge_error::DispatchError;
 use forge_sandbox::{ResourceDispatcher, ToolDispatcher};
 use serde_json::Value;
 
@@ -47,14 +47,17 @@ impl Default for RouterDispatcher {
 
 #[async_trait::async_trait]
 impl ToolDispatcher for RouterDispatcher {
-    async fn call_tool(&self, server: &str, tool: &str, args: Value) -> Result<Value> {
-        let client = self.clients.get(server).ok_or_else(|| {
-            anyhow::anyhow!(
-                "unknown server '{}', available servers: {:?}",
-                server,
-                self.server_names()
-            )
-        })?;
+    #[tracing::instrument(skip(self, args))]
+    async fn call_tool(
+        &self,
+        server: &str,
+        tool: &str,
+        args: Value,
+    ) -> Result<Value, DispatchError> {
+        let client = self
+            .clients
+            .get(server)
+            .ok_or_else(|| DispatchError::ServerNotFound(server.into()))?;
         client.call_tool(server, tool, args).await
     }
 }
@@ -94,14 +97,11 @@ impl Default for RouterResourceDispatcher {
 
 #[async_trait::async_trait]
 impl ResourceDispatcher for RouterResourceDispatcher {
-    async fn read_resource(&self, server: &str, uri: &str) -> Result<Value> {
-        let client = self.clients.get(server).ok_or_else(|| {
-            anyhow::anyhow!(
-                "unknown server '{}' for resource read, available servers: {:?}",
-                server,
-                self.server_names()
-            )
-        })?;
+    async fn read_resource(&self, server: &str, uri: &str) -> Result<Value, DispatchError> {
+        let client = self
+            .clients
+            .get(server)
+            .ok_or_else(|| DispatchError::ServerNotFound(server.into()))?;
         client.read_resource(server, uri).await
     }
 }
@@ -132,7 +132,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ToolDispatcher for MockDispatcher {
-        async fn call_tool(&self, server: &str, tool: &str, args: Value) -> Result<Value> {
+        async fn call_tool(
+            &self,
+            server: &str,
+            tool: &str,
+            args: Value,
+        ) -> Result<Value, DispatchError> {
             self.calls
                 .lock()
                 .unwrap()
@@ -151,8 +156,15 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ToolDispatcher for FailingDispatcher {
-        async fn call_tool(&self, _server: &str, _tool: &str, _args: Value) -> Result<Value> {
-            Err(anyhow::anyhow!("downstream connection failed"))
+        async fn call_tool(
+            &self,
+            _server: &str,
+            _tool: &str,
+            _args: Value,
+        ) -> Result<Value, DispatchError> {
+            Err(DispatchError::Internal(anyhow::anyhow!(
+                "downstream connection failed"
+            )))
         }
     }
 
@@ -196,14 +208,10 @@ mod tests {
             .await;
 
         assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
+        let err = result.unwrap_err();
         assert!(
-            err.contains("nonexistent"),
-            "error should mention the unknown server name: {err}"
-        );
-        assert!(
-            err.contains("known"),
-            "error should list available servers: {err}"
+            matches!(err, DispatchError::ServerNotFound(ref s) if s == "nonexistent"),
+            "expected ServerNotFound, got: {err}"
         );
     }
 
@@ -284,8 +292,7 @@ mod tests {
     async fn router_empty_returns_error() {
         let router = RouterDispatcher::new();
         let result = router.call_tool("any", "tool", serde_json::json!({})).await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("unknown server"));
+        assert!(matches!(result, Err(DispatchError::ServerNotFound(_))));
     }
 
     // --- v0.2 Resource Router Tests (RS-C05..RS-C06) ---
@@ -296,7 +303,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ResourceDispatcher for MockResourceDispatcher {
-        async fn read_resource(&self, server: &str, uri: &str) -> Result<Value> {
+        async fn read_resource(&self, server: &str, uri: &str) -> Result<Value, DispatchError> {
             Ok(serde_json::json!({
                 "dispatcher": self.name,
                 "server": server,
@@ -343,9 +350,6 @@ mod tests {
         );
 
         let result = router.read_resource("nonexistent", "uri").await;
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("nonexistent"), "got: {err}");
-        assert!(err.contains("known"), "should list available: {err}");
+        assert!(matches!(result, Err(DispatchError::ServerNotFound(ref s)) if s == "nonexistent"));
     }
 }

@@ -6,7 +6,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use forge_error::DispatchError;
 use forge_sandbox::{ResourceDispatcher, ToolDispatcher};
 use serde_json::Value;
 use tokio::sync::Mutex;
@@ -44,12 +44,6 @@ pub(crate) struct CircuitBreakerState {
 }
 
 /// A [`ToolDispatcher`] that implements the circuit breaker pattern.
-///
-/// Wraps an inner dispatcher and tracks consecutive failures. After
-/// `failure_threshold` consecutive errors, the circuit opens and all calls
-/// are rejected immediately until `recovery_timeout` elapses. The first
-/// call after recovery is a probe (half-open): success closes the circuit,
-/// failure re-opens it.
 pub struct CircuitBreakerDispatcher {
     inner: Arc<dyn ToolDispatcher>,
     config: CircuitBreakerConfig,
@@ -79,42 +73,34 @@ impl CircuitBreakerDispatcher {
 
 #[async_trait::async_trait]
 impl ToolDispatcher for CircuitBreakerDispatcher {
-    async fn call_tool(&self, server: &str, tool: &str, args: Value) -> Result<Value> {
-        // Check circuit state before calling
+    async fn call_tool(
+        &self,
+        server: &str,
+        tool: &str,
+        args: Value,
+    ) -> Result<Value, DispatchError> {
         {
             let mut st = self.state.lock().await;
             match st.state {
                 CircuitState::Open => {
-                    // Check if recovery timeout has elapsed
                     if let Some(last_fail) = st.last_failure_time {
                         if last_fail.elapsed() >= self.config.recovery_timeout {
-                            // Transition to half-open: allow a single probe
                             st.state = CircuitState::HalfOpen;
                             tracing::info!(
                                 server = %self.server_name,
                                 "circuit breaker half-open, allowing probe call"
                             );
                         } else {
-                            return Err(anyhow::anyhow!(
-                                "circuit breaker open for server '{}': {} consecutive failures, \
-                                 recovery in {}s",
-                                self.server_name,
-                                st.consecutive_failures,
-                                (self.config.recovery_timeout - last_fail.elapsed()).as_secs()
-                            ));
+                            return Err(DispatchError::CircuitOpen(self.server_name.clone()));
                         }
                     }
                 }
-                CircuitState::HalfOpen | CircuitState::Closed => {
-                    // Allow the call through
-                }
+                CircuitState::HalfOpen | CircuitState::Closed => {}
             }
         }
 
-        // Execute the call
         let result = self.inner.call_tool(server, tool, args).await;
 
-        // Update state based on result
         {
             let mut st = self.state.lock().await;
             match &result {
@@ -155,9 +141,6 @@ impl ToolDispatcher for CircuitBreakerDispatcher {
 }
 
 /// A [`ResourceDispatcher`] wrapper with independent circuit breaker state.
-///
-/// Uses the same circuit breaker pattern as [`CircuitBreakerDispatcher`] but
-/// tracks resource failures independently from tool call failures.
 pub struct CircuitBreakerResourceDispatcher {
     inner: Arc<dyn ResourceDispatcher>,
     server_name: String,
@@ -187,8 +170,11 @@ impl CircuitBreakerResourceDispatcher {
 
 #[async_trait::async_trait]
 impl ResourceDispatcher for CircuitBreakerResourceDispatcher {
-    async fn read_resource(&self, server: &str, uri: &str) -> Result<serde_json::Value> {
-        // Check circuit state before calling
+    async fn read_resource(
+        &self,
+        server: &str,
+        uri: &str,
+    ) -> Result<serde_json::Value, DispatchError> {
         {
             let mut st = self.state.lock().await;
             match st.state {
@@ -197,11 +183,7 @@ impl ResourceDispatcher for CircuitBreakerResourceDispatcher {
                         if last_fail.elapsed() >= self.config.recovery_timeout {
                             st.state = CircuitState::HalfOpen;
                         } else {
-                            return Err(anyhow::anyhow!(
-                                "circuit breaker open for server '{}': {} consecutive failures",
-                                self.server_name,
-                                st.consecutive_failures,
-                            ));
+                            return Err(DispatchError::CircuitOpen(self.server_name.clone()));
                         }
                     }
                 }
@@ -211,7 +193,6 @@ impl ResourceDispatcher for CircuitBreakerResourceDispatcher {
 
         let result = self.inner.read_resource(server, uri).await;
 
-        // Update state based on result
         {
             let mut st = self.state.lock().await;
             match &result {
@@ -245,7 +226,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ToolDispatcher for OkDispatcher {
-        async fn call_tool(&self, _server: &str, tool: &str, _args: Value) -> Result<Value> {
+        async fn call_tool(
+            &self,
+            _server: &str,
+            tool: &str,
+            _args: Value,
+        ) -> Result<Value, DispatchError> {
             Ok(serde_json::json!({"tool": tool, "status": "ok"}))
         }
     }
@@ -267,9 +253,17 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ToolDispatcher for FailDispatcher {
-        async fn call_tool(&self, _server: &str, _tool: &str, _args: Value) -> Result<Value> {
+        async fn call_tool(
+            &self,
+            _server: &str,
+            _tool: &str,
+            _args: Value,
+        ) -> Result<Value, DispatchError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            Err(anyhow::anyhow!("server error"))
+            Err(DispatchError::Upstream {
+                server: "s".into(),
+                message: "server error".into(),
+            })
         }
     }
 
@@ -281,10 +275,18 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ToolDispatcher for FailThenOkDispatcher {
-        async fn call_tool(&self, _server: &str, tool: &str, _args: Value) -> Result<Value> {
+        async fn call_tool(
+            &self,
+            _server: &str,
+            tool: &str,
+            _args: Value,
+        ) -> Result<Value, DispatchError> {
             let n = self.calls.fetch_add(1, Ordering::SeqCst);
             if n < self.fail_count {
-                Err(anyhow::anyhow!("server error"))
+                Err(DispatchError::Upstream {
+                    server: "s".into(),
+                    message: "server error".into(),
+                })
             } else {
                 Ok(serde_json::json!({"tool": tool, "status": "ok"}))
             }
@@ -312,18 +314,13 @@ mod tests {
         let inner = Arc::new(FailDispatcher::new());
         let cb = CircuitBreakerDispatcher::new(inner.clone(), test_config(3, 60_000), "flaky");
 
-        // 3 failures to trip the breaker
         for _ in 0..3 {
             let _ = cb.call_tool("flaky", "tool", serde_json::json!({})).await;
         }
         assert_eq!(inner.call_count(), 3);
 
-        // 4th call should be rejected without reaching inner
         let result = cb.call_tool("flaky", "tool", serde_json::json!({})).await;
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("circuit breaker open"), "got: {msg}");
-        assert!(msg.contains("flaky"), "should mention server: {msg}");
+        assert!(matches!(result, Err(DispatchError::CircuitOpen(_))));
         assert_eq!(
             inner.call_count(),
             3,
@@ -336,15 +333,13 @@ mod tests {
         let inner = Arc::new(FailDispatcher::new());
         let cb = CircuitBreakerDispatcher::new(inner.clone(), test_config(2, 60_000), "s");
 
-        // Trip the breaker
         for _ in 0..2 {
             let _ = cb.call_tool("s", "t", serde_json::json!({})).await;
         }
 
-        // Multiple calls should all be rejected
         for _ in 0..5 {
             let result = cb.call_tool("s", "t", serde_json::json!({})).await;
-            assert!(result.is_err());
+            assert!(matches!(result, Err(DispatchError::CircuitOpen(_))));
         }
         assert_eq!(
             inner.call_count(),
@@ -357,23 +352,19 @@ mod tests {
     async fn half_open_after_recovery_timeout() {
         let inner = Arc::new(FailThenOkDispatcher {
             calls: AtomicUsize::new(0),
-            fail_count: 3, // fail first 3, then succeed
+            fail_count: 3,
         });
         let cb = CircuitBreakerDispatcher::new(inner, test_config(3, 50), "s");
 
-        // Trip the breaker (3 failures)
         for _ in 0..3 {
             let _ = cb.call_tool("s", "t", serde_json::json!({})).await;
         }
 
-        // Should be open
         let result = cb.call_tool("s", "t", serde_json::json!({})).await;
         assert!(result.is_err());
 
-        // Wait for recovery
         tokio::time::sleep(Duration::from_millis(60)).await;
 
-        // Probe call should succeed (fail_count=3, this is call #3 zero-indexed → success)
         let result = cb.call_tool("s", "t", serde_json::json!({})).await;
         assert!(result.is_ok(), "probe should succeed after recovery");
     }
@@ -383,22 +374,18 @@ mod tests {
         let inner = Arc::new(FailDispatcher::new());
         let cb = CircuitBreakerDispatcher::new(inner.clone(), test_config(2, 50), "s");
 
-        // Trip the breaker
         for _ in 0..2 {
             let _ = cb.call_tool("s", "t", serde_json::json!({})).await;
         }
 
-        // Wait for recovery
         tokio::time::sleep(Duration::from_millis(60)).await;
 
-        // Probe call will fail → circuit should re-open
         let result = cb.call_tool("s", "t", serde_json::json!({})).await;
         assert!(result.is_err());
 
-        // Next call should be rejected immediately (circuit re-opened)
         let before = inner.call_count();
         let result = cb.call_tool("s", "t", serde_json::json!({})).await;
-        assert!(result.is_err());
+        assert!(matches!(result, Err(DispatchError::CircuitOpen(_))));
         assert_eq!(
             inner.call_count(),
             before,
@@ -410,19 +397,16 @@ mod tests {
     async fn success_resets_failure_counter() {
         let inner = Arc::new(FailThenOkDispatcher {
             calls: AtomicUsize::new(0),
-            fail_count: 2, // fail first 2, then succeed
+            fail_count: 2,
         });
         let cb = CircuitBreakerDispatcher::new(inner, test_config(3, 60_000), "s");
 
-        // 2 failures (threshold is 3, so still closed)
         let _ = cb.call_tool("s", "t", serde_json::json!({})).await;
         let _ = cb.call_tool("s", "t", serde_json::json!({})).await;
 
-        // 1 success (call index 2) → counter should reset
         let result = cb.call_tool("s", "t", serde_json::json!({})).await;
         assert!(result.is_ok());
 
-        // Circuit should still be closed — the counter was reset
         let st = cb.state.lock().await;
         assert_eq!(st.state, CircuitState::Closed);
         assert_eq!(st.consecutive_failures, 0);
@@ -443,12 +427,7 @@ mod tests {
             .call_tool("my-server", "tool", serde_json::json!({}))
             .await
             .unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("my-server"), "should mention server: {msg}");
-        assert!(
-            msg.contains("2 consecutive failures"),
-            "should mention failure count: {msg}"
-        );
+        assert!(matches!(err, DispatchError::CircuitOpen(ref s) if s == "my-server"));
     }
 
     // --- v0.2 Resource Circuit Breaker Test (RS-C08) ---
@@ -457,8 +436,11 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ResourceDispatcher for FailResourceDispatcher {
-        async fn read_resource(&self, _server: &str, _uri: &str) -> Result<Value> {
-            Err(anyhow::anyhow!("resource read failed"))
+        async fn read_resource(&self, _server: &str, _uri: &str) -> Result<Value, DispatchError> {
+            Err(DispatchError::Upstream {
+                server: "flaky".into(),
+                message: "resource read failed".into(),
+            })
         }
     }
 
@@ -467,16 +449,12 @@ mod tests {
         let inner: Arc<dyn ResourceDispatcher> = Arc::new(FailResourceDispatcher);
         let cb = CircuitBreakerResourceDispatcher::new(inner, test_config(2, 60_000), "flaky");
 
-        // 2 failures to trip
         for _ in 0..2 {
             let _ = cb.read_resource("flaky", "file:///log").await;
         }
 
-        // 3rd call rejected without reaching inner
         let result = cb.read_resource("flaky", "file:///log").await;
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("circuit breaker open"), "got: {msg}");
+        assert!(matches!(result, Err(DispatchError::CircuitOpen(_))));
     }
 
     #[tokio::test]
@@ -487,19 +465,15 @@ mod tests {
         });
         let cb = CircuitBreakerDispatcher::new(inner, test_config(2, 50), "s");
 
-        // Trip the breaker
         for _ in 0..2 {
             let _ = cb.call_tool("s", "t", serde_json::json!({})).await;
         }
 
-        // Wait for recovery
         tokio::time::sleep(Duration::from_millis(60)).await;
 
-        // Probe succeeds (call index 2)
         let result = cb.call_tool("s", "t", serde_json::json!({})).await;
         assert!(result.is_ok());
 
-        // Circuit should be closed now — next call should go through
         let result = cb.call_tool("s", "t", serde_json::json!({})).await;
         assert!(result.is_ok());
     }

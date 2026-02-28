@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use anyhow::Result;
+use forge_error::DispatchError;
 use serde_json::Value;
 use tokio::sync::Mutex;
 
@@ -25,6 +25,7 @@ pub type SharedGroupLock = Arc<Mutex<Option<String>>>;
 
 /// Isolation mode for a server group.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum IsolationMode {
     /// Strict: once an execution calls a server in this group, it cannot call
     /// servers in a different strict group.
@@ -92,7 +93,7 @@ async fn check_group_access(
     policy: &GroupPolicy,
     locked_group: &SharedGroupLock,
     server: &str,
-) -> Result<()> {
+) -> Result<(), DispatchError> {
     if let Some((group, mode)) = policy.server_group(server) {
         if mode == IsolationMode::Strict {
             let mut locked = locked_group.lock().await;
@@ -104,13 +105,13 @@ async fn check_group_access(
                     // Same strict group: allowed
                 }
                 Some(existing) => {
-                    return Err(anyhow::anyhow!(
-                        "cross-group call denied: server '{}' is in strict group '{}', \
-                         but this execution is locked to strict group '{}'",
-                        server,
-                        group,
-                        existing,
-                    ));
+                    return Err(DispatchError::GroupPolicyDenied {
+                        reason: format!(
+                            "cross-group call denied: server '{}' is in strict group '{}', \
+                             but this execution is locked to strict group '{}'",
+                            server, group, existing,
+                        ),
+                    });
                 }
             }
         }
@@ -190,7 +191,12 @@ impl GroupEnforcingResourceDispatcher {
 
 #[async_trait::async_trait]
 impl ToolDispatcher for GroupEnforcingDispatcher {
-    async fn call_tool(&self, server: &str, tool: &str, args: Value) -> Result<Value> {
+    async fn call_tool(
+        &self,
+        server: &str,
+        tool: &str,
+        args: Value,
+    ) -> Result<Value, DispatchError> {
         check_group_access(&self.policy, &self.locked_group, server).await?;
         self.inner.call_tool(server, tool, args).await
     }
@@ -198,7 +204,7 @@ impl ToolDispatcher for GroupEnforcingDispatcher {
 
 #[async_trait::async_trait]
 impl ResourceDispatcher for GroupEnforcingResourceDispatcher {
-    async fn read_resource(&self, server: &str, uri: &str) -> Result<Value> {
+    async fn read_resource(&self, server: &str, uri: &str) -> Result<Value, DispatchError> {
         check_group_access(&self.policy, &self.locked_group, server).await?;
         self.inner.read_resource(server, uri).await
     }
@@ -212,7 +218,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ToolDispatcher for MockDispatcher {
-        async fn call_tool(&self, server: &str, tool: &str, _args: Value) -> Result<Value> {
+        async fn call_tool(
+            &self,
+            server: &str,
+            tool: &str,
+            _args: Value,
+        ) -> Result<Value, DispatchError> {
             Ok(serde_json::json!({"server": server, "tool": tool}))
         }
     }
@@ -302,12 +313,12 @@ mod tests {
         let result = dispatcher
             .call_tool("slack", "messages.send", serde_json::json!({}))
             .await;
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
+        let err = result.unwrap_err();
         assert!(
-            msg.contains("cross-group"),
-            "should mention cross-group: {msg}"
+            matches!(err, DispatchError::GroupPolicyDenied { .. }),
+            "expected GroupPolicyDenied, got: {err}"
         );
+        let msg = err.to_string();
         assert!(msg.contains("slack"), "should mention server: {msg}");
         assert!(
             msg.contains("external"),
@@ -416,7 +427,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ResourceDispatcher for MockResourceDispatcher {
-        async fn read_resource(&self, server: &str, uri: &str) -> Result<Value> {
+        async fn read_resource(&self, server: &str, uri: &str) -> Result<Value, DispatchError> {
             Ok(serde_json::json!({"server": server, "uri": uri}))
         }
     }
@@ -490,11 +501,10 @@ mod tests {
         let result = resource_dispatcher
             .read_resource("slack", "file:///messages")
             .await;
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
+        let err = result.unwrap_err();
         assert!(
-            msg.contains("cross-group"),
-            "should mention cross-group: {msg}"
+            matches!(err, DispatchError::GroupPolicyDenied { .. }),
+            "expected GroupPolicyDenied, got: {err}"
         );
     }
 
@@ -528,11 +538,10 @@ mod tests {
         let result = tool_dispatcher
             .call_tool("vault", "secrets.list", serde_json::json!({}))
             .await;
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
+        let err = result.unwrap_err();
         assert!(
-            msg.contains("cross-group"),
-            "should mention cross-group: {msg}"
+            matches!(err, DispatchError::GroupPolicyDenied { .. }),
+            "expected GroupPolicyDenied, got: {err}"
         );
     }
 
@@ -553,11 +562,16 @@ mod tests {
             .call_tool("slack", "send", serde_json::json!({}))
             .await
             .unwrap_err();
-        let msg = err.to_string();
-        // Should contain enough info for the LLM to understand what happened
-        assert!(msg.contains("denied"));
-        assert!(msg.contains("slack"));
-        assert!(msg.contains("comms"));
-        assert!(msg.contains("secrets"));
+        // Use typed match instead of string matching on error type
+        assert!(
+            matches!(
+                err,
+                DispatchError::GroupPolicyDenied { ref reason }
+                    if reason.contains("slack")
+                    && reason.contains("comms")
+                    && reason.contains("secrets")
+            ),
+            "expected GroupPolicyDenied mentioning server/groups, got: {err}"
+        );
     }
 }

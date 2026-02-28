@@ -12,6 +12,8 @@ use tokio::io::BufReader;
 use tokio::process::Command;
 
 use crate::error::SandboxError;
+use tokio::io::{AsyncRead, AsyncWrite};
+
 use crate::ipc::{read_message, write_message, ChildMessage, ParentMessage, WorkerConfig};
 use crate::{ResourceDispatcher, StashDispatcher, ToolDispatcher};
 
@@ -26,6 +28,7 @@ impl SandboxHost {
     /// 3. Routes tool call requests through the parent's dispatcher
     /// 4. Returns the execution result (or kills the child on timeout)
     ///
+    #[tracing::instrument(skip(code, config, dispatcher, resource_dispatcher, stash_dispatcher), fields(code_len = code.len()))]
     pub async fn execute_in_child(
         code: &str,
         config: &crate::SandboxConfig,
@@ -109,31 +112,61 @@ impl SandboxHost {
 
 /// Run the IPC event loop: read messages from the child, dispatch tool calls,
 /// resource reads, and stash operations, then return the final result.
-async fn ipc_event_loop(
-    child_stdin: &mut tokio::process::ChildStdin,
-    child_stdout: &mut BufReader<tokio::process::ChildStdout>,
+///
+/// Generic over I/O types so both single-execution [`SandboxHost`] and the
+/// worker pool can reuse this loop.
+pub(crate) async fn ipc_event_loop<W, R>(
+    child_stdin: &mut W,
+    child_stdout: &mut R,
     dispatcher: Arc<dyn ToolDispatcher>,
     resource_dispatcher: Option<Arc<dyn ResourceDispatcher>>,
     stash_dispatcher: Option<Arc<dyn StashDispatcher>>,
-) -> Result<serde_json::Value, SandboxError> {
+) -> Result<serde_json::Value, SandboxError>
+where
+    W: AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
+{
     loop {
         let msg: Option<ChildMessage> = read_message(child_stdout)
             .await
             .map_err(|e| SandboxError::Execution(anyhow::anyhow!("IPC read error: {}", e)))?;
 
         match msg {
-            Some(ChildMessage::ExecutionComplete { result }) => {
+            Some(ChildMessage::ExecutionComplete { result, error_kind }) => {
                 return match result {
                     Ok(value) => Ok(value),
                     Err(err) => {
-                        // Strip "javascript error: " prefix if already applied by the
-                        // worker's SandboxError::JsError.to_string(), preventing double
-                        // wrapping like "javascript error: javascript error: <msg>".
-                        let message = err
-                            .strip_prefix("javascript error: ")
-                            .unwrap_or(&err)
-                            .to_string();
-                        Err(SandboxError::JsError { message })
+                        // Use error_kind to reconstruct the correct SandboxError variant.
+                        // Falls back to JsError if error_kind is absent (backward compat
+                        // with workers that predate the error_kind field).
+                        match error_kind {
+                            Some(crate::ipc::ErrorKind::Timeout) => {
+                                // Extract timeout_ms from the error message if possible,
+                                // otherwise use 0 as a sentinel.
+                                let timeout_ms = err
+                                    .split("after ")
+                                    .nth(1)
+                                    .and_then(|s| s.trim_end_matches("ms").parse::<u64>().ok())
+                                    .unwrap_or(0);
+                                Err(SandboxError::Timeout { timeout_ms })
+                            }
+                            Some(crate::ipc::ErrorKind::HeapLimit) => {
+                                Err(SandboxError::HeapLimitExceeded)
+                            }
+                            Some(crate::ipc::ErrorKind::Execution) => {
+                                Err(SandboxError::Execution(anyhow::anyhow!("{}", err)))
+                            }
+                            Some(crate::ipc::ErrorKind::JsError) | None => {
+                                // Strip "javascript error: " prefix if already applied by the
+                                // worker's SandboxError::JsError.to_string(), preventing double
+                                // wrapping like "javascript error: javascript error: <msg>".
+                                let message = err
+                                    .strip_prefix("javascript error: ")
+                                    .unwrap_or(&err)
+                                    .to_string();
+                                Err(SandboxError::JsError { message })
+                            }
+                        }
                     }
                 };
             }
@@ -232,6 +265,10 @@ async fn ipc_event_loop(
             Some(ChildMessage::Log { message }) => {
                 tracing::info!(target: "forge::sandbox::worker", "{}", message);
             }
+            Some(ChildMessage::ResetComplete) => {
+                // Unexpected in single-execution mode; ignore.
+                tracing::warn!("received unexpected ResetComplete in single-execution mode");
+            }
             None => {
                 // Child closed stdout without sending ExecutionComplete
                 return Err(SandboxError::Execution(anyhow::anyhow!(
@@ -249,7 +286,7 @@ async fn ipc_event_loop(
 /// 2. Same directory as the current executable
 ///
 /// On Unix, rejects world-writable binaries (mode & 0o002 != 0).
-fn find_worker_binary() -> Result<PathBuf, SandboxError> {
+pub(crate) fn find_worker_binary() -> Result<PathBuf, SandboxError> {
     // 1. Explicit env var — must be an absolute path
     if let Ok(path) = std::env::var("FORGE_WORKER_BIN") {
         let p = PathBuf::from(&path);

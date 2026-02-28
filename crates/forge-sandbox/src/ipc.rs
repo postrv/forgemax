@@ -8,9 +8,29 @@ use serde_json::Value;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+/// Error classification for structured error preservation across IPC.
+///
+/// When errors cross the process boundary via `ExecutionComplete`, the typed
+/// `SandboxError` variants are converted to strings. This enum preserves the
+/// error kind so the parent can reconstruct the correct `SandboxError` variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ErrorKind {
+    /// V8 execution timed out (CPU watchdog or async event loop).
+    Timeout,
+    /// V8 heap memory limit was exceeded.
+    HeapLimit,
+    /// A JavaScript error was thrown.
+    JsError,
+    /// Generic execution failure.
+    Execution,
+}
+
 /// Messages sent from the parent process to the worker child.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
+#[non_exhaustive]
 pub enum ParentMessage {
     /// Initial message: execute this code in the sandbox.
     Execute {
@@ -35,6 +55,14 @@ pub enum ParentMessage {
         /// The resource content, or an error message.
         result: Result<Value, String>,
     },
+    /// Reset the worker for a new execution (pool mode).
+    ///
+    /// The worker drops its current JsRuntime and creates a fresh one.
+    /// It responds with [`ChildMessage::ResetComplete`].
+    Reset {
+        /// New worker configuration for the next execution.
+        config: WorkerConfig,
+    },
     /// Response to a stash operation from the child.
     StashResult {
         /// Matches the request_id from the stash request.
@@ -47,6 +75,7 @@ pub enum ParentMessage {
 /// Messages sent from the worker child to the parent process.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
+#[non_exhaustive]
 pub enum ChildMessage {
     /// Request the parent to dispatch a tool call.
     ToolCallRequest {
@@ -98,10 +127,17 @@ pub enum ChildMessage {
         /// Unique ID for correlating request ↔ response.
         request_id: u64,
     },
+    /// Worker has been reset and is ready for a new execution.
+    ResetComplete,
     /// The execution has finished.
     ExecutionComplete {
         /// The result value, or an error message.
         result: Result<Value, String>,
+        /// Classification of the error for typed reconstruction on the parent side.
+        /// Present only when `result` is `Err`. Defaults to `JsError` if absent
+        /// (backward compatibility with workers that don't send this field).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error_kind: Option<ErrorKind>,
     },
     /// A log message from the worker.
     Log {
@@ -382,6 +418,7 @@ mod tests {
     async fn roundtrip_child_execution_complete() {
         let msg = ChildMessage::ExecutionComplete {
             result: Ok(serde_json::json!([1, 2, 3])),
+            error_kind: None,
         };
 
         let mut buf = Vec::new();
@@ -391,8 +428,9 @@ mod tests {
         let decoded: ChildMessage = read_message(&mut cursor).await.unwrap().unwrap();
 
         match decoded {
-            ChildMessage::ExecutionComplete { result } => {
+            ChildMessage::ExecutionComplete { result, error_kind } => {
                 assert_eq!(result.unwrap(), serde_json::json!([1, 2, 3]));
+                assert_eq!(error_kind, None);
             }
             other => panic!("expected ExecutionComplete, got: {:?}", other),
         }
@@ -431,6 +469,7 @@ mod tests {
         };
         let msg3 = ChildMessage::ExecutionComplete {
             result: Ok(serde_json::json!("done")),
+            error_kind: None,
         };
 
         let mut buf = Vec::new();
@@ -456,6 +495,7 @@ mod tests {
     async fn execution_complete_error_roundtrip() {
         let msg = ChildMessage::ExecutionComplete {
             result: Err("failed to create tokio runtime: resource unavailable".into()),
+            error_kind: Some(ErrorKind::Execution),
         };
 
         let mut buf = Vec::new();
@@ -465,12 +505,13 @@ mod tests {
         let decoded: ChildMessage = read_message(&mut cursor).await.unwrap().unwrap();
 
         match decoded {
-            ChildMessage::ExecutionComplete { result } => {
+            ChildMessage::ExecutionComplete { result, error_kind } => {
                 let err = result.unwrap_err();
                 assert!(
                     err.contains("tokio runtime"),
                     "expected runtime error: {err}"
                 );
+                assert_eq!(error_kind, Some(ErrorKind::Execution));
             }
             other => panic!("expected ExecutionComplete, got: {:?}", other),
         }
@@ -507,6 +548,7 @@ mod tests {
         let large_data = "x".repeat(1_000_000);
         let msg = ChildMessage::ExecutionComplete {
             result: Ok(serde_json::json!(large_data)),
+            error_kind: None,
         };
 
         let mut buf = Vec::new();
@@ -516,7 +558,7 @@ mod tests {
         let decoded: ChildMessage = read_message(&mut cursor).await.unwrap().unwrap();
 
         match decoded {
-            ChildMessage::ExecutionComplete { result } => {
+            ChildMessage::ExecutionComplete { result, .. } => {
                 assert_eq!(result.unwrap().as_str().unwrap().len(), 1_000_000);
             }
             other => panic!("expected ExecutionComplete, got: {:?}", other),
@@ -805,6 +847,7 @@ mod tests {
         };
         let msg5 = ChildMessage::ExecutionComplete {
             result: Ok(serde_json::json!("done")),
+            error_kind: None,
         };
 
         let mut buf = Vec::new();
@@ -832,6 +875,96 @@ mod tests {
         assert!(d6.is_none());
     }
 
+    // --- IPC-P01: Reset round-trip ---
+    #[tokio::test]
+    async fn ipc_p01_reset_roundtrip() {
+        let msg = ParentMessage::Reset {
+            config: WorkerConfig {
+                timeout_ms: 3000,
+                max_heap_size: 32 * 1024 * 1024,
+                max_tool_calls: 25,
+                max_tool_call_args_size: 512 * 1024,
+                max_output_size: 512 * 1024,
+                max_code_size: 32 * 1024,
+                max_ipc_message_size: DEFAULT_MAX_IPC_MESSAGE_SIZE,
+                max_resource_size: 32 * 1024 * 1024,
+                max_parallel: 4,
+            },
+        };
+
+        let mut buf = Vec::new();
+        write_message(&mut buf, &msg).await.unwrap();
+
+        let mut cursor = Cursor::new(buf);
+        let decoded: ParentMessage = read_message(&mut cursor).await.unwrap().unwrap();
+
+        match decoded {
+            ParentMessage::Reset { config } => {
+                assert_eq!(config.timeout_ms, 3000);
+                assert_eq!(config.max_tool_calls, 25);
+            }
+            other => panic!("expected Reset, got: {:?}", other),
+        }
+    }
+
+    // --- IPC-P02: ResetComplete round-trip ---
+    #[tokio::test]
+    async fn ipc_p02_reset_complete_roundtrip() {
+        let msg = ChildMessage::ResetComplete;
+
+        let mut buf = Vec::new();
+        write_message(&mut buf, &msg).await.unwrap();
+
+        let mut cursor = Cursor::new(buf);
+        let decoded: ChildMessage = read_message(&mut cursor).await.unwrap().unwrap();
+
+        assert!(matches!(decoded, ChildMessage::ResetComplete));
+    }
+
+    // --- IPC-P03: Reset + Execute interleaving in single stream ---
+    #[tokio::test]
+    async fn ipc_p03_reset_execute_interleaving() {
+        let reset = ParentMessage::Reset {
+            config: WorkerConfig {
+                timeout_ms: 5000,
+                max_heap_size: 64 * 1024 * 1024,
+                max_tool_calls: 50,
+                max_tool_call_args_size: 1024 * 1024,
+                max_output_size: 1024 * 1024,
+                max_code_size: 64 * 1024,
+                max_ipc_message_size: DEFAULT_MAX_IPC_MESSAGE_SIZE,
+                max_resource_size: 64 * 1024 * 1024,
+                max_parallel: 8,
+            },
+        };
+        let execute = ParentMessage::Execute {
+            code: "async () => 42".into(),
+            manifest: None,
+            config: WorkerConfig {
+                timeout_ms: 5000,
+                max_heap_size: 64 * 1024 * 1024,
+                max_tool_calls: 50,
+                max_tool_call_args_size: 1024 * 1024,
+                max_output_size: 1024 * 1024,
+                max_code_size: 64 * 1024,
+                max_ipc_message_size: DEFAULT_MAX_IPC_MESSAGE_SIZE,
+                max_resource_size: 64 * 1024 * 1024,
+                max_parallel: 8,
+            },
+        };
+
+        let mut buf = Vec::new();
+        write_message(&mut buf, &reset).await.unwrap();
+        write_message(&mut buf, &execute).await.unwrap();
+
+        let mut cursor = Cursor::new(buf);
+        let d1: ParentMessage = read_message(&mut cursor).await.unwrap().unwrap();
+        let d2: ParentMessage = read_message(&mut cursor).await.unwrap().unwrap();
+
+        assert!(matches!(d1, ParentMessage::Reset { .. }));
+        assert!(matches!(d2, ParentMessage::Execute { .. }));
+    }
+
     // --- IPC-10: Oversized stash message rejected by read_message_with_limit ---
     #[tokio::test]
     async fn ipc_10_oversized_stash_message_rejected() {
@@ -853,6 +986,118 @@ mod tests {
         assert!(
             err_msg.contains("too large"),
             "error should mention 'too large': {err_msg}"
+        );
+    }
+
+    // --- IPC-O01: ErrorKind timeout round-trip ---
+    #[tokio::test]
+    async fn ipc_o01_error_kind_timeout_roundtrip() {
+        let msg = ChildMessage::ExecutionComplete {
+            result: Err("execution timed out after 500ms".into()),
+            error_kind: Some(ErrorKind::Timeout),
+        };
+
+        let mut buf = Vec::new();
+        write_message(&mut buf, &msg).await.unwrap();
+
+        let mut cursor = Cursor::new(buf);
+        let decoded: ChildMessage = read_message(&mut cursor).await.unwrap().unwrap();
+
+        match decoded {
+            ChildMessage::ExecutionComplete { result, error_kind } => {
+                assert!(result.is_err());
+                assert_eq!(error_kind, Some(ErrorKind::Timeout));
+            }
+            other => panic!("expected ExecutionComplete, got: {:?}", other),
+        }
+    }
+
+    // --- IPC-O02: ErrorKind heap_limit round-trip ---
+    #[tokio::test]
+    async fn ipc_o02_error_kind_heap_limit_roundtrip() {
+        let msg = ChildMessage::ExecutionComplete {
+            result: Err("V8 heap limit exceeded".into()),
+            error_kind: Some(ErrorKind::HeapLimit),
+        };
+
+        let mut buf = Vec::new();
+        write_message(&mut buf, &msg).await.unwrap();
+
+        let mut cursor = Cursor::new(buf);
+        let decoded: ChildMessage = read_message(&mut cursor).await.unwrap().unwrap();
+
+        match decoded {
+            ChildMessage::ExecutionComplete { result, error_kind } => {
+                assert!(result.is_err());
+                assert_eq!(error_kind, Some(ErrorKind::HeapLimit));
+            }
+            other => panic!("expected ExecutionComplete, got: {:?}", other),
+        }
+    }
+
+    // --- IPC-O03: ErrorKind absent defaults to None (backward compatibility) ---
+    #[tokio::test]
+    async fn ipc_o03_error_kind_backward_compat() {
+        // Simulate a message from an older worker that doesn't include error_kind.
+        // The JSON doesn't have the error_kind field at all.
+        let json = r#"{"type":"ExecutionComplete","result":{"Err":"some old error"}}"#;
+        let mut buf = Vec::new();
+        let payload = json.as_bytes();
+        let len = payload.len() as u32;
+        buf.extend_from_slice(&len.to_be_bytes());
+        buf.extend_from_slice(payload);
+
+        let mut cursor = Cursor::new(buf);
+        let decoded: ChildMessage = read_message(&mut cursor).await.unwrap().unwrap();
+
+        match decoded {
+            ChildMessage::ExecutionComplete { result, error_kind } => {
+                assert!(result.is_err());
+                assert_eq!(
+                    error_kind, None,
+                    "missing error_kind should default to None"
+                );
+            }
+            other => panic!("expected ExecutionComplete, got: {:?}", other),
+        }
+    }
+
+    // --- IPC-O04: ErrorKind js_error round-trip ---
+    #[tokio::test]
+    async fn ipc_o04_error_kind_js_error_roundtrip() {
+        let msg = ChildMessage::ExecutionComplete {
+            result: Err("ReferenceError: x is not defined".into()),
+            error_kind: Some(ErrorKind::JsError),
+        };
+
+        let mut buf = Vec::new();
+        write_message(&mut buf, &msg).await.unwrap();
+
+        let mut cursor = Cursor::new(buf);
+        let decoded: ChildMessage = read_message(&mut cursor).await.unwrap().unwrap();
+
+        match decoded {
+            ChildMessage::ExecutionComplete { result, error_kind } => {
+                assert_eq!(result.unwrap_err(), "ReferenceError: x is not defined");
+                assert_eq!(error_kind, Some(ErrorKind::JsError));
+            }
+            other => panic!("expected ExecutionComplete, got: {:?}", other),
+        }
+    }
+
+    // --- IPC-O05: Success result has no error_kind in serialized JSON ---
+    #[tokio::test]
+    async fn ipc_o05_success_omits_error_kind() {
+        let msg = ChildMessage::ExecutionComplete {
+            result: Ok(serde_json::json!(42)),
+            error_kind: None,
+        };
+
+        let json = serde_json::to_string(&msg).unwrap();
+        // error_kind: None should be skipped thanks to skip_serializing_if
+        assert!(
+            !json.contains("error_kind"),
+            "success messages should not contain error_kind field: {json}"
         );
     }
 }

@@ -13,7 +13,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use forge_manifest::Manifest;
+use forge_manifest::{LiveManifest, Manifest};
 use forge_sandbox::groups::{
     GroupEnforcingDispatcher, GroupEnforcingResourceDispatcher, GroupPolicy,
 };
@@ -66,7 +66,7 @@ fn truncate_result_if_needed(json: String) -> String {
 #[derive(Clone)]
 pub struct ForgeServer {
     executor: Arc<SandboxExecutor>,
-    manifest: Arc<Manifest>,
+    manifest: LiveManifest,
     dispatcher: Arc<dyn ToolDispatcher>,
     resource_dispatcher: Option<Arc<dyn ResourceDispatcher>>,
     group_policy: Option<Arc<GroupPolicy>>,
@@ -91,12 +91,14 @@ impl StashDispatcher for ServerStashDispatcher {
         value: serde_json::Value,
         ttl_secs: Option<u32>,
         _current_group: Option<String>,
-    ) -> Result<serde_json::Value, anyhow::Error> {
+    ) -> Result<serde_json::Value, forge_error::DispatchError> {
         let ttl = ttl_secs
             .filter(|&s| s > 0)
             .map(|s| Duration::from_secs(s as u64));
         let mut stash = self.stash.lock().await;
-        stash.put(key, value, ttl, self.current_group.as_deref())?;
+        stash
+            .put(key, value, ttl, self.current_group.as_deref())
+            .map_err(|e| forge_error::DispatchError::Internal(e.into()))?;
         Ok(serde_json::json!({"ok": true}))
     }
 
@@ -104,9 +106,12 @@ impl StashDispatcher for ServerStashDispatcher {
         &self,
         key: &str,
         _current_group: Option<String>,
-    ) -> Result<serde_json::Value, anyhow::Error> {
+    ) -> Result<serde_json::Value, forge_error::DispatchError> {
         let stash = self.stash.lock().await;
-        match stash.get(key, self.current_group.as_deref())? {
+        match stash
+            .get(key, self.current_group.as_deref())
+            .map_err(|e| forge_error::DispatchError::Internal(e.into()))?
+        {
             Some(v) => Ok(v.clone()),
             None => Ok(serde_json::Value::Null),
         }
@@ -116,16 +121,18 @@ impl StashDispatcher for ServerStashDispatcher {
         &self,
         key: &str,
         _current_group: Option<String>,
-    ) -> Result<serde_json::Value, anyhow::Error> {
+    ) -> Result<serde_json::Value, forge_error::DispatchError> {
         let mut stash = self.stash.lock().await;
-        let deleted = stash.delete(key, self.current_group.as_deref())?;
+        let deleted = stash
+            .delete(key, self.current_group.as_deref())
+            .map_err(|e| forge_error::DispatchError::Internal(e.into()))?;
         Ok(serde_json::json!({"deleted": deleted}))
     }
 
     async fn keys(
         &self,
         _current_group: Option<String>,
-    ) -> Result<serde_json::Value, anyhow::Error> {
+    ) -> Result<serde_json::Value, forge_error::DispatchError> {
         let stash = self.stash.lock().await;
         let keys: Vec<&str> = stash.keys(self.current_group.as_deref());
         Ok(serde_json::json!(keys))
@@ -143,7 +150,7 @@ impl ForgeServer {
     ) -> Self {
         Self {
             executor: Arc::new(SandboxExecutor::new(config)),
-            manifest: Arc::new(manifest),
+            manifest: LiveManifest::new(manifest),
             dispatcher,
             resource_dispatcher,
             group_policy: None,
@@ -172,6 +179,35 @@ impl ForgeServer {
     pub fn with_stash(mut self, config: StashConfig) -> Self {
         self.session_stash = Some(Arc::new(tokio::sync::Mutex::new(SessionStash::new(config))));
         self
+    }
+
+    /// Create a new Forge server with a pre-configured executor.
+    ///
+    /// Use this when you need to attach a worker pool to the executor
+    /// before wrapping it in the server.
+    pub fn new_with_executor(
+        executor: SandboxExecutor,
+        manifest: Manifest,
+        dispatcher: Arc<dyn ToolDispatcher>,
+        resource_dispatcher: Option<Arc<dyn ResourceDispatcher>>,
+    ) -> Self {
+        Self {
+            executor: Arc::new(executor),
+            manifest: LiveManifest::new(manifest),
+            dispatcher,
+            resource_dispatcher,
+            group_policy: None,
+            session_stash: None,
+            tool_router: Self::tool_router(),
+        }
+    }
+
+    /// Get a reference to the live manifest for external updates.
+    ///
+    /// Background tasks can call [`LiveManifest::update()`] to refresh
+    /// the manifest without restarting the server.
+    pub fn live_manifest(&self) -> &LiveManifest {
+        &self.manifest
     }
 }
 
@@ -209,14 +245,16 @@ impl ForgeServer {
         name = "search",
         description = "Search the capability manifest to discover available tools across all connected servers. The manifest is available as `globalThis.manifest` with servers, categories, and tool schemas. Write a JavaScript async arrow function to query it.\n\nManifest structure: manifest.servers is an Array of {name, description, categories}. IMPORTANT: categories is an Object keyed by name (NOT an array) — use Object.entries() or Object.values() to iterate. Each category has a .tools Array with {name, description, input_schema}. Check input_schema for required parameters before calling a tool.\n\nExample: `async () => { const s = manifest.servers[0]; return Object.entries(s.categories).map(([name, cat]) => ({ name, tools: cat.tools.map(t => t.name) })); }`"
     )]
+    #[tracing::instrument(skip(self, input), fields(code_len = input.code.len()))]
     pub async fn search(
         &self,
         Parameters(input): Parameters<SearchInput>,
     ) -> Result<String, String> {
-        tracing::info!(code_len = input.code.len(), "search: starting");
+        tracing::info!("search: starting");
 
-        let manifest_json = self
-            .manifest
+        // Snapshot the manifest for this search — lock-free read
+        let manifest = self.manifest.current();
+        let manifest_json = manifest
             .to_json()
             .map_err(|e| format!("manifest serialization failed: {e}"))?;
 
@@ -247,11 +285,12 @@ impl ForgeServer {
         name = "execute",
         description = "Execute JavaScript against the tool API. Use `forge.server('name').category.tool(args)` or `forge.callTool(server, tool, args)` to call tools on connected servers. Chain multiple operations in a single call.\n\nIMPORTANT: Code runs in a sandboxed V8 isolate with NO filesystem, network, or module access. import(), require(), eval(), and Deno.* are all blocked. Use forge.callTool() for all external operations.\n\nExample: `async () => { const result = await forge.callTool('narsil', 'scan_security', { repo: 'MyProject' }); return result; }`\n\nAdditional APIs:\n- `forge.readResource(server, uri)` — read MCP resources\n- `forge.stash.put(key, value, {ttl?})` / `.get(key)` / `.delete(key)` / `.keys()` — session key-value store\n- `forge.parallel(calls, opts)` — bounded concurrent execution\n\nAlways check tool input_schema via search() before calling unfamiliar tools."
     )]
+    #[tracing::instrument(skip(self, input), fields(code_len = input.code.len()))]
     pub async fn execute(
         &self,
         Parameters(input): Parameters<ExecuteInput>,
     ) -> Result<String, String> {
-        tracing::info!(code_len = input.code.len(), "execute: starting");
+        tracing::info!("execute: starting");
 
         // Wrap dispatcher(s) with group enforcement if a policy is configured.
         // A fresh pair of GroupEnforcingDispatcher/GroupEnforcingResourceDispatcher
@@ -288,12 +327,22 @@ impl ForgeServer {
                 }) as Arc<dyn StashDispatcher>
             });
 
+        // Snapshot the manifest for this execution — lock-free read
+        let manifest = self.manifest.current();
+
         // SR-R6: Collect known server names from manifest for op-level validation
-        let known_servers: std::collections::HashSet<String> = self
-            .manifest
+        let known_servers: std::collections::HashSet<String> =
+            manifest.servers.iter().map(|s| s.name.clone()).collect();
+
+        // Collect known (server, tool) pairs for structured error fuzzy matching
+        let known_tools: Vec<(String, String)> = manifest
             .servers
             .iter()
-            .map(|s| s.name.clone())
+            .flat_map(|s| {
+                s.categories
+                    .values()
+                    .flat_map(|cat| cat.tools.iter().map(|t| (s.name.clone(), t.name.clone())))
+            })
             .collect();
 
         match self
@@ -304,6 +353,7 @@ impl ForgeServer {
                 resource_dispatcher,
                 stash_dispatcher,
                 Some(known_servers),
+                Some(known_tools),
             )
             .await
         {
@@ -328,10 +378,11 @@ impl ForgeServer {
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for ForgeServer {
     fn get_info(&self) -> ServerInfo {
+        let manifest = self.manifest.current();
         let stats = format!(
             "{} servers, {} tools",
-            self.manifest.total_servers(),
-            self.manifest.total_tools(),
+            manifest.total_servers(),
+            manifest.total_tools(),
         );
 
         ServerInfo {
@@ -360,7 +411,14 @@ impl ServerHandler for ForgeServer {
                  - forge.readResource(server, uri) — read MCP resources from downstream servers\n\
                  - forge.stash.put(key, value, {{ttl?}}) / .get(key) / .delete(key) / .keys() — \
                  session-scoped key-value store for sharing data across executions\n\
-                 - forge.parallel(calls, opts) — bounded concurrent execution of tool/resource calls"
+                 - forge.parallel(calls, opts) — bounded concurrent execution of tool/resource calls\n\
+                 \n\
+                 ## TypeScript API Definitions\n\
+                 \n\
+                 ```typescript\n\
+                 {dts}\n\
+                 ```",
+                dts = forge_manifest::FORGE_DTS
             )),
             server_info: Implementation {
                 name: "forge".into(),
@@ -389,7 +447,7 @@ mod tests {
             server: &str,
             tool: &str,
             args: serde_json::Value,
-        ) -> Result<serde_json::Value, anyhow::Error> {
+        ) -> Result<serde_json::Value, forge_error::DispatchError> {
             Ok(serde_json::json!({
                 "server": server,
                 "tool": tool,
@@ -576,5 +634,40 @@ mod tests {
         assert!(shown > 0, "should show some content");
         let data = parsed["data"].as_str().unwrap();
         assert_eq!(data.len(), shown, "data length should match _shown_chars");
+    }
+
+    // --- Phase R3: FORGE_DTS in instructions ---
+
+    #[test]
+    fn dts_01_instructions_contain_typescript_defs() {
+        let server = test_server();
+        let info = server.get_info();
+        let instructions = info.instructions.unwrap();
+        assert!(
+            instructions.contains("callTool"),
+            "instructions should contain callTool: {instructions}"
+        );
+    }
+
+    #[test]
+    fn dts_02_instructions_contain_forge_interface() {
+        let server = test_server();
+        let info = server.get_info();
+        let instructions = info.instructions.unwrap();
+        assert!(
+            instructions.contains("interface") || instructions.contains("Forge"),
+            "instructions should contain Forge interface"
+        );
+    }
+
+    #[test]
+    fn dts_03_instructions_contain_stash_types() {
+        let server = test_server();
+        let info = server.get_info();
+        let instructions = info.instructions.unwrap();
+        assert!(
+            instructions.contains("ForgeStash"),
+            "instructions should contain ForgeStash type"
+        );
     }
 }

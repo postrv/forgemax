@@ -48,11 +48,18 @@ pub struct AuditEntry {
     pub result_size_bytes: usize,
     /// Final outcome.
     pub outcome: AuditOutcome,
+    /// Whether a pooled worker was reused (vs. cold start).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub worker_reused: bool,
+    /// Pool size when this execution acquired a worker. None if no pool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool_size_at_acquire: Option<usize>,
 }
 
 /// The type of sandbox operation.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum AuditOperation {
     /// A manifest search operation.
     Search,
@@ -93,6 +100,7 @@ pub struct ResourceReadAudit {
 /// Type of stash operation for audit logging.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum StashOpType {
     /// Store a value.
     Put,
@@ -124,6 +132,7 @@ pub struct StashOperationAudit {
 /// The outcome of a sandbox execution.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum AuditOutcome {
     /// Execution completed successfully.
     Success,
@@ -222,6 +231,8 @@ pub struct AuditEntryBuilder {
     resource_reads: Vec<ResourceReadAudit>,
     stash_operations: Vec<StashOperationAudit>,
     start: Instant,
+    worker_reused: bool,
+    pool_size_at_acquire: Option<usize>,
 }
 
 impl AuditEntryBuilder {
@@ -237,6 +248,8 @@ impl AuditEntryBuilder {
             resource_reads: Vec::new(),
             stash_operations: Vec::new(),
             start: Instant::now(),
+            worker_reused: false,
+            pool_size_at_acquire: None,
         }
     }
 
@@ -253,6 +266,16 @@ impl AuditEntryBuilder {
     /// Record a stash operation.
     pub fn record_stash_op(&mut self, audit: StashOperationAudit) {
         self.stash_operations.push(audit);
+    }
+
+    /// Mark that a pooled worker was reused for this execution.
+    pub fn worker_reused(&mut self, reused: bool) {
+        self.worker_reused = reused;
+    }
+
+    /// Record the pool size when the worker was acquired.
+    pub fn pool_size_at_acquire(&mut self, size: usize) {
+        self.pool_size_at_acquire = Some(size);
     }
 
     /// Finalize the audit entry with the execution result.
@@ -284,6 +307,8 @@ impl AuditEntryBuilder {
             duration_ms,
             result_size_bytes,
             outcome,
+            worker_reused: self.worker_reused,
+            pool_size_at_acquire: self.pool_size_at_acquire,
         }
     }
 }
@@ -294,6 +319,39 @@ pub struct NoopAuditLogger;
 #[async_trait::async_trait]
 impl AuditLogger for NoopAuditLogger {
     async fn log(&self, _entry: &AuditEntry) {}
+}
+
+/// An audit logger that emits structured events via the [`tracing`] framework.
+///
+/// Audit entries are logged at `INFO` level with `audit = true` for easy
+/// filtering. The entry's tool calls, resource reads, and stash operations
+/// are summarised as counts to keep log lines concise.
+///
+/// Use `RUST_LOG=forge=info` to capture all audit events.
+pub struct TracingAuditLogger;
+
+#[async_trait::async_trait]
+impl AuditLogger for TracingAuditLogger {
+    async fn log(&self, entry: &AuditEntry) {
+        let outcome = match &entry.outcome {
+            AuditOutcome::Success => "success",
+            AuditOutcome::Error { .. } => "error",
+            AuditOutcome::Timeout => "timeout",
+        };
+        tracing::info!(
+            audit = true,
+            execution_id = %entry.execution_id,
+            operation = ?entry.operation,
+            code_hash = %entry.code_hash,
+            duration_ms = entry.duration_ms,
+            result_size_bytes = entry.result_size_bytes,
+            tool_calls = entry.tool_calls.len(),
+            resource_reads = entry.resource_reads.len(),
+            stash_ops = entry.stash_operations.len(),
+            outcome = outcome,
+            "audit"
+        );
+    }
 }
 
 /// An audit-logging wrapper around a [`ToolDispatcher`] that records tool call metrics.
@@ -319,7 +377,7 @@ impl crate::ToolDispatcher for AuditingDispatcher {
         server: &str,
         tool: &str,
         args: serde_json::Value,
-    ) -> Result<serde_json::Value, anyhow::Error> {
+    ) -> Result<serde_json::Value, forge_error::DispatchError> {
         let args_hash = sha256_hex(&serde_json::to_string(&args).unwrap_or_default());
         let start = Instant::now();
 
@@ -360,7 +418,7 @@ impl crate::ResourceDispatcher for AuditingResourceDispatcher {
         &self,
         server: &str,
         uri: &str,
-    ) -> Result<serde_json::Value, anyhow::Error> {
+    ) -> Result<serde_json::Value, forge_error::DispatchError> {
         let uri_hash = sha256_hex(uri);
         let start = Instant::now();
 
@@ -412,7 +470,7 @@ impl crate::StashDispatcher for AuditingStashDispatcher {
         value: serde_json::Value,
         ttl_secs: Option<u32>,
         current_group: Option<String>,
-    ) -> Result<serde_json::Value, anyhow::Error> {
+    ) -> Result<serde_json::Value, forge_error::DispatchError> {
         let size_bytes = serde_json::to_string(&value).map(|s| s.len()).unwrap_or(0);
         let start = Instant::now();
 
@@ -434,7 +492,7 @@ impl crate::StashDispatcher for AuditingStashDispatcher {
         &self,
         key: &str,
         current_group: Option<String>,
-    ) -> Result<serde_json::Value, anyhow::Error> {
+    ) -> Result<serde_json::Value, forge_error::DispatchError> {
         let start = Instant::now();
 
         let result = self.inner.get(key, current_group).await;
@@ -455,7 +513,7 @@ impl crate::StashDispatcher for AuditingStashDispatcher {
         &self,
         key: &str,
         current_group: Option<String>,
-    ) -> Result<serde_json::Value, anyhow::Error> {
+    ) -> Result<serde_json::Value, forge_error::DispatchError> {
         let start = Instant::now();
 
         let result = self.inner.delete(key, current_group).await;
@@ -475,7 +533,7 @@ impl crate::StashDispatcher for AuditingStashDispatcher {
     async fn keys(
         &self,
         current_group: Option<String>,
-    ) -> Result<serde_json::Value, anyhow::Error> {
+    ) -> Result<serde_json::Value, forge_error::DispatchError> {
         let start = Instant::now();
 
         let result = self.inner.keys(current_group).await;
@@ -618,6 +676,8 @@ mod tests {
             duration_ms: 42,
             result_size_bytes: 10,
             outcome: AuditOutcome::Success,
+            worker_reused: false,
+            pool_size_at_acquire: None,
         };
 
         logger.log(&entry).await;
@@ -664,6 +724,8 @@ mod tests {
             duration_ms: 100,
             result_size_bytes: 500,
             outcome: AuditOutcome::Success,
+            worker_reused: false,
+            pool_size_at_acquire: None,
         };
 
         logger.log(&entry).await;
@@ -697,6 +759,8 @@ mod tests {
             duration_ms: 1,
             result_size_bytes: 0,
             outcome: AuditOutcome::Success,
+            worker_reused: false,
+            pool_size_at_acquire: None,
         };
 
         let json = serde_json::to_string(&entry).unwrap();
@@ -719,6 +783,8 @@ mod tests {
             duration_ms: 1,
             result_size_bytes: 0,
             outcome: AuditOutcome::Success,
+            worker_reused: false,
+            pool_size_at_acquire: None,
         };
         let json = serde_json::to_string(&entry).unwrap();
         assert!(
@@ -747,6 +813,8 @@ mod tests {
             duration_ms: 1,
             result_size_bytes: 0,
             outcome: AuditOutcome::Success,
+            worker_reused: false,
+            pool_size_at_acquire: None,
         };
         let json = serde_json::to_string(&entry).unwrap();
         assert!(json.contains("stash_operations"));
@@ -771,27 +839,27 @@ mod tests {
                 _value: serde_json::Value,
                 _ttl_secs: Option<u32>,
                 _current_group: Option<String>,
-            ) -> Result<serde_json::Value, anyhow::Error> {
+            ) -> Result<serde_json::Value, forge_error::DispatchError> {
                 Ok(serde_json::json!({"ok": true}))
             }
             async fn get(
                 &self,
                 _key: &str,
                 _current_group: Option<String>,
-            ) -> Result<serde_json::Value, anyhow::Error> {
+            ) -> Result<serde_json::Value, forge_error::DispatchError> {
                 Ok(serde_json::Value::Null)
             }
             async fn delete(
                 &self,
                 _key: &str,
                 _current_group: Option<String>,
-            ) -> Result<serde_json::Value, anyhow::Error> {
+            ) -> Result<serde_json::Value, forge_error::DispatchError> {
                 Ok(serde_json::json!({"deleted": false}))
             }
             async fn keys(
                 &self,
                 _current_group: Option<String>,
-            ) -> Result<serde_json::Value, anyhow::Error> {
+            ) -> Result<serde_json::Value, forge_error::DispatchError> {
                 Ok(serde_json::json!([]))
             }
         }
@@ -822,5 +890,319 @@ mod tests {
         assert!(matches!(audits[3].op_type, StashOpType::Keys));
         assert_eq!(audits[3].key, "", "keys op should have empty key");
         assert!(audits.iter().all(|a| a.success));
+    }
+
+    // --- Phase 7: TracingAuditLogger tests ---
+
+    #[tokio::test]
+    async fn ob_01_tracing_audit_logger_does_not_panic() {
+        // TracingAuditLogger should handle any valid AuditEntry without panic.
+        // We can't easily capture tracing output in tests, but we verify no panic.
+        let logger = TracingAuditLogger;
+        let entry = AuditEntry {
+            execution_id: "trace-test".into(),
+            timestamp: Utc::now(),
+            code_hash: "abc".into(),
+            code_preview: "async () => {}".into(),
+            operation: AuditOperation::Execute,
+            tool_calls: vec![ToolCallAudit {
+                server: "s".into(),
+                tool: "t".into(),
+                args_hash: "h".into(),
+                duration_ms: 5,
+                success: true,
+            }],
+            resource_reads: vec![],
+            stash_operations: vec![],
+            duration_ms: 10,
+            result_size_bytes: 100,
+            outcome: AuditOutcome::Success,
+            worker_reused: false,
+            pool_size_at_acquire: None,
+        };
+        logger.log(&entry).await;
+    }
+
+    #[tokio::test]
+    async fn ob_02_tracing_audit_logger_handles_error_outcome() {
+        let logger = TracingAuditLogger;
+        let entry = AuditEntry {
+            execution_id: "err-test".into(),
+            timestamp: Utc::now(),
+            code_hash: "def".into(),
+            code_preview: "async () => { throw new Error('x'); }".into(),
+            operation: AuditOperation::Execute,
+            tool_calls: vec![],
+            resource_reads: vec![],
+            stash_operations: vec![],
+            duration_ms: 3,
+            result_size_bytes: 0,
+            outcome: AuditOutcome::Error {
+                message: "test error".into(),
+            },
+            worker_reused: false,
+            pool_size_at_acquire: None,
+        };
+        logger.log(&entry).await;
+    }
+
+    #[tokio::test]
+    async fn ob_03_tracing_audit_logger_handles_timeout_outcome() {
+        let logger = TracingAuditLogger;
+        let entry = AuditEntry {
+            execution_id: "timeout-test".into(),
+            timestamp: Utc::now(),
+            code_hash: "ghi".into(),
+            code_preview: "async () => { while(true) {} }".into(),
+            operation: AuditOperation::Search,
+            tool_calls: vec![],
+            resource_reads: vec![],
+            stash_operations: vec![],
+            duration_ms: 5000,
+            result_size_bytes: 0,
+            outcome: AuditOutcome::Timeout,
+            worker_reused: false,
+            pool_size_at_acquire: None,
+        };
+        logger.log(&entry).await;
+    }
+
+    #[tokio::test]
+    async fn ob_04_audit_entry_never_contains_raw_code() {
+        // Security: the audit entry must never contain the raw submitted code.
+        // It should only store a SHA-256 hash and a truncated preview.
+        let secret_code = "async () => { const API_KEY = 'sk-secret-12345'; return API_KEY; }";
+        let builder = AuditEntryBuilder::new(secret_code, AuditOperation::Execute);
+        let entry = builder.finish(&Ok(serde_json::json!("ok")));
+
+        // The serialized entry should not have a raw "code" field — only code_hash and code_preview.
+        let json = serde_json::to_string(&entry).expect("serialize");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse");
+        assert!(
+            parsed.get("code").is_none(),
+            "serialized entry must not have a raw 'code' field"
+        );
+        assert!(
+            parsed.get("code_hash").is_some(),
+            "serialized entry must include code_hash"
+        );
+        // code_preview IS included (it's the first 500 chars) — that's by design
+        // But the full code should not appear as a separate field
+        assert_eq!(entry.code_hash, sha256_hex(secret_code));
+        assert!(!entry.code_hash.contains("sk-secret"));
+        // Verify the hash is a valid 64-char hex string (SHA-256)
+        assert_eq!(entry.code_hash.len(), 64);
+        assert!(entry.code_hash.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[tokio::test]
+    async fn ob_05_audit_entry_code_preview_truncated() {
+        let long_code = "x".repeat(1000);
+        let builder = AuditEntryBuilder::new(&long_code, AuditOperation::Execute);
+        let entry = builder.finish(&Ok(serde_json::json!(null)));
+
+        // Preview should be truncated + "..."
+        assert!(entry.code_preview.len() <= CODE_PREVIEW_MAX + 3); // +3 for "..."
+        assert!(entry.code_preview.ends_with("..."));
+    }
+
+    #[tokio::test]
+    async fn ob_06_audit_entry_serializes_all_fields() {
+        // Verify the full audit entry serializes correctly with all field types populated.
+        let entry = AuditEntry {
+            execution_id: "test-id".into(),
+            timestamp: Utc::now(),
+            code_hash: sha256_hex("code"),
+            code_preview: "code".into(),
+            operation: AuditOperation::Execute,
+            tool_calls: vec![ToolCallAudit {
+                server: "srv".into(),
+                tool: "t".into(),
+                args_hash: "h".into(),
+                duration_ms: 1,
+                success: true,
+            }],
+            resource_reads: vec![ResourceReadAudit {
+                server: "srv".into(),
+                uri_hash: "uri_h".into(),
+                size_bytes: 1024,
+                duration_ms: 2,
+                success: true,
+            }],
+            stash_operations: vec![StashOperationAudit {
+                op_type: StashOpType::Put,
+                key: "k".into(),
+                size_bytes: 100,
+                duration_ms: 1,
+                success: true,
+            }],
+            duration_ms: 50,
+            result_size_bytes: 200,
+            outcome: AuditOutcome::Success,
+            worker_reused: false,
+            pool_size_at_acquire: None,
+        };
+
+        let json = serde_json::to_string(&entry).expect("serialize");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse");
+
+        assert_eq!(parsed["execution_id"], "test-id");
+        assert_eq!(parsed["tool_calls"][0]["server"], "srv");
+        assert_eq!(parsed["resource_reads"][0]["size_bytes"], 1024);
+        assert_eq!(parsed["stash_operations"][0]["op_type"], "put");
+        assert_eq!(parsed["outcome"], "success");
+    }
+
+    #[tokio::test]
+    async fn ob_07_tracing_audit_logger_with_all_fields() {
+        // TracingAuditLogger should handle entries with tool_calls, resource_reads,
+        // and stash_operations without panic, summarised as counts.
+        let logger = TracingAuditLogger;
+        let entry = AuditEntry {
+            execution_id: "full-test".into(),
+            timestamp: Utc::now(),
+            code_hash: sha256_hex("test"),
+            code_preview: "test".into(),
+            operation: AuditOperation::Execute,
+            tool_calls: vec![
+                ToolCallAudit {
+                    server: "s1".into(),
+                    tool: "t1".into(),
+                    args_hash: "h1".into(),
+                    duration_ms: 5,
+                    success: true,
+                },
+                ToolCallAudit {
+                    server: "s2".into(),
+                    tool: "t2".into(),
+                    args_hash: "h2".into(),
+                    duration_ms: 10,
+                    success: false,
+                },
+            ],
+            resource_reads: vec![ResourceReadAudit {
+                server: "s1".into(),
+                uri_hash: "uh".into(),
+                size_bytes: 512,
+                duration_ms: 3,
+                success: true,
+            }],
+            stash_operations: vec![
+                StashOperationAudit {
+                    op_type: StashOpType::Put,
+                    key: "k1".into(),
+                    size_bytes: 50,
+                    duration_ms: 1,
+                    success: true,
+                },
+                StashOperationAudit {
+                    op_type: StashOpType::Get,
+                    key: "k1".into(),
+                    size_bytes: 0,
+                    duration_ms: 1,
+                    success: true,
+                },
+            ],
+            duration_ms: 100,
+            result_size_bytes: 500,
+            outcome: AuditOutcome::Success,
+            worker_reused: false,
+            pool_size_at_acquire: None,
+        };
+        // Should not panic with multiple tool_calls, resource_reads, stash_ops
+        logger.log(&entry).await;
+    }
+
+    #[tokio::test]
+    async fn ob_08_audit_entry_builder_execution_id_is_uuid() {
+        let builder = AuditEntryBuilder::new("code", AuditOperation::Execute);
+        let entry = builder.finish(&Ok(serde_json::json!(null)));
+        // Execution ID should be a valid UUID v4
+        assert!(
+            uuid::Uuid::parse_str(&entry.execution_id).is_ok(),
+            "execution_id should be a valid UUID: {}",
+            entry.execution_id
+        );
+    }
+
+    #[tokio::test]
+    async fn ob_09_audit_outcome_error_redaction() {
+        // Error messages in audit should not contain raw internal paths or stack traces
+        // beyond what the error itself provides. Verify the mapping works correctly.
+        let err = crate::SandboxError::Timeout { timeout_ms: 5000 };
+        let builder = AuditEntryBuilder::new("code", AuditOperation::Execute);
+        let entry = builder.finish(&Err(err));
+        assert!(matches!(entry.outcome, AuditOutcome::Timeout));
+
+        let err2 = crate::SandboxError::JsError {
+            message: "ReferenceError: x is not defined".into(),
+        };
+        let builder2 = AuditEntryBuilder::new("code", AuditOperation::Execute);
+        let entry2 = builder2.finish(&Err(err2));
+        match &entry2.outcome {
+            AuditOutcome::Error { message } => {
+                assert!(message.contains("ReferenceError"));
+            }
+            other => panic!("expected Error outcome, got {:?}", other),
+        }
+    }
+
+    // --- Phase R6: AuditEntry new fields ---
+
+    #[tokio::test]
+    async fn ae_01_audit_entry_worker_reused_defaults_false() {
+        let builder = AuditEntryBuilder::new("code", AuditOperation::Execute);
+        let entry = builder.finish(&Ok(serde_json::json!(null)));
+        assert!(!entry.worker_reused);
+    }
+
+    #[tokio::test]
+    async fn ae_02_audit_entry_pool_size_defaults_none() {
+        let builder = AuditEntryBuilder::new("code", AuditOperation::Execute);
+        let entry = builder.finish(&Ok(serde_json::json!(null)));
+        assert!(entry.pool_size_at_acquire.is_none());
+    }
+
+    #[tokio::test]
+    async fn ae_03_builder_sets_worker_reused() {
+        let mut builder = AuditEntryBuilder::new("code", AuditOperation::Execute);
+        builder.worker_reused(true);
+        let entry = builder.finish(&Ok(serde_json::json!(null)));
+        assert!(entry.worker_reused);
+    }
+
+    #[tokio::test]
+    async fn ae_04_builder_sets_pool_size() {
+        let mut builder = AuditEntryBuilder::new("code", AuditOperation::Execute);
+        builder.pool_size_at_acquire(4);
+        let entry = builder.finish(&Ok(serde_json::json!(null)));
+        assert_eq!(entry.pool_size_at_acquire, Some(4));
+    }
+
+    #[tokio::test]
+    async fn ae_05_new_fields_serialize_correctly() {
+        let mut builder = AuditEntryBuilder::new("code", AuditOperation::Execute);
+        builder.worker_reused(true);
+        builder.pool_size_at_acquire(3);
+        let entry = builder.finish(&Ok(serde_json::json!(null)));
+
+        let json = serde_json::to_string(&entry).expect("serialize");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse");
+        assert_eq!(parsed["worker_reused"], true);
+        assert_eq!(parsed["pool_size_at_acquire"], 3);
+
+        // When defaults: worker_reused should be skipped, pool_size_at_acquire should be skipped
+        let builder2 = AuditEntryBuilder::new("code", AuditOperation::Execute);
+        let entry2 = builder2.finish(&Ok(serde_json::json!(null)));
+        let json2 = serde_json::to_string(&entry2).expect("serialize");
+        let parsed2: serde_json::Value = serde_json::from_str(&json2).expect("parse");
+        assert!(
+            parsed2.get("worker_reused").is_none(),
+            "worker_reused=false should be skipped"
+        );
+        assert!(
+            parsed2.get("pool_size_at_acquire").is_none(),
+            "pool_size_at_acquire=None should be skipped"
+        );
     }
 }

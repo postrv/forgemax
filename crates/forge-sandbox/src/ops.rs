@@ -87,16 +87,25 @@ pub async fn op_forge_call_tool(
     let args: serde_json::Value = serde_json::from_str(&args_json)
         .map_err(|e| JsErrorBox::generic(format!("invalid JSON args: {e}")))?;
 
-    let result = dispatcher
-        .call_tool(&server, &tool, args)
-        .await
-        .map_err(|e| {
-            JsErrorBox::generic(crate::redact::redact_error_for_llm(
-                &server,
-                &tool,
-                &e.to_string(),
-            ))
-        })?;
+    let result = match dispatcher.call_tool(&server, &tool, args).await {
+        Ok(val) => val,
+        Err(e) => {
+            let known = {
+                let st = op_state.borrow();
+                st.try_borrow::<KnownTools>()
+                    .map(|kt| kt.0.clone())
+                    .unwrap_or_default()
+            };
+            let pairs: Vec<(&str, &str)> = known
+                .iter()
+                .map(|(s, t)| (s.as_str(), t.as_str()))
+                .collect();
+            let mut structured = e.to_structured_error(Some(&pairs));
+            crate::redact::redact_structured_error(&server, &tool, &mut structured);
+            return serde_json::to_string(&structured)
+                .map_err(|e| JsErrorBox::generic(format!("error serialization failed: {e}")));
+        }
+    };
 
     serde_json::to_string(&result)
         .map_err(|e| JsErrorBox::generic(format!("result serialization failed: {e}")))
@@ -118,6 +127,12 @@ pub(crate) struct CurrentGroup(pub(crate) Option<String>);
 /// Stored in OpState so `op_forge_read_resource` can reject unknown servers
 /// before any dispatch machinery runs.
 pub(crate) struct KnownServers(pub(crate) HashSet<String>);
+
+/// Known (server, tool) pairs for structured error fuzzy matching.
+///
+/// Stored in OpState so tool/resource dispatch errors can produce
+/// `{error:true, code:"TOOL_NOT_FOUND", suggested_fix:"Did you mean 'find_symbols'?"}`.
+pub(crate) struct KnownTools(pub(crate) Vec<(String, String)>);
 
 /// Validate a resource URI for security.
 ///
@@ -243,14 +258,25 @@ pub async fn op_forge_read_resource(
         (d, max_size)
     };
 
-    let result = dispatcher.read_resource(&server, &uri).await.map_err(|e| {
-        // SR-R5: Use "readResource" instead of the raw URI to prevent path leakage
-        JsErrorBox::generic(crate::redact::redact_error_for_llm(
-            &server,
-            "readResource",
-            &e.to_string(),
-        ))
-    })?;
+    let result = match dispatcher.read_resource(&server, &uri).await {
+        Ok(val) => val,
+        Err(e) => {
+            let known = {
+                let st = op_state.borrow();
+                st.try_borrow::<KnownTools>()
+                    .map(|kt| kt.0.clone())
+                    .unwrap_or_default()
+            };
+            let pairs: Vec<(&str, &str)> = known
+                .iter()
+                .map(|(s, t)| (s.as_str(), t.as_str()))
+                .collect();
+            let mut structured = e.to_structured_error(Some(&pairs));
+            crate::redact::redact_structured_error(&server, "readResource", &mut structured);
+            return serde_json::to_string(&structured)
+                .map_err(|e| JsErrorBox::generic(format!("error serialization failed: {e}")));
+        }
+    };
 
     // SR-R2: Serialize and truncate if > max_resource_size
     let mut json = serde_json::to_string(&result)

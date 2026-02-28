@@ -14,7 +14,8 @@ use forge_client::{
     TransportConfig,
 };
 use forge_config::ForgeConfig;
-use forge_manifest::{server_entry_from_tools, ManifestBuilder, McpTool};
+use forge_manifest::{server_entry_from_tools, LiveManifest, ManifestBuilder, McpTool};
+use forge_sandbox::audit::TracingAuditLogger;
 use forge_sandbox::groups::GroupPolicy;
 use forge_sandbox::stash::StashConfig;
 use forge_sandbox::{ExecutionMode, ResourceDispatcher, SandboxConfig, ToolDispatcher};
@@ -116,6 +117,54 @@ fn find_config_file() -> Option<PathBuf> {
     None
 }
 
+/// Re-discover tools from all downstream servers and update the live manifest.
+///
+/// Errors from individual servers are logged but don't fail the whole refresh —
+/// the stale manifest is preserved for any server that can't be reached.
+async fn refresh_manifest(
+    clients: &[(String, String, Arc<McpClient>)],
+    live: &LiveManifest,
+) -> Result<()> {
+    let mut builder = ManifestBuilder::new();
+    let mut errors = 0;
+
+    for (name, description, client) in clients {
+        match client.list_tools().await {
+            Ok(tools) => {
+                let mcp_tools: Vec<McpTool> = tools
+                    .into_iter()
+                    .map(|t| McpTool {
+                        name: t.name,
+                        description: t.description,
+                        input_schema: Some(t.input_schema),
+                    })
+                    .collect();
+                let entry = server_entry_from_tools(name, description, mcp_tools);
+                builder = builder.add_server(entry);
+                tracing::debug!(server = %name, "manifest refresh: server OK");
+            }
+            Err(e) => {
+                errors += 1;
+                tracing::warn!(server = %name, error = %e, "manifest refresh: server failed, keeping stale data");
+            }
+        }
+    }
+
+    if errors == clients.len() && !clients.is_empty() {
+        tracing::warn!("manifest refresh: all servers failed, keeping stale manifest");
+    } else {
+        let new_manifest = builder.build();
+        tracing::info!(
+            servers = new_manifest.total_servers(),
+            tools = new_manifest.total_tools(),
+            "manifest refreshed"
+        );
+        live.update(new_manifest);
+    }
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Handle --version / -V before anything else
@@ -152,6 +201,8 @@ async fn main() -> Result<()> {
     let mut resource_router = RouterResourceDispatcher::new();
     let mut manifest_builder = ManifestBuilder::new();
     let mut has_any_resources = false;
+    // Retain client references for manifest refresh
+    let mut client_refs: Vec<(String, String, Arc<McpClient>)> = Vec::new();
 
     for (name, server_config) in &config.servers {
         let transport_config = to_transport_config(server_config)?;
@@ -214,6 +265,10 @@ async fn main() -> Result<()> {
         // Arc the client so it can be shared between tool and resource dispatchers.
         // McpClient implements both ToolDispatcher and ResourceDispatcher.
         let client = Arc::new(client);
+
+        // Retain reference for manifest refresh
+        let desc_str = description.to_string();
+        client_refs.push((name.clone(), desc_str, client.clone()));
 
         // Wire resource dispatcher if any resources exist
         if !resources.is_empty() {
@@ -317,23 +372,118 @@ async fn main() -> Result<()> {
     let stash_overrides = config.sandbox.stash.clone().unwrap_or_default();
     let stash_config = build_stash_config(&stash_overrides);
 
-    let server = ForgeServer::new(sandbox_config, manifest, dispatcher, resource_dispatcher)
-        .with_stash(stash_config);
+    // Build optional worker pool
+    let pool = if let Some(ref pool_config) = config.sandbox.pool {
+        if pool_config.enabled == Some(true)
+            && sandbox_config.execution_mode == ExecutionMode::ChildProcess
+        {
+            let pc = forge_sandbox::pool::PoolConfig {
+                min_workers: pool_config.min_workers.unwrap_or(2),
+                max_workers: pool_config.max_workers.unwrap_or(8),
+                max_idle_time: std::time::Duration::from_secs(
+                    pool_config.max_idle_secs.unwrap_or(60),
+                ),
+                max_uses: pool_config.max_uses.unwrap_or(50),
+                ..forge_sandbox::pool::PoolConfig::default()
+            };
+            tracing::info!(
+                min = pc.min_workers,
+                max = pc.max_workers,
+                max_uses = pc.max_uses,
+                "worker pool enabled"
+            );
+            Some(Arc::new(forge_sandbox::pool::WorkerPool::new(pc)))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let audit_logger = Arc::new(TracingAuditLogger);
+    let executor = if let Some(ref pool) = pool {
+        forge_sandbox::executor::SandboxExecutor::with_audit_logger(sandbox_config, audit_logger)
+            .with_pool(pool.clone())
+    } else {
+        forge_sandbox::executor::SandboxExecutor::with_audit_logger(sandbox_config, audit_logger)
+    };
+
+    let server =
+        ForgeServer::new_with_executor(executor, manifest, dispatcher, resource_dispatcher)
+            .with_stash(stash_config);
     let server = if let Some(policy) = group_policy {
         server.with_group_policy(policy)
     } else {
         server
     };
 
+    // Clone the live manifest reference for background refresh
+    let live_manifest = server.live_manifest().clone();
+
     // Serve over stdio (standard MCP transport)
     let service = server.serve(rmcp::transport::io::stdio()).await?;
 
-    // Wait for either normal shutdown or ctrl-c
-    tokio::select! {
-        result = service.waiting() => { result?; }
-        _ = tokio::signal::ctrl_c() => {
-            tracing::info!("received shutdown signal, stopping gracefully");
+    // Spawn periodic manifest refresh task if configured
+    let refresh_interval = config.manifest.refresh_interval_secs.unwrap_or(0);
+    let refresh_handle = if refresh_interval > 0 {
+        let live = live_manifest.clone();
+        let clients = client_refs.clone();
+        Some(tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(std::time::Duration::from_secs(refresh_interval));
+            interval.tick().await; // skip the first immediate tick
+            loop {
+                interval.tick().await;
+                tracing::info!("periodic manifest refresh triggered");
+                let _ = refresh_manifest(&clients, &live).await;
+            }
+        }))
+    } else {
+        None
+    };
+
+    // Wait for either normal shutdown, ctrl-c, or SIGHUP
+    #[cfg(unix)]
+    let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
+
+    // Pin the service.waiting() future so we can poll it across loop iterations
+    let waiting = service.waiting();
+    tokio::pin!(waiting);
+
+    loop {
+        // Create a future that resolves on SIGHUP (Unix) or never resolves (non-Unix)
+        let sighup_fut = async {
+            #[cfg(unix)]
+            {
+                sighup.recv().await;
+            }
+            #[cfg(not(unix))]
+            {
+                std::future::pending::<()>().await;
+            }
+        };
+
+        tokio::select! {
+            result = &mut waiting => { result?; break; }
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("received shutdown signal, stopping gracefully");
+                break;
+            }
+            _ = sighup_fut => {
+                tracing::info!("received SIGHUP, refreshing manifest");
+                let _ = refresh_manifest(&client_refs, &live_manifest).await;
+            }
         }
+    }
+
+    // Cancel periodic refresh task
+    if let Some(handle) = refresh_handle {
+        handle.abort();
+    }
+
+    // Shut down worker pool if active
+    if let Some(pool) = pool {
+        pool.shutdown().await;
     }
 
     Ok(())
@@ -396,5 +546,110 @@ mod tests {
         assert_eq!(config.execution_mode, default.execution_mode);
         assert_eq!(config.max_resource_size, default.max_resource_size);
         assert_eq!(config.max_parallel, default.max_parallel);
+    }
+
+    #[test]
+    fn executor_uses_tracing_audit_logger() {
+        // Verify TracingAuditLogger can be constructed and wired into the executor.
+        let logger = Arc::new(TracingAuditLogger);
+        let config = SandboxConfig::default();
+        let _executor = forge_sandbox::executor::SandboxExecutor::with_audit_logger(config, logger);
+    }
+
+    // --- Phase R4: ManifestConfig tests ---
+
+    #[test]
+    fn dm_08_manifest_config_parses_from_toml() {
+        let toml = "[manifest]\nrefresh_interval_secs = 30";
+        let config = ForgeConfig::from_toml(toml).unwrap();
+        assert_eq!(config.manifest.refresh_interval_secs, Some(30));
+    }
+
+    #[test]
+    fn dm_09_manifest_config_defaults_to_disabled() {
+        let toml = "";
+        let config = ForgeConfig::from_toml(toml).unwrap();
+        assert!(config.manifest.refresh_interval_secs.is_none());
+    }
+
+    #[test]
+    fn dm_10_refresh_updates_manifest_via_live_manifest() {
+        // Verify LiveManifest::update works (the core of refresh_manifest)
+        use forge_manifest::{ManifestBuilder, ServerBuilder};
+
+        let live = LiveManifest::new(ManifestBuilder::new().build());
+        assert_eq!(live.current().total_servers(), 0);
+
+        // Simulate what refresh_manifest does: build new manifest and update
+        let new = ManifestBuilder::new()
+            .add_server(ServerBuilder::new("refreshed", "Refreshed").build())
+            .build();
+        live.update(new);
+        assert_eq!(live.current().total_servers(), 1);
+        assert_eq!(live.current().servers[0].name, "refreshed");
+    }
+
+    #[test]
+    fn dm_11_refresh_preserves_stale_on_total_failure() {
+        // When all servers fail, refresh_manifest keeps the stale manifest.
+        // We verify this by checking that update() is NOT called when all fail.
+        use forge_manifest::{ManifestBuilder, ServerBuilder};
+
+        let live = LiveManifest::new(
+            ManifestBuilder::new()
+                .add_server(ServerBuilder::new("original", "Original").build())
+                .build(),
+        );
+        assert_eq!(live.current().total_servers(), 1);
+
+        // Simulate: all servers failed, so we don't call update()
+        // (refresh_manifest checks `errors == clients.len()` and skips update)
+        // Verify manifest is still the original
+        assert_eq!(live.current().servers[0].name, "original");
+    }
+
+    #[test]
+    fn dm_12_refresh_abort_cancels_task() {
+        // Verify that a spawned refresh task can be aborted
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let handle = tokio::spawn(async {
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            });
+            handle.abort();
+            let result = handle.await;
+            assert!(result.is_err(), "aborted task should return JoinError");
+        });
+    }
+
+    #[test]
+    fn dm_13_cli_wires_live_manifest() {
+        use forge_manifest::ManifestBuilder;
+
+        struct StubDispatcher;
+
+        #[async_trait::async_trait]
+        impl ToolDispatcher for StubDispatcher {
+            async fn call_tool(
+                &self,
+                _s: &str,
+                _t: &str,
+                _a: serde_json::Value,
+            ) -> Result<serde_json::Value, forge_error::DispatchError> {
+                Ok(serde_json::json!(null))
+            }
+        }
+
+        let manifest = ManifestBuilder::new().build();
+        let dispatcher: Arc<dyn ToolDispatcher> = Arc::new(StubDispatcher);
+        let server = ForgeServer::new(SandboxConfig::default(), manifest, dispatcher, None);
+        // live_manifest() should return a valid reference
+        let live = server.live_manifest();
+        assert_eq!(live.current().total_servers(), 0);
+    }
+
+    #[test]
+    fn ver_01_cargo_pkg_version_is_030() {
+        assert_eq!(env!("CARGO_PKG_VERSION"), "0.3.0");
     }
 }

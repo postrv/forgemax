@@ -4,6 +4,7 @@ use thiserror::Error;
 
 /// Errors that can occur during sandbox execution.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum SandboxError {
     /// Code failed validation checks.
     #[error("code validation failed: {reason}")]
@@ -83,4 +84,37 @@ pub enum SandboxError {
     /// V8 heap memory limit was exceeded.
     #[error("V8 heap limit exceeded")]
     HeapLimitExceeded,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::executor::ExecutionMode;
+    use crate::ipc::ErrorKind;
+
+    /// Compile-time guard: all sandbox public enums are #[non_exhaustive].
+    /// The wildcard arm documents that downstream crates must handle future variants.
+    #[test]
+    #[allow(unreachable_patterns)]
+    fn ne_sandbox_enums_are_non_exhaustive() {
+        let err = SandboxError::HeapLimitExceeded;
+        match err {
+            SandboxError::HeapLimitExceeded
+            | SandboxError::Timeout { .. }
+            | SandboxError::ValidationFailed { .. } => {}
+            _ => {}
+        }
+
+        let mode = ExecutionMode::InProcess;
+        match mode {
+            ExecutionMode::InProcess | ExecutionMode::ChildProcess => {}
+            _ => {}
+        }
+
+        let kind = ErrorKind::Timeout;
+        match kind {
+            ErrorKind::Timeout | ErrorKind::HeapLimit | ErrorKind::JsError => {}
+            _ => {}
+        }
+    }
 }

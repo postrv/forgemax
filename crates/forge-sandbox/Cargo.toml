@@ -14,6 +14,7 @@ tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
+forge-error.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 async-trait.workspace = true
@@ -22,6 +23,16 @@ uuid.workspace = true
 chrono.workspace = true
 regex = "1"
 percent-encoding = "2"
+
+# AST validator (optional, default on)
+oxc_parser = { workspace = true, optional = true }
+oxc_ast = { workspace = true, optional = true }
+oxc_span = { workspace = true, optional = true }
+oxc_allocator = { workspace = true, optional = true }
+
+[features]
+default = ["ast-validator"]
+ast-validator = ["dep:oxc_parser", "dep:oxc_ast", "dep:oxc_span", "dep:oxc_allocator"]
 
 [dev-dependencies]
 tempfile = "3"

@@ -21,13 +21,15 @@ use crate::audit::{
 };
 use crate::error::SandboxError;
 use crate::ops::{
-    forge_ext, CurrentGroup, ExecutionResult, KnownServers, MaxResourceSize, ToolCallLimits,
+    forge_ext, CurrentGroup, ExecutionResult, KnownServers, KnownTools, MaxResourceSize,
+    ToolCallLimits,
 };
 use crate::validator::validate_code;
 use crate::{ResourceDispatcher, StashDispatcher, ToolDispatcher};
 
 /// How the sandbox executes code.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ExecutionMode {
     /// Run V8 in-process on a dedicated thread (default, suitable for tests).
     #[default]
@@ -90,6 +92,8 @@ pub struct SandboxExecutor {
     config: SandboxConfig,
     semaphore: Arc<Semaphore>,
     audit_logger: Arc<dyn AuditLogger>,
+    /// Optional worker pool for reusing child processes.
+    pool: Option<Arc<crate::pool::WorkerPool>>,
 }
 
 impl SandboxExecutor {
@@ -100,6 +104,7 @@ impl SandboxExecutor {
             config,
             semaphore,
             audit_logger: Arc::new(NoopAuditLogger),
+            pool: None,
         }
     }
 
@@ -110,7 +115,17 @@ impl SandboxExecutor {
             config,
             semaphore,
             audit_logger: logger,
+            pool: None,
         }
+    }
+
+    /// Attach a worker pool for reusing child processes.
+    ///
+    /// When a pool is set and the execution mode is `ChildProcess`, workers
+    /// are acquired from the pool instead of spawning fresh processes.
+    pub fn with_pool(mut self, pool: Arc<crate::pool::WorkerPool>) -> Self {
+        self.pool = Some(pool);
+        self
     }
 
     /// Execute a `search()` call — runs code against the capability manifest.
@@ -118,12 +133,13 @@ impl SandboxExecutor {
     /// The manifest is injected as `globalThis.manifest` in the sandbox.
     /// The LLM's code is an async arrow function that queries it.
     /// Search always runs in-process (read-only, no credential exposure risk).
+    #[tracing::instrument(skip(self, code, manifest), fields(code_len = code.len()))]
     pub async fn execute_search(
         &self,
         code: &str,
         manifest: &Value,
     ) -> Result<Value, SandboxError> {
-        tracing::info!(code_len = code.len(), "execute_search: starting");
+        tracing::info!("execute_search: starting");
 
         let audit_builder = AuditEntryBuilder::new(code, AuditOperation::Search);
 
@@ -198,11 +214,14 @@ impl SandboxExecutor {
             resource_dispatcher,
             stash_dispatcher,
             None,
+            None,
         )
         .await
     }
 
-    /// Execute code with additional options (known servers for SR-R6 validation).
+    /// Execute code with additional options (known servers for SR-R6 validation,
+    /// known tools for structured error fuzzy matching).
+    #[tracing::instrument(skip(self, code, dispatcher, resource_dispatcher, stash_dispatcher, known_servers, known_tools), fields(code_len = code.len(), mode = ?self.config.execution_mode))]
     pub async fn execute_code_with_options(
         &self,
         code: &str,
@@ -210,12 +229,9 @@ impl SandboxExecutor {
         resource_dispatcher: Option<Arc<dyn ResourceDispatcher>>,
         stash_dispatcher: Option<Arc<dyn StashDispatcher>>,
         known_servers: Option<std::collections::HashSet<String>>,
+        known_tools: Option<Vec<(String, String)>>,
     ) -> Result<Value, SandboxError> {
-        tracing::info!(
-            code_len = code.len(),
-            mode = ?self.config.execution_mode,
-            "execute_code: starting"
-        );
+        tracing::info!("execute_code: starting");
 
         let mut audit_builder = AuditEntryBuilder::new(code, AuditOperation::Execute);
 
@@ -249,14 +265,50 @@ impl SandboxExecutor {
 
         let result = match self.config.execution_mode {
             ExecutionMode::ChildProcess => {
-                crate::host::SandboxHost::execute_in_child(
-                    code,
-                    &self.config,
-                    auditing_dispatcher,
-                    auditing_resource_dispatcher,
-                    auditing_stash_dispatcher,
-                )
-                .await
+                if let Some(ref pool) = self.pool {
+                    // Pool mode: acquire a warm worker, execute, release
+                    match pool.acquire(&self.config).await {
+                        Ok(mut worker) => {
+                            let exec_result = worker
+                                .execute(
+                                    code,
+                                    &self.config,
+                                    auditing_dispatcher,
+                                    auditing_resource_dispatcher,
+                                    auditing_stash_dispatcher,
+                                )
+                                .await;
+                            let outcome = if is_fatal_sandbox_error(&exec_result) {
+                                crate::pool::ReleaseOutcome::Fatal
+                            } else {
+                                crate::pool::ReleaseOutcome::Ok
+                            };
+                            pool.release(worker, outcome).await;
+                            exec_result
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "pool acquire failed, falling back to fresh process");
+                            crate::host::SandboxHost::execute_in_child(
+                                code,
+                                &self.config,
+                                auditing_dispatcher,
+                                auditing_resource_dispatcher,
+                                auditing_stash_dispatcher,
+                            )
+                            .await
+                        }
+                    }
+                } else {
+                    // No pool: spawn fresh child process
+                    crate::host::SandboxHost::execute_in_child(
+                        code,
+                        &self.config,
+                        auditing_dispatcher,
+                        auditing_resource_dispatcher,
+                        auditing_stash_dispatcher,
+                    )
+                    .await
+                }
             }
             ExecutionMode::InProcess => {
                 self.execute_code_in_process(
@@ -265,6 +317,7 @@ impl SandboxExecutor {
                     auditing_resource_dispatcher,
                     auditing_stash_dispatcher,
                     known_servers,
+                    known_tools,
                 )
                 .await
             }
@@ -305,6 +358,7 @@ impl SandboxExecutor {
         resource_dispatcher: Option<Arc<dyn ResourceDispatcher>>,
         stash_dispatcher: Option<Arc<dyn StashDispatcher>>,
         known_servers: Option<std::collections::HashSet<String>>,
+        known_tools: Option<Vec<(String, String)>>,
     ) -> Result<Value, SandboxError> {
         let code = code.to_string();
         let config = self.config.clone();
@@ -330,6 +384,7 @@ impl SandboxExecutor {
                 resource_dispatcher,
                 stash_dispatcher,
                 known_servers,
+                known_tools,
             ));
             if tx.send(result).is_err() {
                 tracing::warn!("sandbox result receiver dropped before result was sent");
@@ -339,6 +394,19 @@ impl SandboxExecutor {
         rx.await
             .map_err(|_| SandboxError::Execution(anyhow::anyhow!("sandbox thread panicked")))?
     }
+}
+
+/// Determine if a sandbox execution result indicates a fatal worker condition.
+///
+/// Workers that time out or exceed their heap limit must be killed rather than
+/// reused. With the `ErrorKind` field in `ExecutionComplete`, the host now
+/// reconstructs the correct typed `SandboxError` variant, so this function
+/// only needs to match the native types.
+fn is_fatal_sandbox_error(result: &Result<Value, SandboxError>) -> bool {
+    matches!(
+        result,
+        Err(SandboxError::Timeout { .. }) | Err(SandboxError::HeapLimitExceeded)
+    )
 }
 
 /// State for the near-heap-limit callback.
@@ -379,7 +447,16 @@ pub async fn run_search(
     code: &str,
     manifest: &Value,
 ) -> Result<Value, SandboxError> {
-    let mut runtime = create_runtime(None, None, config.max_heap_size, None, None, None, None)?;
+    let mut runtime = create_runtime(
+        None,
+        None,
+        config.max_heap_size,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )?;
 
     // Inject the manifest as a global
     let manifest_json = serde_json::to_string(manifest)?;
@@ -447,11 +524,13 @@ pub async fn run_execute(
         resource_dispatcher,
         stash_dispatcher,
         None,
+        None,
     )
     .await
 }
 
-/// Run an execute operation with an optional set of known server names for SR-R6 validation.
+/// Run an execute operation with an optional set of known server names for SR-R6 validation
+/// and known tools for structured error fuzzy matching.
 pub async fn run_execute_with_known_servers(
     config: &SandboxConfig,
     code: &str,
@@ -459,6 +538,7 @@ pub async fn run_execute_with_known_servers(
     resource_dispatcher: Option<Arc<dyn ResourceDispatcher>>,
     stash_dispatcher: Option<Arc<dyn StashDispatcher>>,
     known_servers: Option<std::collections::HashSet<String>>,
+    known_tools: Option<Vec<(String, String)>>,
 ) -> Result<Value, SandboxError> {
     let limits = ToolCallLimits {
         max_calls: config.max_tool_calls,
@@ -473,6 +553,7 @@ pub async fn run_execute_with_known_servers(
         Some(config.max_resource_size),
         stash_dispatcher.clone(),
         known_servers,
+        known_tools,
     )?;
 
     // Determine which capabilities are available
@@ -621,7 +702,14 @@ fn build_execute_bootstrap(has_resource: bool, has_stash: bool, max_parallel: us
                                 const batch = calls.slice(i, i + concurrency);
                                 await Promise.allSettled(
                                     batch.map((fn, idx) => fn().then(
-                                        val => { results[i + idx] = val; },
+                                        val => {
+                                            if (val && val.error === true && val.code) {
+                                                errors.push({ index: i + idx, error: val.message || val.code });
+                                            } else {
+                                                results[i + idx] = val;
+                                            }
+                                            if (errors.length > 0 && failFast) aborted = true;
+                                        },
                                         err => {
                                             errors.push({ index: i + idx, error: err.message || String(err) });
                                             if (failFast) aborted = true;
@@ -670,6 +758,7 @@ fn build_execute_bootstrap(has_resource: bool, has_stash: bool, max_parallel: us
 }
 
 /// Create a fresh JsRuntime with the forge extension loaded and V8 heap limits set.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn create_runtime(
     dispatcher: Option<Arc<dyn ToolDispatcher>>,
     resource_dispatcher: Option<Arc<dyn ResourceDispatcher>>,
@@ -678,6 +767,7 @@ pub(crate) fn create_runtime(
     max_resource_size: Option<usize>,
     stash_dispatcher: Option<Arc<dyn StashDispatcher>>,
     known_servers: Option<std::collections::HashSet<String>>,
+    known_tools: Option<Vec<(String, String)>>,
 ) -> Result<JsRuntime, SandboxError> {
     let create_params = v8::CreateParams::default().heap_limits(0, max_heap_size);
 
@@ -706,6 +796,9 @@ pub(crate) fn create_runtime(
     }
     if let Some(servers) = known_servers {
         runtime.op_state().borrow_mut().put(KnownServers(servers));
+    }
+    if let Some(tools) = known_tools {
+        runtime.op_state().borrow_mut().put(KnownTools(tools));
     }
 
     Ok(runtime)
@@ -850,7 +943,7 @@ mod tests {
             server: &str,
             tool: &str,
             args: serde_json::Value,
-        ) -> Result<serde_json::Value, anyhow::Error> {
+        ) -> Result<serde_json::Value, forge_error::DispatchError> {
             Ok(serde_json::json!({
                 "server": server,
                 "tool": tool,
@@ -1263,7 +1356,7 @@ mod tests {
             &self,
             server: &str,
             uri: &str,
-        ) -> Result<serde_json::Value, anyhow::Error> {
+        ) -> Result<serde_json::Value, forge_error::DispatchError> {
             Ok(serde_json::json!({
                 "server": server,
                 "uri": uri,
@@ -1283,7 +1376,7 @@ mod tests {
             &self,
             _server: &str,
             _uri: &str,
-        ) -> Result<serde_json::Value, anyhow::Error> {
+        ) -> Result<serde_json::Value, forge_error::DispatchError> {
             Ok(serde_json::json!({
                 "data": "x".repeat(self.content_size)
             }))
@@ -1301,8 +1394,8 @@ mod tests {
             &self,
             _server: &str,
             _uri: &str,
-        ) -> Result<serde_json::Value, anyhow::Error> {
-            Err(anyhow::anyhow!("{}", self.error_msg))
+        ) -> Result<serde_json::Value, forge_error::DispatchError> {
+            Err(anyhow::anyhow!("{}", self.error_msg).into())
         }
     }
 
@@ -1437,20 +1530,21 @@ mod tests {
                 error_msg: "connection refused: http://internal.corp:9876/secret/path".into(),
             }));
 
+        // Structured errors are returned as values, not thrown
         let code = r#"async () => {
-            try {
-                await forge.readResource("my-server", "file:///logs/secret.log");
-                return "should not reach here";
-            } catch(e) {
-                return e.message;
-            }
+            const result = await forge.readResource("my-server", "file:///logs/secret.log");
+            return result;
         }"#;
 
         let result = exec
             .execute_code(code, tool_dispatcher, resource_dispatcher, None)
             .await
             .unwrap();
-        let msg = result.as_str().unwrap();
+        assert_eq!(
+            result["error"], true,
+            "should be structured error: {result}"
+        );
+        let msg = result["message"].as_str().unwrap();
         assert!(
             !msg.contains("internal.corp"),
             "should not leak internal URL: {msg}"
@@ -1473,7 +1567,7 @@ mod tests {
                 &self,
                 _server: &str,
                 _uri: &str,
-            ) -> Result<serde_json::Value, anyhow::Error> {
+            ) -> Result<serde_json::Value, forge_error::DispatchError> {
                 Ok(serde_json::json!({
                     "content": "SGVsbG8gV29ybGQ=",
                     "_encoding": "base64"
@@ -1509,20 +1603,21 @@ mod tests {
                 error_msg: "resource not found".into(),
             }));
 
+        // Structured errors are returned as values, not thrown
         let code = r#"async () => {
-            try {
-                await forge.readResource("s", "file:///nonexistent");
-                return "should not reach here";
-            } catch(e) {
-                return e.message;
-            }
+            const result = await forge.readResource("s", "file:///nonexistent");
+            return result;
         }"#;
 
         let result = exec
             .execute_code(code, tool_dispatcher, resource_dispatcher, None)
             .await
             .unwrap();
-        let msg = result.as_str().unwrap();
+        assert_eq!(
+            result["error"], true,
+            "should be structured error: {result}"
+        );
+        let msg = result["message"].as_str().unwrap();
         assert!(
             msg.contains("failed"),
             "should indicate failure: {result:?}"
@@ -1565,20 +1660,21 @@ mod tests {
                 error_msg: "unknown resource URI: file:///etc/shadow".into(),
             }));
 
+        // Structured errors are returned as values, not thrown
         let code = r#"async () => {
-            try {
-                await forge.readResource("postgres-server", "file:///etc/shadow");
-                return "should not reach here";
-            } catch(e) {
-                return e.message;
-            }
+            const result = await forge.readResource("postgres-server", "file:///etc/shadow");
+            return result;
         }"#;
 
         let result = exec
             .execute_code(code, tool_dispatcher, resource_dispatcher, None)
             .await
             .unwrap();
-        let msg = result.as_str().unwrap();
+        assert_eq!(
+            result["error"], true,
+            "should be structured error: {result}"
+        );
+        let msg = result["message"].as_str().unwrap();
         // SR-R5: Error should use "readResource" not the raw URI
         assert!(
             !msg.contains("/etc/shadow"),
@@ -1747,6 +1843,7 @@ mod tests {
                 resource_dispatcher,
                 None,
                 Some(known),
+                None,
             )
             .await
             .unwrap();
@@ -1847,12 +1944,14 @@ mod tests {
             value: serde_json::Value,
             ttl_secs: Option<u32>,
             _current_group: Option<String>,
-        ) -> Result<serde_json::Value, anyhow::Error> {
+        ) -> Result<serde_json::Value, forge_error::DispatchError> {
             let ttl = ttl_secs
                 .filter(|&s| s > 0)
                 .map(|s| std::time::Duration::from_secs(s as u64));
             let mut stash = self.stash.lock().await;
-            stash.put(key, value, ttl, self.current_group.as_deref())?;
+            stash
+                .put(key, value, ttl, self.current_group.as_deref())
+                .map_err(|e| forge_error::DispatchError::Internal(e.into()))?;
             Ok(serde_json::json!({"ok": true}))
         }
 
@@ -1860,9 +1959,12 @@ mod tests {
             &self,
             key: &str,
             _current_group: Option<String>,
-        ) -> Result<serde_json::Value, anyhow::Error> {
+        ) -> Result<serde_json::Value, forge_error::DispatchError> {
             let stash = self.stash.lock().await;
-            match stash.get(key, self.current_group.as_deref())? {
+            match stash
+                .get(key, self.current_group.as_deref())
+                .map_err(|e| forge_error::DispatchError::Internal(e.into()))?
+            {
                 Some(v) => Ok(v.clone()),
                 None => Ok(serde_json::Value::Null),
             }
@@ -1872,16 +1974,18 @@ mod tests {
             &self,
             key: &str,
             _current_group: Option<String>,
-        ) -> Result<serde_json::Value, anyhow::Error> {
+        ) -> Result<serde_json::Value, forge_error::DispatchError> {
             let mut stash = self.stash.lock().await;
-            let deleted = stash.delete(key, self.current_group.as_deref())?;
+            let deleted = stash
+                .delete(key, self.current_group.as_deref())
+                .map_err(|e| forge_error::DispatchError::Internal(e.into()))?;
             Ok(serde_json::json!({"deleted": deleted}))
         }
 
         async fn keys(
             &self,
             _current_group: Option<String>,
-        ) -> Result<serde_json::Value, anyhow::Error> {
+        ) -> Result<serde_json::Value, forge_error::DispatchError> {
             let stash = self.stash.lock().await;
             let keys: Vec<&str> = stash.keys(self.current_group.as_deref());
             Ok(serde_json::json!(keys))
@@ -2482,9 +2586,9 @@ mod tests {
                 _server: &str,
                 tool: &str,
                 _args: serde_json::Value,
-            ) -> Result<serde_json::Value, anyhow::Error> {
+            ) -> Result<serde_json::Value, forge_error::DispatchError> {
                 if tool == "fail" {
-                    Err(anyhow::anyhow!("deliberate failure"))
+                    Err(anyhow::anyhow!("deliberate failure").into())
                 } else {
                     Ok(serde_json::json!({"tool": tool, "ok": true}))
                 }
@@ -2535,11 +2639,11 @@ mod tests {
                 _server: &str,
                 tool: &str,
                 _args: serde_json::Value,
-            ) -> Result<serde_json::Value, anyhow::Error> {
+            ) -> Result<serde_json::Value, forge_error::DispatchError> {
                 let mut c = self.calls.lock().unwrap();
                 *c += 1;
                 if tool == "fail" {
-                    Err(anyhow::anyhow!("fail"))
+                    Err(anyhow::anyhow!("fail").into())
                 } else {
                     Ok(serde_json::json!({"ok": true}))
                 }
@@ -2589,7 +2693,7 @@ mod tests {
                 _server: &str,
                 _tool: &str,
                 _args: serde_json::Value,
-            ) -> Result<serde_json::Value, anyhow::Error> {
+            ) -> Result<serde_json::Value, forge_error::DispatchError> {
                 let c = self
                     .current
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
@@ -2683,10 +2787,8 @@ mod tests {
                 _server: &str,
                 _tool: &str,
                 _args: serde_json::Value,
-            ) -> Result<serde_json::Value, anyhow::Error> {
-                Err(anyhow::anyhow!(
-                    "connection to http://internal.secret:9999/api failed"
-                ))
+            ) -> Result<serde_json::Value, forge_error::DispatchError> {
+                Err(anyhow::anyhow!("connection to http://internal.secret:9999/api failed").into())
             }
         }
 
@@ -2787,7 +2889,7 @@ mod tests {
                 _server: &str,
                 _tool: &str,
                 _args: serde_json::Value,
-            ) -> Result<serde_json::Value, anyhow::Error> {
+            ) -> Result<serde_json::Value, forge_error::DispatchError> {
                 let c = self
                     .current
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
@@ -3443,22 +3545,22 @@ mod tests {
         });
         let dispatcher: Arc<dyn ToolDispatcher> = Arc::new(TestDispatcher);
 
+        // Structured errors are returned as values, not thrown
         let code = r#"async () => {
-            try {
-                await forge.readResource("secret-server", "file:///data/log.txt");
-                return { error: null };
-            } catch (e) {
-                return { error: e.message || String(e) };
-            }
+            const result = await forge.readResource("secret-server", "file:///data/log.txt");
+            return result;
         }"#;
 
         let result = exec
             .execute_code(code, dispatcher, Some(failing_resource), None)
             .await
             .unwrap();
-        let error_msg = result["error"].as_str().unwrap();
+        assert_eq!(
+            result["error"], true,
+            "should be structured error: {result}"
+        );
+        let error_msg = result["message"].as_str().unwrap();
         // Error should be redacted — should not contain raw file paths from the dispatcher
-        // The redaction replaces the error with a safe format
         assert!(
             !error_msg.contains("/var/secret/db.sock"),
             "error must be redacted, got: {error_msg}"
@@ -3467,6 +3569,147 @@ mod tests {
         assert!(
             error_msg.contains("secret-server"),
             "error should reference server name: {error_msg}"
+        );
+    }
+
+    // --- Structured error wiring tests (Phase R2) ---
+
+    /// Dispatcher that always returns ServerNotFound.
+    struct ErrorDispatcher;
+
+    #[async_trait::async_trait]
+    impl ToolDispatcher for ErrorDispatcher {
+        async fn call_tool(
+            &self,
+            server: &str,
+            _tool: &str,
+            _args: serde_json::Value,
+        ) -> Result<serde_json::Value, forge_error::DispatchError> {
+            Err(forge_error::DispatchError::ServerNotFound(
+                server.to_string(),
+            ))
+        }
+    }
+
+    /// Dispatcher that returns ToolNotFound.
+    struct ToolNotFoundDispatcher;
+
+    #[async_trait::async_trait]
+    impl ToolDispatcher for ToolNotFoundDispatcher {
+        async fn call_tool(
+            &self,
+            server: &str,
+            tool: &str,
+            _args: serde_json::Value,
+        ) -> Result<serde_json::Value, forge_error::DispatchError> {
+            Err(forge_error::DispatchError::ToolNotFound {
+                server: server.to_string(),
+                tool: tool.to_string(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn se_wire_01_tool_call_error_returns_structured_json() {
+        let exec = executor();
+        let dispatcher: Arc<dyn ToolDispatcher> = Arc::new(ErrorDispatcher);
+
+        let code = r#"async () => {
+            const result = await forge.callTool("bad_server", "bad_tool", {});
+            return result;
+        }"#;
+
+        let result = exec
+            .execute_code(code, dispatcher, None, None)
+            .await
+            .unwrap();
+        assert_eq!(result["error"], true, "should be an error: {result}");
+    }
+
+    #[tokio::test]
+    async fn se_wire_02_structured_error_has_code_field() {
+        let exec = executor();
+        let dispatcher: Arc<dyn ToolDispatcher> = Arc::new(ErrorDispatcher);
+
+        let code = r#"async () => {
+            const result = await forge.callTool("bad_server", "bad_tool", {});
+            return result;
+        }"#;
+
+        let result = exec
+            .execute_code(code, dispatcher, None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            result["code"], "SERVER_NOT_FOUND",
+            "should have code field: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn se_wire_03_structured_error_has_suggested_fix() {
+        let exec = executor();
+        let dispatcher: Arc<dyn ToolDispatcher> = Arc::new(ToolNotFoundDispatcher);
+
+        // Provide known_tools so fuzzy matching can suggest "find_symbols"
+        let known_tools = vec![("narsil".to_string(), "find_symbols".to_string())];
+
+        let code = r#"async () => {
+            const result = await forge.callTool("narsil", "fnd_symbols", {});
+            return result;
+        }"#;
+
+        let result = exec
+            .execute_code_with_options(code, dispatcher, None, None, None, Some(known_tools))
+            .await
+            .unwrap();
+        assert_eq!(result["code"], "TOOL_NOT_FOUND", "code: {result}");
+        let fix = result["suggested_fix"]
+            .as_str()
+            .expect("should have suggested_fix");
+        assert!(
+            fix.contains("find_symbols"),
+            "should suggest find_symbols, got: {fix}"
+        );
+    }
+
+    #[tokio::test]
+    async fn se_wire_04_structured_error_message_is_redacted() {
+        // Dispatcher that leaks a credential in its error message
+        struct CredLeakDispatcher;
+
+        #[async_trait::async_trait]
+        impl ToolDispatcher for CredLeakDispatcher {
+            async fn call_tool(
+                &self,
+                server: &str,
+                _tool: &str,
+                _args: serde_json::Value,
+            ) -> Result<serde_json::Value, forge_error::DispatchError> {
+                Err(forge_error::DispatchError::Upstream {
+                    server: server.to_string(),
+                    message: "auth failed with Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.rg2e at https://internal.corp:9999/api".to_string(),
+                })
+            }
+        }
+
+        let exec = executor();
+        let dispatcher: Arc<dyn ToolDispatcher> = Arc::new(CredLeakDispatcher);
+
+        let code = r#"async () => {
+            const result = await forge.callTool("narsil", "find", {});
+            return result;
+        }"#;
+
+        let result = exec
+            .execute_code(code, dispatcher, None, None)
+            .await
+            .unwrap();
+        let msg = result["message"].as_str().expect("should have message");
+        assert!(!msg.contains("eyJhbGci"), "JWT should be redacted: {msg}");
+        assert!(
+            !msg.contains("internal.corp"),
+            "URL should be redacted: {msg}"
         );
     }
 }

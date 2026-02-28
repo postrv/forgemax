@@ -1,6 +1,6 @@
 [package]
-name = "forge-manifest"
-description = "Hierarchical capability manifest for Code Mode tool discovery"
+name = "forge-error"
+description = "Typed error types for Forge gateway dispatcher traits"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,6 +8,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+thiserror.workspace = true
+anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-arc-swap.workspace = true
+strsim.workspace = true

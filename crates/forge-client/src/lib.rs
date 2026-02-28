@@ -33,6 +33,7 @@ pub use timeout::{TimeoutDispatcher, TimeoutResourceDispatcher};
 
 /// Configuration for connecting to a downstream MCP server.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum TransportConfig {
     /// Connect via stdio to a child process.
     Stdio {
@@ -346,7 +347,12 @@ impl McpClient {
 
 #[async_trait::async_trait]
 impl ToolDispatcher for McpClient {
-    async fn call_tool(&self, _server: &str, tool: &str, args: Value) -> Result<Value> {
+    async fn call_tool(
+        &self,
+        _server: &str,
+        tool: &str,
+        args: Value,
+    ) -> Result<Value, forge_error::DispatchError> {
         let arguments = args.as_object().cloned().or_else(|| {
             if args.is_null() {
                 Some(serde_json::Map::new())
@@ -365,18 +371,31 @@ impl ToolDispatcher for McpClient {
                 task: None,
             })
             .await
-            .with_context(|| {
-                format!("tool call failed: server='{}', tool='{}'", self.name, tool)
+            .map_err(|e| forge_error::DispatchError::Upstream {
+                server: self.name.clone(),
+                message: format!("tool call failed: tool='{}': {}", tool, e),
             })?;
 
-        call_tool_result_to_value(result)
+        call_tool_result_to_value(result).map_err(|e| forge_error::DispatchError::Upstream {
+            server: self.name.clone(),
+            message: e.to_string(),
+        })
     }
 }
 
 #[async_trait::async_trait]
 impl ResourceDispatcher for McpClient {
-    async fn read_resource(&self, _server: &str, uri: &str) -> Result<Value> {
-        self.read_resource(uri).await
+    async fn read_resource(
+        &self,
+        _server: &str,
+        uri: &str,
+    ) -> Result<Value, forge_error::DispatchError> {
+        self.read_resource(uri)
+            .await
+            .map_err(|e| forge_error::DispatchError::Upstream {
+                server: self.name.clone(),
+                message: format!("resource read failed: uri='{}': {}", uri, e),
+            })
     }
 }
 
@@ -745,5 +764,19 @@ mod tests {
         assert!(!is_sensitive_header("Content-Type"));
         assert!(!is_sensitive_header("Accept"));
         assert!(!is_sensitive_header("User-Agent"));
+    }
+
+    /// Compile-time guard: TransportConfig is #[non_exhaustive].
+    #[test]
+    #[allow(unreachable_patterns)]
+    fn ne_transport_config_is_non_exhaustive() {
+        let config = TransportConfig::Stdio {
+            command: "test".into(),
+            args: vec![],
+        };
+        match config {
+            TransportConfig::Stdio { .. } | TransportConfig::Http { .. } => {}
+            _ => {}
+        }
     }
 }

@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Result;
+use forge_error::DispatchError;
 use forge_sandbox::{ResourceDispatcher, ToolDispatcher};
 use serde_json::Value;
 
@@ -31,15 +31,18 @@ impl TimeoutDispatcher {
 
 #[async_trait::async_trait]
 impl ToolDispatcher for TimeoutDispatcher {
-    async fn call_tool(&self, server: &str, tool: &str, args: Value) -> Result<Value> {
+    async fn call_tool(
+        &self,
+        server: &str,
+        tool: &str,
+        args: Value,
+    ) -> Result<Value, DispatchError> {
         match tokio::time::timeout(self.timeout, self.inner.call_tool(server, tool, args)).await {
             Ok(result) => result,
-            Err(_elapsed) => Err(anyhow::anyhow!(
-                "timeout after {}s calling tool '{}' on server '{}'",
-                self.timeout.as_secs(),
-                tool,
-                self.server_name,
-            )),
+            Err(_elapsed) => Err(DispatchError::Timeout {
+                server: self.server_name.clone(),
+                timeout_ms: self.timeout.as_millis() as u64,
+            }),
         }
     }
 }
@@ -68,15 +71,17 @@ impl TimeoutResourceDispatcher {
 
 #[async_trait::async_trait]
 impl ResourceDispatcher for TimeoutResourceDispatcher {
-    async fn read_resource(&self, server: &str, uri: &str) -> Result<serde_json::Value> {
+    async fn read_resource(
+        &self,
+        server: &str,
+        uri: &str,
+    ) -> Result<serde_json::Value, DispatchError> {
         match tokio::time::timeout(self.timeout, self.inner.read_resource(server, uri)).await {
             Ok(result) => result,
-            Err(_elapsed) => Err(anyhow::anyhow!(
-                "timeout after {}s reading resource '{}' on server '{}'",
-                self.timeout.as_secs(),
-                uri,
-                self.server_name,
-            )),
+            Err(_elapsed) => Err(DispatchError::Timeout {
+                server: self.server_name.clone(),
+                timeout_ms: self.timeout.as_millis() as u64,
+            }),
         }
     }
 }
@@ -84,13 +89,17 @@ impl ResourceDispatcher for TimeoutResourceDispatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
     struct InstantDispatcher;
 
     #[async_trait::async_trait]
     impl ToolDispatcher for InstantDispatcher {
-        async fn call_tool(&self, _server: &str, tool: &str, _args: Value) -> Result<Value> {
+        async fn call_tool(
+            &self,
+            _server: &str,
+            tool: &str,
+            _args: Value,
+        ) -> Result<Value, DispatchError> {
             Ok(serde_json::json!({"tool": tool, "status": "ok"}))
         }
     }
@@ -101,21 +110,28 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ToolDispatcher for SlowDispatcher {
-        async fn call_tool(&self, _server: &str, _tool: &str, _args: Value) -> Result<Value> {
+        async fn call_tool(
+            &self,
+            _server: &str,
+            _tool: &str,
+            _args: Value,
+        ) -> Result<Value, DispatchError> {
             tokio::time::sleep(self.delay).await;
             Ok(serde_json::json!({"status": "ok"}))
         }
     }
 
-    struct FailingDispatcher {
-        calls: Mutex<usize>,
-    }
+    struct FailingDispatcher;
 
     #[async_trait::async_trait]
     impl ToolDispatcher for FailingDispatcher {
-        async fn call_tool(&self, _server: &str, _tool: &str, _args: Value) -> Result<Value> {
-            *self.calls.lock().unwrap() += 1;
-            Err(anyhow::anyhow!("inner error"))
+        async fn call_tool(
+            &self,
+            _server: &str,
+            _tool: &str,
+            _args: Value,
+        ) -> Result<Value, DispatchError> {
+            Err(DispatchError::Internal(anyhow::anyhow!("inner error")))
         }
     }
 
@@ -140,6 +156,7 @@ mod tests {
             .call_tool("slow-server", "scan", serde_json::json!({}))
             .await;
         assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), DispatchError::Timeout { .. }));
     }
 
     #[tokio::test]
@@ -152,12 +169,9 @@ mod tests {
             .call_tool("narsil", "symbols.find", serde_json::json!({}))
             .await
             .unwrap_err();
+        assert!(matches!(err, DispatchError::Timeout { ref server, .. } if server == "narsil"));
         let msg = err.to_string();
         assert!(msg.contains("timeout"), "should mention timeout: {msg}");
-        assert!(
-            msg.contains("symbols.find"),
-            "should mention tool name: {msg}"
-        );
         assert!(msg.contains("narsil"), "should mention server name: {msg}");
     }
 
@@ -167,7 +181,11 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ResourceDispatcher for InstantResourceDispatcher {
-        async fn read_resource(&self, _server: &str, uri: &str) -> Result<serde_json::Value> {
+        async fn read_resource(
+            &self,
+            _server: &str,
+            uri: &str,
+        ) -> Result<serde_json::Value, DispatchError> {
             Ok(serde_json::json!({"uri": uri}))
         }
     }
@@ -176,7 +194,11 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ResourceDispatcher for SlowResourceDispatcher {
-        async fn read_resource(&self, _server: &str, _uri: &str) -> Result<serde_json::Value> {
+        async fn read_resource(
+            &self,
+            _server: &str,
+            _uri: &str,
+        ) -> Result<serde_json::Value, DispatchError> {
             tokio::time::sleep(Duration::from_secs(10)).await;
             Ok(serde_json::json!({}))
         }
@@ -200,25 +222,17 @@ mod tests {
             "slow-server",
         );
         let result = slow.read_resource("slow-server", "file:///log").await;
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("timeout"), "got: {err}");
+        assert!(matches!(result, Err(DispatchError::Timeout { .. })));
     }
 
     #[tokio::test]
     async fn inner_error_preserved() {
-        let inner = Arc::new(FailingDispatcher {
-            calls: Mutex::new(0),
-        });
+        let inner = Arc::new(FailingDispatcher);
         let td = TimeoutDispatcher::new(inner, Duration::from_secs(5), "test");
         let err = td
             .call_tool("test", "tool", serde_json::json!({}))
             .await
             .unwrap_err();
-        assert!(
-            err.to_string().contains("inner error"),
-            "inner error should propagate: {}",
-            err
-        );
+        assert!(matches!(err, DispatchError::Internal(_)));
     }
 }

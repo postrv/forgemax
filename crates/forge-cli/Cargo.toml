@@ -28,3 +28,6 @@ anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 async-trait.workspace = true
+
+[dev-dependencies]
+forge-error.workspace = true

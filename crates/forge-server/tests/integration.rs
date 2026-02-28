@@ -37,7 +37,7 @@ impl ToolDispatcher for RecordingDispatcher {
         server: &str,
         tool: &str,
         args: serde_json::Value,
-    ) -> Result<serde_json::Value, anyhow::Error> {
+    ) -> Result<serde_json::Value, forge_error::DispatchError> {
         self.calls
             .lock()
             .unwrap()
@@ -181,8 +181,10 @@ async fn error_propagation_from_dispatcher() {
             _server: &str,
             _tool: &str,
             _args: serde_json::Value,
-        ) -> Result<serde_json::Value, anyhow::Error> {
-            Err(anyhow::anyhow!("simulated downstream failure"))
+        ) -> Result<serde_json::Value, forge_error::DispatchError> {
+            Err(forge_error::DispatchError::Internal(anyhow::anyhow!(
+                "simulated downstream failure"
+            )))
         }
     }
 
@@ -192,21 +194,22 @@ async fn error_propagation_from_dispatcher() {
     let result = server
         .execute(Parameters(ExecuteInput {
             code: r#"async () => {
-                try {
-                    await forge.callTool("narsil", "ast.parse", {});
-                    return "should not reach here";
-                } catch(e) {
-                    return { error: e.message };
-                }
+                // Structured errors are returned as values, not thrown
+                const result = await forge.callTool("narsil", "ast.parse", {});
+                return result;
             }"#
             .into(),
         }))
         .await;
 
-    let json = result.expect("execute should succeed (error caught in JS)");
+    let json = result.expect("execute should succeed");
     let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(
+        parsed["error"], true,
+        "should be structured error: {parsed:?}"
+    );
     assert!(
-        parsed["error"]
+        parsed["message"]
             .as_str()
             .unwrap()
             .contains("simulated downstream failure"),
@@ -250,7 +253,7 @@ impl ResourceDispatcher for MockResourceDispatcher {
         &self,
         server: &str,
         uri: &str,
-    ) -> Result<serde_json::Value, anyhow::Error> {
+    ) -> Result<serde_json::Value, forge_error::DispatchError> {
         Ok(serde_json::json!({
             "server": server,
             "uri": uri,
@@ -270,8 +273,11 @@ impl ResourceDispatcher for FailingResourceDispatcher {
         &self,
         _server: &str,
         _uri: &str,
-    ) -> Result<serde_json::Value, anyhow::Error> {
-        Err(anyhow::anyhow!("{}", self.error_msg))
+    ) -> Result<serde_json::Value, forge_error::DispatchError> {
+        Err(forge_error::DispatchError::Internal(anyhow::anyhow!(
+            "{}",
+            self.error_msg
+        )))
     }
 }
 
@@ -399,23 +405,24 @@ async fn rs_i03_read_resource_group_isolation() {
                 const data = await forge.readResource("narsil", "file:///log");
 
                 // Now try to call a tool on "other-server" (group "data")
-                try {
-                    await forge.callTool("other-server", "tool", {});
-                    return { error: null };
-                } catch (e) {
-                    return { error: e.message || String(e) };
-                }
+                // Structured errors are returned as values, not thrown
+                const result = await forge.callTool("other-server", "tool", {});
+                return result;
             }"#
             .into(),
         }))
         .await;
 
-    let json = result.expect("execute should succeed (error caught in JS)");
+    let json = result.expect("execute should succeed");
     let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-    let error = parsed["error"].as_str().unwrap();
-    assert!(
-        error.contains("group") || error.contains("isolation") || error.contains("locked"),
-        "should report group isolation error, got: {error}"
+    assert_eq!(
+        parsed["error"], true,
+        "should be structured error: {parsed:?}"
+    );
+    assert_eq!(
+        parsed["code"].as_str().unwrap(),
+        "GROUP_POLICY_DENIED",
+        "should report group policy denied, got: {parsed:?}"
     );
 }
 
@@ -492,7 +499,7 @@ async fn rs_i06_read_resource_timeout_enforcement() {
             &self,
             _server: &str,
             _uri: &str,
-        ) -> Result<serde_json::Value, anyhow::Error> {
+        ) -> Result<serde_json::Value, forge_error::DispatchError> {
             // Sleep longer than the execution timeout
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
             Ok(serde_json::json!({"data": "too late"}))
@@ -531,10 +538,11 @@ async fn rs_i06_read_resource_timeout_enforcement() {
     );
     let json = result.unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-    let err = parsed["error"].as_str().expect("should have error field");
-    assert!(
-        err.contains("timed out") || err.contains("timeout") || err.contains("Timed out"),
-        "error should mention timeout, got: {err}"
+    // Sandbox-level async timeout returns {"error":"async timeout"} (not a structured DispatchError)
+    assert_eq!(
+        parsed["error"].as_str().unwrap(),
+        "async timeout",
+        "should report async timeout, got: {parsed:?}"
     );
 }
 
@@ -551,21 +559,22 @@ async fn rs_i07_graceful_degradation_no_resource_support() {
     let result = server
         .execute(Parameters(ExecuteInput {
             code: r#"async () => {
-                try {
-                    await forge.readResource("narsil", "file:///log");
-                    return { error: null };
-                } catch (e) {
-                    return { error: e.message || String(e) };
-                }
+                // Structured errors are returned as values, not thrown
+                const result = await forge.readResource("narsil", "file:///log");
+                return result;
             }"#
             .into(),
         }))
         .await;
 
-    let json = result.expect("execute should succeed (error caught in JS)");
+    let json = result.expect("execute should succeed");
     let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-    let error = parsed["error"].as_str().unwrap();
-    // The error should be caught and surfaced, not crash the execution
+    assert_eq!(
+        parsed["error"], true,
+        "should be structured error: {parsed:?}"
+    );
+    let error = parsed["message"].as_str().unwrap();
+    // The error should be surfaced as a structured error, not crash the execution
     assert!(
         !error.is_empty(),
         "should have a non-empty error message for unsupported resources"

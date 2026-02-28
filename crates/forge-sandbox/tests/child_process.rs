@@ -29,7 +29,7 @@ impl ToolDispatcher for EchoDispatcher {
         server: &str,
         tool: &str,
         args: serde_json::Value,
-    ) -> Result<serde_json::Value, anyhow::Error> {
+    ) -> Result<serde_json::Value, forge_error::DispatchError> {
         Ok(serde_json::json!({
             "server": server,
             "tool": tool,
@@ -49,7 +49,7 @@ impl ToolDispatcher for SlowDispatcher {
         _server: &str,
         _tool: &str,
         _args: serde_json::Value,
-    ) -> Result<serde_json::Value, anyhow::Error> {
+    ) -> Result<serde_json::Value, forge_error::DispatchError> {
         tokio::time::sleep(Duration::from_millis(100)).await;
         Ok(serde_json::json!({"status": "slow_ok"}))
     }
@@ -299,12 +299,14 @@ impl StashDispatcher for DirectStashDispatcher {
         value: serde_json::Value,
         ttl_secs: Option<u32>,
         _current_group: Option<String>,
-    ) -> Result<serde_json::Value, anyhow::Error> {
+    ) -> Result<serde_json::Value, forge_error::DispatchError> {
         let ttl = ttl_secs
             .filter(|&s| s > 0)
             .map(|s| Duration::from_secs(s as u64));
         let mut stash = self.stash.lock().await;
-        stash.put(key, value, ttl, self.current_group.as_deref())?;
+        stash
+            .put(key, value, ttl, self.current_group.as_deref())
+            .map_err(|e| forge_error::DispatchError::Internal(e.into()))?;
         Ok(serde_json::json!({"ok": true}))
     }
 
@@ -312,9 +314,12 @@ impl StashDispatcher for DirectStashDispatcher {
         &self,
         key: &str,
         _current_group: Option<String>,
-    ) -> Result<serde_json::Value, anyhow::Error> {
+    ) -> Result<serde_json::Value, forge_error::DispatchError> {
         let stash = self.stash.lock().await;
-        match stash.get(key, self.current_group.as_deref())? {
+        match stash
+            .get(key, self.current_group.as_deref())
+            .map_err(|e| forge_error::DispatchError::Internal(e.into()))?
+        {
             Some(v) => Ok(v.clone()),
             None => Ok(serde_json::Value::Null),
         }
@@ -324,16 +329,18 @@ impl StashDispatcher for DirectStashDispatcher {
         &self,
         key: &str,
         _current_group: Option<String>,
-    ) -> Result<serde_json::Value, anyhow::Error> {
+    ) -> Result<serde_json::Value, forge_error::DispatchError> {
         let mut stash = self.stash.lock().await;
-        let deleted = stash.delete(key, self.current_group.as_deref())?;
+        let deleted = stash
+            .delete(key, self.current_group.as_deref())
+            .map_err(|e| forge_error::DispatchError::Internal(e.into()))?;
         Ok(serde_json::json!({"deleted": deleted}))
     }
 
     async fn keys(
         &self,
         _current_group: Option<String>,
-    ) -> Result<serde_json::Value, anyhow::Error> {
+    ) -> Result<serde_json::Value, forge_error::DispatchError> {
         let stash = self.stash.lock().await;
         let keys: Vec<&str> = stash.keys(self.current_group.as_deref());
         Ok(serde_json::json!(keys))

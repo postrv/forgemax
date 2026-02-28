@@ -34,6 +34,7 @@ use thiserror::Error;
 
 /// Errors from config parsing.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum ConfigError {
     /// Failed to read config file.
     #[error("failed to read config file: {0}")]
@@ -62,6 +63,19 @@ pub struct ForgeConfig {
     /// Server group definitions for cross-server data flow policies.
     #[serde(default)]
     pub groups: HashMap<String, GroupConfig>,
+
+    /// Manifest refresh behavior.
+    #[serde(default)]
+    pub manifest: ManifestConfig,
+}
+
+/// Configuration for manifest refresh behavior.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ManifestConfig {
+    /// How often to re-discover tools from downstream servers (seconds).
+    /// 0 or absent = disabled (manifest is static after startup).
+    #[serde(default)]
+    pub refresh_interval_secs: Option<u64>,
 }
 
 /// Configuration for a server group.
@@ -160,6 +174,37 @@ pub struct SandboxOverrides {
     /// Stash configuration overrides.
     #[serde(default)]
     pub stash: Option<StashOverrides>,
+
+    /// Worker pool configuration overrides.
+    #[serde(default)]
+    pub pool: Option<PoolOverrides>,
+}
+
+/// Configuration overrides for the worker pool.
+///
+/// When enabled, warm worker processes are reused across executions
+/// instead of spawning a new process each time (~5-10ms vs ~50ms).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct PoolOverrides {
+    /// Enable the worker pool (default: false).
+    #[serde(default)]
+    pub enabled: Option<bool>,
+
+    /// Minimum number of warm workers to keep ready (default: 2).
+    #[serde(default)]
+    pub min_workers: Option<usize>,
+
+    /// Maximum number of workers in the pool (default: 8).
+    #[serde(default)]
+    pub max_workers: Option<usize>,
+
+    /// Kill idle workers after this many seconds (default: 60).
+    #[serde(default)]
+    pub max_idle_secs: Option<u64>,
+
+    /// Recycle a worker after this many executions (default: 50).
+    #[serde(default)]
+    pub max_uses: Option<u32>,
 }
 
 /// Configuration overrides for the ephemeral stash.
@@ -355,6 +400,57 @@ impl ForgeConfig {
                     "sandbox.max_resource_size_mb ({}) + 1 MB overhead exceeds IPC message limit ({} MB)",
                     resource_mb, ipc_limit_mb
                 )));
+            }
+        }
+
+        // Validate pool config
+        if let Some(ref pool) = self.sandbox.pool {
+            self.validate_pool(pool)?;
+        }
+
+        Ok(())
+    }
+
+    fn validate_pool(&self, pool: &PoolOverrides) -> Result<(), ConfigError> {
+        let max_concurrent = self.sandbox.max_concurrent.unwrap_or(8);
+
+        // CV-08: max_workers must be >= 1 and <= max_concurrent
+        if let Some(max) = pool.max_workers {
+            if max == 0 || max > max_concurrent {
+                return Err(ConfigError::Invalid(format!(
+                    "sandbox.pool.max_workers must be >= 1 and <= max_concurrent ({})",
+                    max_concurrent
+                )));
+            }
+        }
+
+        let max_workers = pool.max_workers.unwrap_or(8);
+
+        // CV-09: min_workers must be >= 0 and <= max_workers
+        if let Some(min) = pool.min_workers {
+            if min > max_workers {
+                return Err(ConfigError::Invalid(format!(
+                    "sandbox.pool.min_workers ({}) must be <= max_workers ({})",
+                    min, max_workers
+                )));
+            }
+        }
+
+        // CV-10: max_uses must be > 0
+        if let Some(uses) = pool.max_uses {
+            if uses == 0 {
+                return Err(ConfigError::Invalid(
+                    "sandbox.pool.max_uses must be > 0".into(),
+                ));
+            }
+        }
+
+        // CV-11: max_idle_secs must be >= 5 and <= 3600
+        if let Some(idle) = pool.max_idle_secs {
+            if !(5..=3600).contains(&idle) {
+                return Err(ConfigError::Invalid(
+                    "sandbox.pool.max_idle_secs must be >= 5 and <= 3600".into(),
+                ));
             }
         }
 
@@ -917,5 +1013,127 @@ mod tests {
         assert_eq!(stash.max_total_size_mb, Some(64));
         assert_eq!(stash.default_ttl_secs, Some(1800));
         assert_eq!(stash.max_ttl_secs, Some(43200));
+    }
+
+    // --- Pool config tests (CV-08 to CV-11) ---
+
+    #[test]
+    fn cv_08_pool_max_workers_validation() {
+        // max_workers = 0 is invalid
+        let toml = r#"
+            [sandbox.pool]
+            enabled = true
+            max_workers = 0
+        "#;
+        assert!(ForgeConfig::from_toml(toml).is_err());
+
+        // max_workers > max_concurrent is invalid
+        let toml = r#"
+            [sandbox]
+            max_concurrent = 4
+            [sandbox.pool]
+            max_workers = 5
+        "#;
+        assert!(ForgeConfig::from_toml(toml).is_err());
+
+        // max_workers within range is valid
+        let toml = r#"
+            [sandbox]
+            max_concurrent = 8
+            [sandbox.pool]
+            max_workers = 4
+        "#;
+        assert!(ForgeConfig::from_toml(toml).is_ok());
+    }
+
+    #[test]
+    fn cv_09_pool_min_workers_validation() {
+        // min_workers > max_workers is invalid
+        let toml = r#"
+            [sandbox.pool]
+            min_workers = 5
+            max_workers = 2
+        "#;
+        assert!(ForgeConfig::from_toml(toml).is_err());
+
+        // min_workers <= max_workers is valid
+        let toml = r#"
+            [sandbox.pool]
+            min_workers = 2
+            max_workers = 4
+        "#;
+        assert!(ForgeConfig::from_toml(toml).is_ok());
+    }
+
+    #[test]
+    fn cv_10_pool_max_uses_validation() {
+        // max_uses = 0 is invalid
+        let toml = r#"
+            [sandbox.pool]
+            max_uses = 0
+        "#;
+        assert!(ForgeConfig::from_toml(toml).is_err());
+
+        // max_uses > 0 is valid
+        let toml = r#"
+            [sandbox.pool]
+            max_uses = 100
+        "#;
+        assert!(ForgeConfig::from_toml(toml).is_ok());
+    }
+
+    #[test]
+    fn cv_11_pool_max_idle_validation() {
+        // max_idle_secs < 5 is invalid
+        let toml = r#"
+            [sandbox.pool]
+            max_idle_secs = 2
+        "#;
+        assert!(ForgeConfig::from_toml(toml).is_err());
+
+        // max_idle_secs > 3600 is invalid
+        let toml = r#"
+            [sandbox.pool]
+            max_idle_secs = 7200
+        "#;
+        assert!(ForgeConfig::from_toml(toml).is_err());
+
+        // max_idle_secs = 60 is valid
+        let toml = r#"
+            [sandbox.pool]
+            max_idle_secs = 60
+        "#;
+        assert!(ForgeConfig::from_toml(toml).is_ok());
+    }
+
+    #[test]
+    fn config_parses_pool_fields() {
+        let toml = r#"
+            [sandbox.pool]
+            enabled = true
+            min_workers = 2
+            max_workers = 8
+            max_idle_secs = 60
+            max_uses = 50
+        "#;
+
+        let config = ForgeConfig::from_toml(toml).unwrap();
+        let pool = config.sandbox.pool.unwrap();
+        assert_eq!(pool.enabled, Some(true));
+        assert_eq!(pool.min_workers, Some(2));
+        assert_eq!(pool.max_workers, Some(8));
+        assert_eq!(pool.max_idle_secs, Some(60));
+        assert_eq!(pool.max_uses, Some(50));
+    }
+
+    /// Compile-time guard: ConfigError is #[non_exhaustive].
+    #[test]
+    #[allow(unreachable_patterns)]
+    fn ne_config_error_is_non_exhaustive() {
+        let err = ConfigError::Invalid("test".into());
+        match err {
+            ConfigError::Invalid(_) | ConfigError::Parse(_) => {}
+            _ => {}
+        }
     }
 }

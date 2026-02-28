@@ -100,6 +100,28 @@ pub fn redact_error_message(error: &str) -> String {
     lines.join("\n")
 }
 
+/// Redact sensitive data from a structured error JSON object.
+///
+/// Applies [`redact_error_for_llm`] to the `message` field and
+/// [`redact_error_message`] to the `suggested_fix` field, preserving
+/// all other fields (`error`, `code`, `retryable`) untouched.
+pub fn redact_structured_error(server: &str, tool: &str, error: &mut serde_json::Value) {
+    if let Some(msg) = error
+        .get("message")
+        .and_then(|m| m.as_str())
+        .map(|s| s.to_string())
+    {
+        error["message"] = serde_json::Value::String(redact_error_for_llm(server, tool, &msg));
+    }
+    if let Some(fix) = error
+        .get("suggested_fix")
+        .and_then(|f| f.as_str())
+        .map(|s| s.to_string())
+    {
+        error["suggested_fix"] = serde_json::Value::String(redact_error_message(&fix));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -398,5 +420,53 @@ mod tests {
         assert!(!result.contains("/etc/forge"), "path stripped");
         assert!(!result.contains("TlsSocket"), "stack trace stripped");
         assert!(!result.contains("10.0.0.5"), "IP stripped");
+    }
+
+    // --- Structured error redaction tests (Phase R2) ---
+
+    #[test]
+    fn se_wire_05_redact_structured_error_redacts_message() {
+        let mut err = serde_json::json!({
+            "error": true,
+            "code": "UPSTREAM_ERROR",
+            "message": "upstream error from 'narsil': connection to https://internal.corp:9876/api failed",
+            "retryable": true,
+        });
+        redact_structured_error("narsil", "find_symbols", &mut err);
+        let msg = err["message"].as_str().unwrap();
+        assert!(!msg.contains("internal.corp"), "should redact URL: {msg}");
+        assert!(msg.contains("narsil"), "should preserve server name: {msg}");
+    }
+
+    #[test]
+    fn se_wire_06_redact_structured_error_redacts_suggested_fix() {
+        let mut err = serde_json::json!({
+            "error": true,
+            "code": "TOOL_NOT_FOUND",
+            "message": "tool not found",
+            "retryable": false,
+            "suggested_fix": "config at /home/user/.config/forge/tools.toml, try 'find_symbols'"
+        });
+        redact_structured_error("narsil", "fnd_symbols", &mut err);
+        let fix = err["suggested_fix"].as_str().unwrap();
+        assert!(
+            !fix.contains("/home/user"),
+            "should redact paths in suggested_fix: {fix}"
+        );
+    }
+
+    #[test]
+    fn se_wire_07_redact_structured_error_preserves_code_and_retryable() {
+        let mut err = serde_json::json!({
+            "error": true,
+            "code": "TIMEOUT",
+            "message": "timeout after 5000ms on server 'slow'",
+            "retryable": true,
+            "suggested_fix": "Retry with a simpler operation"
+        });
+        redact_structured_error("slow", "heavy_op", &mut err);
+        assert_eq!(err["error"], true);
+        assert_eq!(err["code"], "TIMEOUT");
+        assert_eq!(err["retryable"], true);
     }
 }

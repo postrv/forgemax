@@ -15,9 +15,19 @@
 //! - **Layer 2**: Tool list for a category (~500 tokens returned)
 //! - **Layer 3**: Full schema for specific tools (~200 tokens per tool)
 
+pub mod live;
+
 use std::collections::BTreeMap;
 
+pub use live::LiveManifest;
 use serde::{Deserialize, Serialize};
+
+/// TypeScript type definitions for the forge sandbox API.
+///
+/// Describes `forge.callTool()`, `forge.server()`, `forge.readResource()`,
+/// `forge.stash.*`, `forge.parallel()`, and the `manifest` global.
+/// Included in MCP server instructions for LLM code generation accuracy.
+pub const FORGE_DTS: &str = include_str!("forge.d.ts");
 
 /// A tool parameter definition.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -991,6 +1001,41 @@ mod tests {
         let summary2 = m2.layer0_summary();
         let servers2 = summary2.as_array().unwrap();
         assert!(servers2[0].get("totalResources").is_none());
+    }
+
+    // --- TypeScript definitions tests (Phase 5A) ---
+
+    #[test]
+    fn ts_01_forge_dts_non_empty() {
+        assert!(!FORGE_DTS.is_empty());
+        assert!(FORGE_DTS.len() > 100, "forge.d.ts should be substantial");
+    }
+
+    #[test]
+    fn ts_02_forge_dts_contains_key_apis() {
+        assert!(FORGE_DTS.contains("callTool"), "should declare callTool");
+        assert!(
+            FORGE_DTS.contains("readResource"),
+            "should declare readResource"
+        );
+        assert!(
+            FORGE_DTS.contains("ForgeStash"),
+            "should declare stash types"
+        );
+        assert!(FORGE_DTS.contains("parallel"), "should declare parallel");
+        assert!(FORGE_DTS.contains("manifest"), "should reference manifest");
+        assert!(
+            FORGE_DTS.contains("ManifestServer"),
+            "should declare ManifestServer"
+        );
+    }
+
+    #[test]
+    fn ts_03_forge_dts_has_jsdoc_examples() {
+        assert!(
+            FORGE_DTS.contains("@example"),
+            "should include JSDoc @example annotations"
+        );
     }
 
     #[test]

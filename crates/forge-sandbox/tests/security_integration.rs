@@ -17,7 +17,7 @@ impl ToolDispatcher for StubDispatcher {
         _server: &str,
         _tool: &str,
         _args: serde_json::Value,
-    ) -> Result<serde_json::Value, anyhow::Error> {
+    ) -> Result<serde_json::Value, forge_error::DispatchError> {
         Ok(serde_json::json!({"status": "ok"}))
     }
 }

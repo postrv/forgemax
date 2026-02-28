@@ -12,8 +12,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use forge_error::DispatchError;
+use forge_sandbox::error::SandboxError;
 use forge_sandbox::ipc::{
-    read_message, read_message_with_limit, write_message, ChildMessage, ParentMessage,
+    read_message, read_message_with_limit, write_message, ChildMessage, ErrorKind, ParentMessage,
 };
 use forge_sandbox::{ResourceDispatcher, StashDispatcher, ToolDispatcher};
 use tokio::io::{self, AsyncWriteExt, BufReader};
@@ -39,7 +41,7 @@ impl ToolDispatcher for IpcToolBridge {
         server: &str,
         tool: &str,
         args: serde_json::Value,
-    ) -> Result<serde_json::Value, anyhow::Error> {
+    ) -> Result<serde_json::Value, forge_error::DispatchError> {
         let request_id = self.next_id.fetch_add(1, Ordering::SeqCst);
 
         // Register a waiter for the response
@@ -63,7 +65,7 @@ impl ToolDispatcher for IpcToolBridge {
             .await
             .map_err(|_| anyhow::anyhow!("IPC response channel closed"))?;
 
-        result.map_err(|e| anyhow::anyhow!("{}", e))
+        result.map_err(|e| DispatchError::Internal(anyhow::anyhow!("{}", e)))
     }
 }
 
@@ -86,7 +88,7 @@ impl ResourceDispatcher for IpcResourceBridge {
         &self,
         server: &str,
         uri: &str,
-    ) -> Result<serde_json::Value, anyhow::Error> {
+    ) -> Result<serde_json::Value, forge_error::DispatchError> {
         let request_id = self.next_id.fetch_add(1, Ordering::SeqCst);
 
         let (resp_tx, resp_rx) = oneshot::channel();
@@ -106,7 +108,7 @@ impl ResourceDispatcher for IpcResourceBridge {
             .await
             .map_err(|_| anyhow::anyhow!("IPC response channel closed"))?;
 
-        result.map_err(|e| anyhow::anyhow!("{}", e))
+        result.map_err(|e| DispatchError::Internal(anyhow::anyhow!("{}", e)))
     }
 }
 
@@ -131,7 +133,7 @@ impl StashDispatcher for IpcStashBridge {
         value: serde_json::Value,
         ttl_secs: Option<u32>,
         _current_group: Option<String>,
-    ) -> Result<serde_json::Value, anyhow::Error> {
+    ) -> Result<serde_json::Value, forge_error::DispatchError> {
         let request_id = self.next_id.fetch_add(1, Ordering::SeqCst);
 
         let (resp_tx, resp_rx) = oneshot::channel();
@@ -152,14 +154,14 @@ impl StashDispatcher for IpcStashBridge {
             .await
             .map_err(|_| anyhow::anyhow!("IPC response channel closed"))?;
 
-        result.map_err(|e| anyhow::anyhow!("{}", e))
+        result.map_err(|e| DispatchError::Internal(anyhow::anyhow!("{}", e)))
     }
 
     async fn get(
         &self,
         key: &str,
         _current_group: Option<String>,
-    ) -> Result<serde_json::Value, anyhow::Error> {
+    ) -> Result<serde_json::Value, forge_error::DispatchError> {
         let request_id = self.next_id.fetch_add(1, Ordering::SeqCst);
 
         let (resp_tx, resp_rx) = oneshot::channel();
@@ -178,14 +180,14 @@ impl StashDispatcher for IpcStashBridge {
             .await
             .map_err(|_| anyhow::anyhow!("IPC response channel closed"))?;
 
-        result.map_err(|e| anyhow::anyhow!("{}", e))
+        result.map_err(|e| DispatchError::Internal(anyhow::anyhow!("{}", e)))
     }
 
     async fn delete(
         &self,
         key: &str,
         _current_group: Option<String>,
-    ) -> Result<serde_json::Value, anyhow::Error> {
+    ) -> Result<serde_json::Value, forge_error::DispatchError> {
         let request_id = self.next_id.fetch_add(1, Ordering::SeqCst);
 
         let (resp_tx, resp_rx) = oneshot::channel();
@@ -204,13 +206,13 @@ impl StashDispatcher for IpcStashBridge {
             .await
             .map_err(|_| anyhow::anyhow!("IPC response channel closed"))?;
 
-        result.map_err(|e| anyhow::anyhow!("{}", e))
+        result.map_err(|e| DispatchError::Internal(anyhow::anyhow!("{}", e)))
     }
 
     async fn keys(
         &self,
         _current_group: Option<String>,
-    ) -> Result<serde_json::Value, anyhow::Error> {
+    ) -> Result<serde_json::Value, forge_error::DispatchError> {
         let request_id = self.next_id.fetch_add(1, Ordering::SeqCst);
 
         let (resp_tx, resp_rx) = oneshot::channel();
@@ -226,7 +228,7 @@ impl StashDispatcher for IpcStashBridge {
             .await
             .map_err(|_| anyhow::anyhow!("IPC response channel closed"))?;
 
-        result.map_err(|e| anyhow::anyhow!("{}", e))
+        result.map_err(|e| DispatchError::Internal(anyhow::anyhow!("{}", e)))
     }
 }
 
@@ -244,37 +246,67 @@ async fn main() -> Result<()> {
         .with_max_level(tracing::Level::WARN)
         .init();
 
-    // Read the Execute message from stdin
     let mut stdin = BufReader::new(io::stdin());
     let mut stdout = io::stdout();
 
-    let msg: ParentMessage = read_message(&mut stdin)
-        .await
-        .context("failed to read initial message from parent")?
-        .context("parent closed stdin before sending Execute")?;
+    // Multi-execution loop: the first message determines the mode.
+    //
+    // - Execute: single-execution mode (backward compatible with v0.2).
+    //   Run the execution, then exit.
+    // - Reset: pool mode. Send ResetComplete, then wait for Execute.
+    //   After execution completes, wait for another Reset or EOF.
+    loop {
+        let msg: ParentMessage = match read_message(&mut stdin).await {
+            Ok(Some(msg)) => msg,
+            Ok(None) => break, // Parent closed stdin — clean exit
+            Err(e) => {
+                anyhow::bail!("failed to read message from parent: {}", e);
+            }
+        };
 
-    let (code, config) = match msg {
-        ParentMessage::Execute {
-            code,
-            manifest: _,
-            config,
-        } => (code, config),
-        other => {
-            anyhow::bail!("expected Execute message, got: {:?}", other);
+        match msg {
+            ParentMessage::Reset { config: _ } => {
+                // Pool mode: acknowledge the reset and wait for Execute
+                write_message(&mut stdout, &ChildMessage::ResetComplete).await?;
+                stdout.flush().await?;
+                continue;
+            }
+            ParentMessage::Execute {
+                code,
+                manifest: _,
+                config,
+            } => {
+                run_single_execution(&mut stdin, &mut stdout, &code, config).await?;
+                // After execution, continue the loop to handle Reset or EOF
+                continue;
+            }
+            other => {
+                anyhow::bail!("expected Execute or Reset message, got: {:?}", other);
+            }
         }
-    };
+    }
 
+    Ok(())
+}
+
+/// Run a single V8 execution, handling the full IPC lifecycle.
+///
+/// This function sets up IPC channels, spawns the V8 thread, runs the
+/// IPC event loop, and waits for completion.
+async fn run_single_execution(
+    stdin: &mut BufReader<io::Stdin>,
+    stdout: &mut io::Stdout,
+    code: &str,
+    config: forge_sandbox::ipc::WorkerConfig,
+) -> Result<()> {
     let sandbox_config = config.to_sandbox_config();
     let max_ipc_size = config.max_ipc_message_size;
 
     // Set up IPC channels
-    // tx: child messages to send to parent (tool requests, logs)
-    // waiter_tx: register response waiters for tool call results
     let (tx, mut rx) = mpsc::unbounded_channel::<ChildMessage>();
     let (waiter_tx, mut waiter_rx) =
         mpsc::unbounded_channel::<(u64, oneshot::Sender<Result<serde_json::Value, String>>)>();
 
-    // Shared request ID counter for all IPC bridges
     let shared_next_id = Arc::new(AtomicU64::new(1));
 
     let dispatcher: Arc<dyn ToolDispatcher> = Arc::new(IpcToolBridge {
@@ -297,6 +329,7 @@ async fn main() -> Result<()> {
     }));
 
     // Spawn the V8 execution on a dedicated thread (V8 isolates are !Send)
+    let code_owned = code.to_string();
     let exec_tx = tx.clone();
     let exec_handle = std::thread::spawn(move || {
         let rt = match tokio::runtime::Builder::new_current_thread()
@@ -307,6 +340,7 @@ async fn main() -> Result<()> {
             Err(e) => {
                 let _ = exec_tx.send(ChildMessage::ExecutionComplete {
                     result: Err(format!("failed to create tokio runtime: {}", e)),
+                    error_kind: Some(ErrorKind::Execution),
                 });
                 return;
             }
@@ -314,26 +348,35 @@ async fn main() -> Result<()> {
 
         let result = rt.block_on(forge_sandbox::executor::run_execute(
             &sandbox_config,
-            &code,
+            &code_owned,
             dispatcher,
             resource_dispatcher,
             stash_dispatcher,
         ));
 
         let child_result = match result {
-            Ok(value) => ChildMessage::ExecutionComplete { result: Ok(value) },
-            Err(e) => ChildMessage::ExecutionComplete {
-                result: Err(e.to_string()),
+            Ok(value) => ChildMessage::ExecutionComplete {
+                result: Ok(value),
+                error_kind: None,
             },
+            Err(ref e) => {
+                let kind = match e {
+                    SandboxError::Timeout { .. } => ErrorKind::Timeout,
+                    SandboxError::HeapLimitExceeded => ErrorKind::HeapLimit,
+                    SandboxError::JsError { .. } => ErrorKind::JsError,
+                    _ => ErrorKind::Execution,
+                };
+                ChildMessage::ExecutionComplete {
+                    result: Err(e.to_string()),
+                    error_kind: Some(kind),
+                }
+            }
         };
 
         let _ = exec_tx.send(child_result);
     });
 
-    // IPC event loop: multiplex between
-    // 1. Outgoing messages from the V8 thread (tool requests, completion)
-    // 2. Incoming responses from the parent (tool call results)
-    // 3. Registering new response waiters
+    // IPC event loop
     let mut pending_waiters: std::collections::HashMap<
         u64,
         oneshot::Sender<Result<serde_json::Value, String>>,
@@ -342,37 +385,34 @@ async fn main() -> Result<()> {
 
     loop {
         tokio::select! {
-            // Outgoing: V8 thread wants to send a message to the parent
             msg = rx.recv() => {
                 match msg {
                     Some(child_msg) => {
                         let is_complete = matches!(child_msg, ChildMessage::ExecutionComplete { .. });
-                        write_message(&mut stdout, &child_msg).await
+                        write_message(stdout, &child_msg).await
                             .context("failed to write message to parent")?;
                         stdout.flush().await?;
                         if is_complete {
                             execution_done = true;
-                            // Drain any remaining waiters
                             if pending_waiters.is_empty() {
                                 break;
                             }
                         }
                     }
                     None => {
-                        // Channel closed — V8 thread exited
                         if !execution_done {
                             let msg = ChildMessage::ExecutionComplete {
                                 result: Err("worker thread exited unexpectedly".into()),
+                                error_kind: Some(ErrorKind::Execution),
                             };
-                            write_message(&mut stdout, &msg).await.ok();
+                            write_message(stdout, &msg).await.ok();
                         }
                         break;
                     }
                 }
             }
 
-            // Incoming: parent sends a response (tool call, resource read, or stash result)
-            result = read_message_with_limit::<ParentMessage, _>(&mut stdin, max_ipc_size) => {
+            result = read_message_with_limit::<ParentMessage, _>(stdin, max_ipc_size) => {
                 match result {
                     Ok(Some(ParentMessage::ToolCallResult { request_id, result })) => {
                         if let Some(waiter) = pending_waiters.remove(&request_id) {
@@ -402,7 +442,6 @@ async fn main() -> Result<()> {
                         tracing::warn!("unexpected message type from parent");
                     }
                     Ok(None) => {
-                        // Parent closed stdin — abort
                         break;
                     }
                     Err(e) => {
@@ -412,7 +451,6 @@ async fn main() -> Result<()> {
                 }
             }
 
-            // Register new response waiters from the IpcToolBridge
             waiter = waiter_rx.recv() => {
                 if let Some((id, sender)) = waiter {
                     pending_waiters.insert(id, sender);
