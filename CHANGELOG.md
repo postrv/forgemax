@@ -2,6 +2,15 @@
 
 All notable changes to Forgemax will be documented in this file.
 
+## [0.3.1] - 2026-02-28
+
+### Fixed
+
+- **IPC error type preservation:** `IpcDispatchError` struct preserves `DispatchError` variant (code, server, tool) across the IPC boundary. Structured error codes (`SERVER_NOT_FOUND`, `TOOL_NOT_FOUND`) and fuzzy-match suggestions now work correctly in ChildProcess mode.
+- **Pre-dispatch tool name validation:** `RouterDispatcher` validates tool names before dispatching to upstream servers. Misspelled tool names now return `TOOL_NOT_FOUND` with Levenshtein suggestions instead of opaque upstream errors.
+- **AST `require()` blocking:** `require` added to `DANGEROUS_IDENTIFIERS` and `check_call_callee`, preventing `require('child_process')` and alias evasion (`const r = require; r('fs')`).
+- **Flaky timeout test:** `rs_i06_read_resource_timeout_enforcement` now accepts both async timeout and CPU watchdog timeout messages, fixing a race condition between the two timeout mechanisms.
+
 ## [0.3.0] - 2026-02-28
 
 ### Added
