@@ -28,6 +28,29 @@ pub(crate) struct ToolCallLimits {
     pub(crate) calls_made: usize,
 }
 
+/// Rate limiting state for stash operations within a single execution.
+pub(crate) struct StashCallLimits {
+    /// Maximum number of stash operations allowed (None = unlimited).
+    pub(crate) max_calls: Option<usize>,
+    /// Number of stash operations made so far.
+    pub(crate) calls_made: usize,
+}
+
+impl StashCallLimits {
+    /// Check if the limit has been reached. Returns an error message if so.
+    pub(crate) fn check_limit(&mut self) -> Result<(), String> {
+        if let Some(max) = self.max_calls {
+            if self.calls_made >= max {
+                return Err(format!(
+                    "stash operation limit reached ({max} calls per execution)"
+                ));
+            }
+        }
+        self.calls_made += 1;
+        Ok(())
+    }
+}
+
 /// Log a message from sandbox code.
 #[op2(fast)]
 pub fn op_forge_log(#[string] msg: &str) {
@@ -157,7 +180,59 @@ fn validate_resource_uri(uri: &str) -> Result<(), String> {
     if has_path_traversal(uri) {
         return Err("resource URI must not contain path traversal".into());
     }
+    if let Some(scheme) = extract_uri_scheme(uri) {
+        if is_blocked_scheme(&scheme) {
+            return Err(format!("URI scheme '{}' is not allowed", scheme));
+        }
+    }
     Ok(())
+}
+
+/// Blocked URI schemes that should never be passed to resource dispatchers.
+const BLOCKED_SCHEMES: &[&str] = &[
+    "data",
+    "javascript",
+    "ftp",
+    "gopher",
+    "telnet",
+    "ldap",
+    "dict",
+];
+
+/// Extract the scheme from a URI (text before `://` or `:`).
+/// Returns `None` for schemeless URIs like `some-resource-id`.
+fn extract_uri_scheme(uri: &str) -> Option<String> {
+    // Check for `://` first (most common)
+    if let Some(pos) = uri.find("://") {
+        let candidate = &uri[..pos];
+        // A valid scheme contains only alphanumeric, +, -, . and starts with a letter
+        if !candidate.is_empty()
+            && candidate.as_bytes()[0].is_ascii_alphabetic()
+            && candidate
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'-' || b == b'.')
+        {
+            return Some(candidate.to_ascii_lowercase());
+        }
+    }
+    // Check for `:` without `//` (e.g., `data:text/plain,...`, `javascript:...`)
+    if let Some(pos) = uri.find(':') {
+        let candidate = &uri[..pos];
+        if !candidate.is_empty()
+            && candidate.as_bytes()[0].is_ascii_alphabetic()
+            && candidate
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'-' || b == b'.')
+        {
+            return Some(candidate.to_ascii_lowercase());
+        }
+    }
+    None
+}
+
+/// Check if a scheme is in the blocklist (case-insensitive, scheme already lowercased).
+fn is_blocked_scheme(scheme: &str) -> bool {
+    BLOCKED_SCHEMES.contains(&scheme)
 }
 
 /// Check if a URI contains path traversal (`..`) as a path segment.
@@ -313,6 +388,11 @@ pub async fn op_forge_stash_put(
     // Defense-in-depth: validate key at op boundary before IPC traversal
     validate_key(&key).map_err(|e| JsErrorBox::generic(e.to_string()))?;
 
+    // Check stash operation limit
+    if let Some(limits) = op_state.borrow_mut().try_borrow_mut::<StashCallLimits>() {
+        limits.check_limit().map_err(JsErrorBox::generic)?;
+    }
+
     let (dispatcher, current_group) = {
         let st = op_state.borrow();
         let d = st.borrow::<Arc<dyn StashDispatcher>>().clone();
@@ -341,8 +421,11 @@ pub async fn op_forge_stash_get(
     op_state: Rc<RefCell<OpState>>,
     #[string] key: String,
 ) -> Result<String, JsErrorBox> {
-    // Defense-in-depth: validate key at op boundary before IPC traversal
     validate_key(&key).map_err(|e| JsErrorBox::generic(e.to_string()))?;
+
+    if let Some(limits) = op_state.borrow_mut().try_borrow_mut::<StashCallLimits>() {
+        limits.check_limit().map_err(JsErrorBox::generic)?;
+    }
 
     let (dispatcher, current_group) = {
         let st = op_state.borrow();
@@ -367,8 +450,11 @@ pub async fn op_forge_stash_delete(
     op_state: Rc<RefCell<OpState>>,
     #[string] key: String,
 ) -> Result<String, JsErrorBox> {
-    // Defense-in-depth: validate key at op boundary before IPC traversal
     validate_key(&key).map_err(|e| JsErrorBox::generic(e.to_string()))?;
+
+    if let Some(limits) = op_state.borrow_mut().try_borrow_mut::<StashCallLimits>() {
+        limits.check_limit().map_err(JsErrorBox::generic)?;
+    }
 
     let (dispatcher, current_group) = {
         let st = op_state.borrow();
@@ -390,6 +476,10 @@ pub async fn op_forge_stash_delete(
 #[op2]
 #[string]
 pub async fn op_forge_stash_keys(op_state: Rc<RefCell<OpState>>) -> Result<String, JsErrorBox> {
+    if let Some(limits) = op_state.borrow_mut().try_borrow_mut::<StashCallLimits>() {
+        limits.check_limit().map_err(JsErrorBox::generic)?;
+    }
+
     let (dispatcher, current_group) = {
         let st = op_state.borrow();
         let d = st.borrow::<Arc<dyn StashDispatcher>>().clone();
@@ -566,5 +656,146 @@ mod tests {
         assert!(validate_resource_uri("file:///../").is_err());
         // Traversal after normal path
         assert!(validate_resource_uri("file:///a/b/../../../etc/shadow").is_err());
+    }
+
+    // --- M2: URI Scheme Validation Tests ---
+
+    #[test]
+    fn uri_m2_01_allows_http_scheme() {
+        assert!(validate_resource_uri("http://example.com/resource").is_ok());
+    }
+
+    #[test]
+    fn uri_m2_02_allows_https_scheme() {
+        assert!(validate_resource_uri("https://example.com/resource").is_ok());
+    }
+
+    #[test]
+    fn uri_m2_03_allows_file_scheme() {
+        assert!(validate_resource_uri("file:///logs/app.log").is_ok());
+    }
+
+    #[test]
+    fn uri_m2_04_rejects_data_scheme() {
+        let err = validate_resource_uri("data:text/plain;base64,SGVsbG8=").unwrap_err();
+        assert!(
+            err.contains("not allowed"),
+            "expected 'not allowed' in error: {err}"
+        );
+    }
+
+    #[test]
+    fn uri_m2_05_rejects_javascript_scheme() {
+        let err = validate_resource_uri("javascript:alert(1)").unwrap_err();
+        assert!(err.contains("not allowed"), "error: {err}");
+    }
+
+    #[test]
+    fn uri_m2_06_rejects_ftp_scheme() {
+        let err = validate_resource_uri("ftp://evil.com/malware").unwrap_err();
+        assert!(err.contains("not allowed"), "error: {err}");
+    }
+
+    #[test]
+    fn uri_m2_07_rejects_gopher_scheme() {
+        let err = validate_resource_uri("gopher://evil.com/0").unwrap_err();
+        assert!(err.contains("not allowed"), "error: {err}");
+    }
+
+    #[test]
+    fn uri_m2_08_allows_custom_mcp_scheme() {
+        // Custom MCP resource URIs should be allowed
+        assert!(validate_resource_uri("postgres://db/table").is_ok());
+        assert!(validate_resource_uri("redis://localhost:6379/0").is_ok());
+        assert!(validate_resource_uri("mongodb://host/db").is_ok());
+    }
+
+    #[test]
+    fn uri_m2_09_allows_schemeless_uri() {
+        // Bare resource identifiers without any scheme
+        assert!(validate_resource_uri("some-resource-id").is_ok());
+        assert!(validate_resource_uri("table_name").is_ok());
+        assert!(validate_resource_uri("logs/2024/app.log").is_ok());
+    }
+
+    #[test]
+    fn uri_m2_10_case_insensitive_scheme_check() {
+        // Mixed case should be blocked
+        assert!(validate_resource_uri("JAVASCRIPT:alert(1)").is_err());
+        assert!(validate_resource_uri("JavaScript:void(0)").is_err());
+        assert!(validate_resource_uri("DATA:text/plain,hello").is_err());
+        assert!(validate_resource_uri("FTP://evil.com/file").is_err());
+        assert!(validate_resource_uri("Gopher://host/0").is_err());
+        assert!(validate_resource_uri("TELNET://host:23").is_err());
+        assert!(validate_resource_uri("LDAP://host/dc=com").is_err());
+        assert!(validate_resource_uri("DICT://host/define").is_err());
+    }
+
+    // --- Phase 7: Stash call limits tests ---
+
+    #[test]
+    fn stash_l4_01_stash_calls_count_against_limit() {
+        let mut limits = StashCallLimits {
+            max_calls: Some(3),
+            calls_made: 0,
+        };
+        assert!(limits.check_limit().is_ok());
+        assert!(limits.check_limit().is_ok());
+        assert!(limits.check_limit().is_ok());
+        // 4th call should fail
+        assert!(limits.check_limit().is_err());
+    }
+
+    #[test]
+    fn stash_l4_02_stash_limit_rejection_message() {
+        let mut limits = StashCallLimits {
+            max_calls: Some(1),
+            calls_made: 0,
+        };
+        assert!(limits.check_limit().is_ok());
+        let err = limits.check_limit().unwrap_err();
+        assert!(err.contains("limit reached"), "should mention limit: {err}");
+        assert!(
+            err.contains("1 calls"),
+            "should mention the limit count: {err}"
+        );
+    }
+
+    #[test]
+    fn stash_l4_03_stash_limit_independent_of_tool_limit() {
+        // Stash limits track separately from tool call limits
+        let mut stash_limits = StashCallLimits {
+            max_calls: Some(5),
+            calls_made: 0,
+        };
+        let tool_limits = ToolCallLimits {
+            max_calls: 0, // tool calls exhausted
+            max_args_size: 1024,
+            calls_made: 0,
+        };
+        // Stash should still work even if tool limit is at 0
+        assert!(stash_limits.check_limit().is_ok());
+        let _ = tool_limits;
+    }
+
+    #[test]
+    fn stash_l4_04_stash_limit_configurable() {
+        // None means unlimited
+        let mut unlimited = StashCallLimits {
+            max_calls: None,
+            calls_made: 0,
+        };
+        for _ in 0..1000 {
+            assert!(unlimited.check_limit().is_ok());
+        }
+
+        // Some(N) means N calls max
+        let mut limited = StashCallLimits {
+            max_calls: Some(2),
+            calls_made: 0,
+        };
+        assert!(limited.check_limit().is_ok());
+        assert!(limited.check_limit().is_ok());
+        assert!(limited.check_limit().is_err());
     }
 }

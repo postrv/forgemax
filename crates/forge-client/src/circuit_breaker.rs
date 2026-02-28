@@ -73,6 +73,7 @@ impl CircuitBreakerDispatcher {
 
 #[async_trait::async_trait]
 impl ToolDispatcher for CircuitBreakerDispatcher {
+    #[tracing::instrument(skip(self, args), fields(server, tool))]
     async fn call_tool(
         &self,
         server: &str,
@@ -170,6 +171,7 @@ impl CircuitBreakerResourceDispatcher {
 
 #[async_trait::async_trait]
 impl ResourceDispatcher for CircuitBreakerResourceDispatcher {
+    #[tracing::instrument(skip(self), fields(server, uri))]
     async fn read_resource(
         &self,
         server: &str,

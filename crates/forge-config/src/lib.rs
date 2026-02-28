@@ -26,6 +26,9 @@
 //! max_tool_calls = 50
 //! ```
 
+#[cfg(feature = "config-watch")]
+pub mod watcher;
+
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -229,6 +232,10 @@ pub struct StashOverrides {
     /// Maximum TTL for stash entries in seconds.
     #[serde(default)]
     pub max_ttl_secs: Option<u64>,
+
+    /// Maximum stash operations per execution (None = unlimited).
+    #[serde(default)]
+    pub max_calls: Option<usize>,
 }
 
 impl ForgeConfig {

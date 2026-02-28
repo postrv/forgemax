@@ -242,7 +242,7 @@ impl AuditEntryBuilder {
             execution_id: Uuid::new_v4().to_string(),
             timestamp: Utc::now(),
             code_hash: sha256_hex(code),
-            code_preview: code_preview(code),
+            code_preview: crate::redact::redact_error_message(&code_preview(code)),
             operation,
             tool_calls: Vec::new(),
             resource_reads: Vec::new(),
@@ -1203,6 +1203,41 @@ mod tests {
         assert!(
             parsed2.get("pool_size_at_acquire").is_none(),
             "pool_size_at_acquire=None should be skipped"
+        );
+    }
+
+    // --- Phase 7 Gap #16: Audit code_preview redaction ---
+
+    #[test]
+    fn audit_l2_01_code_preview_redacts_api_keys() {
+        // API keys in code_preview must be redacted before storage
+        let code = "async () => { const key = 'Bearer sk-1234567890abcdef'; return key; }";
+        let builder = AuditEntryBuilder::new(code, AuditOperation::Execute);
+        let entry = builder.finish(&Ok(serde_json::json!("ok")));
+
+        // The code_preview should have been redacted
+        assert!(
+            !entry.code_preview.contains("sk-1234567890abcdef"),
+            "code_preview should not contain raw API key: {}",
+            entry.code_preview
+        );
+        assert!(
+            entry.code_preview.contains("[REDACTED]"),
+            "code_preview should contain redaction marker: {}",
+            entry.code_preview
+        );
+    }
+
+    #[test]
+    fn audit_l2_02_code_preview_preserves_safe_code() {
+        // Safe code without credentials should pass through unchanged
+        let code = "async () => { return 42; }";
+        let builder = AuditEntryBuilder::new(code, AuditOperation::Execute);
+        let entry = builder.finish(&Ok(serde_json::json!(42)));
+
+        assert_eq!(
+            entry.code_preview, code,
+            "safe code_preview should be unchanged"
         );
     }
 }

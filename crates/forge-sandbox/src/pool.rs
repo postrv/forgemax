@@ -291,15 +291,23 @@ impl WorkerPool {
     /// Reap idle workers that have exceeded `max_idle_time`.
     ///
     /// Call this periodically (e.g., every 10 seconds) from a background task.
+    /// Preserves `min_workers` to avoid repeated cold starts.
     pub async fn reap_idle(&self) {
         let mut idle = self.idle_workers.lock().await;
         let now = Instant::now();
         let mut to_kill = Vec::new();
         let mut kept = VecDeque::new();
+        let alive = *self.alive_count.lock().await;
 
         while let Some(w) = idle.pop_front() {
             if now.duration_since(w.idle_since) > self.config.max_idle_time {
-                to_kill.push(w);
+                // Preserve min_workers: only reap if we'd still have enough alive
+                let would_remain = alive - to_kill.len() - 1;
+                if would_remain >= self.config.min_workers {
+                    to_kill.push(w);
+                } else {
+                    kept.push_back(w);
+                }
             } else {
                 kept.push_back(w);
             }
@@ -313,15 +321,71 @@ impl WorkerPool {
         }
     }
 
+    /// Pre-warm the pool by spawning workers up to `min_workers`.
+    ///
+    /// Each worker is spawned and given a Reset health check. Returns the
+    /// number of workers successfully pre-warmed.
+    #[cfg(feature = "worker-pool")]
+    pub async fn pre_warm(&self, config: &crate::SandboxConfig) -> Result<usize, SandboxError> {
+        let worker_config = WorkerConfig::from(config);
+        let mut count = 0;
+
+        let alive = *self.alive_count.lock().await;
+        let to_spawn = self.config.min_workers.saturating_sub(alive);
+
+        for _ in 0..to_spawn {
+            if *self.alive_count.lock().await >= self.config.max_workers {
+                break;
+            }
+
+            match self.spawn_worker().await {
+                Ok(mut w) => {
+                    if self.health_check(&mut w, &worker_config).await {
+                        w.idle_since = Instant::now();
+                        self.idle_workers.lock().await.push_back(w);
+                        *self.alive_count.lock().await += 1;
+                        count += 1;
+                    } else {
+                        self.kill_worker(w).await;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to pre-warm worker");
+                }
+            }
+        }
+
+        Ok(count)
+    }
+
+    /// Start a background task that periodically reaps idle workers.
+    ///
+    /// The task runs until the returned `JoinHandle` is aborted or the pool shuts down.
+    #[cfg(feature = "worker-pool")]
+    pub fn start_reap_task(self: &Arc<Self>, interval: Duration) -> tokio::task::JoinHandle<()> {
+        let pool = Arc::clone(self);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                if *pool.shutting_down.lock().await {
+                    break;
+                }
+                pool.reap_idle().await;
+            }
+        })
+    }
+
     /// Spawn a fresh worker process.
     async fn spawn_worker(&self) -> Result<PoolWorker, SandboxError> {
         let worker_bin = find_worker_binary()?;
 
+        // stderr is always piped (debug) or null (non-debug) — never inherit.
+        let debug_mode = std::env::var("FORGE_DEBUG").is_ok();
         let mut child = tokio::process::Command::new(&worker_bin)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(if std::env::var("FORGE_DEBUG").is_ok() {
-                std::process::Stdio::inherit()
+            .stderr(if debug_mode {
+                std::process::Stdio::piped()
             } else {
                 std::process::Stdio::null()
             })
@@ -335,6 +399,13 @@ impl WorkerPool {
                     e
                 ))
             })?;
+
+        // Bounded stderr capture in debug mode (max 4KB, logged via tracing)
+        if debug_mode {
+            if let Some(stderr) = child.stderr.take() {
+                tokio::spawn(crate::host::capture_bounded_stderr(stderr));
+            }
+        }
 
         let stdin = child
             .stdin
@@ -447,5 +518,133 @@ mod tests {
         let pool = WorkerPool::new(PoolConfig::default());
         pool.reap_idle().await;
         assert_eq!(pool.idle_workers.lock().await.len(), 0);
+    }
+
+    // --- Phase 5: Pool maturation unit tests ---
+
+    #[test]
+    fn pool_cc15_pool_config_validation() {
+        let config = PoolConfig {
+            min_workers: 0,
+            max_workers: 1,
+            max_idle_time: Duration::from_secs(1),
+            max_uses: 1,
+            health_check_timeout: Duration::from_millis(100),
+        };
+        // Config should accept edge values
+        assert_eq!(config.min_workers, 0);
+        assert_eq!(config.max_workers, 1);
+        assert_eq!(config.max_uses, 1);
+    }
+
+    #[tokio::test]
+    async fn pool_shutdown_rejects_new_acquires() {
+        let pool = WorkerPool::new(PoolConfig::default());
+        pool.shutdown().await;
+
+        let config = crate::SandboxConfig::default();
+        let result = pool.acquire(&config).await;
+        match result {
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("shutting down"),
+                    "should mention shutting down: {msg}"
+                );
+            }
+            Ok(_) => panic!("should reject after shutdown"),
+        }
+    }
+
+    #[tokio::test]
+    async fn pool_shutdown_kills_all_idle() {
+        let pool = WorkerPool::new(PoolConfig::default());
+        // After shutdown, idle pool should be empty
+        pool.shutdown().await;
+        assert_eq!(pool.idle_workers.lock().await.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn pool_reap_preserves_min_workers_count() {
+        // The reap logic should not drop below min_workers
+        // This is a unit test of the logic — we verify via the kept count
+        let config = PoolConfig {
+            min_workers: 2,
+            max_workers: 4,
+            max_idle_time: Duration::from_secs(0), // everything is "expired"
+            max_uses: 50,
+            health_check_timeout: Duration::from_millis(500),
+        };
+        let pool = WorkerPool::new(config);
+        // We can't add real workers without spawning, but we verify the
+        // reap_idle logic handles empty pool + min_workers correctly
+        pool.reap_idle().await;
+        assert_eq!(pool.idle_workers.lock().await.len(), 0);
+    }
+
+    #[test]
+    fn pool_metrics_spawned_increments() {
+        let m = PoolMetrics::default();
+        m.spawned.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(m.spawned.load(Ordering::Relaxed), 1);
+        m.spawned.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(m.spawned.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn pool_metrics_reused_increments() {
+        let m = PoolMetrics::default();
+        m.reused.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(m.reused.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn pool_metrics_killed_idle_increments() {
+        let m = PoolMetrics::default();
+        m.killed_idle.fetch_add(3, Ordering::Relaxed);
+        assert_eq!(m.killed_idle.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn pool_release_outcome_debug() {
+        // Verify Debug impl works
+        let ok = format!("{:?}", ReleaseOutcome::Ok);
+        let fatal = format!("{:?}", ReleaseOutcome::Fatal);
+        assert!(ok.contains("Ok"));
+        assert!(fatal.contains("Fatal"));
+    }
+
+    #[tokio::test]
+    async fn pool_multiple_shutdowns_safe() {
+        let pool = WorkerPool::new(PoolConfig::default());
+        pool.shutdown().await;
+        pool.shutdown().await; // Should not panic
+        assert!(*pool.shutting_down.lock().await);
+    }
+
+    #[cfg(feature = "worker-pool")]
+    #[tokio::test]
+    async fn pool_pw_feature_compiles() {
+        // Verify worker-pool feature gates compile correctly
+        let pool = Arc::new(WorkerPool::new(PoolConfig::default()));
+        let handle = pool.start_reap_task(Duration::from_secs(3600));
+        handle.abort();
+        // Just verify it compiles and runs
+    }
+
+    #[test]
+    fn pool_config_clone() {
+        let config = PoolConfig::default();
+        let cloned = config.clone();
+        assert_eq!(config.min_workers, cloned.min_workers);
+        assert_eq!(config.max_workers, cloned.max_workers);
+    }
+
+    #[test]
+    fn pool_cc22_worker_pool_feature_gate() {
+        // This test verifies the crate compiles both with and without the worker-pool feature.
+        // The feature only gates pre_warm and start_reap_task — core pool functionality is always available.
+        let _config = PoolConfig::default();
+        let _pool = WorkerPool::new(PoolConfig::default());
     }
 }

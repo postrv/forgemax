@@ -1055,4 +1055,58 @@ mod tests {
             "Parse a source file into an AST"
         );
     }
+
+    // --- Phase 8: build.rs .d.ts validation tests ---
+
+    #[test]
+    fn build_dts_01_forge_dts_contains_forge_interface() {
+        let dts = include_str!("forge.d.ts");
+        assert!(
+            dts.contains("interface Forge"),
+            "forge.d.ts must contain 'interface Forge'"
+        );
+    }
+
+    #[test]
+    fn build_dts_02_forge_dts_contains_stash_types() {
+        let dts = include_str!("forge.d.ts");
+        assert!(
+            dts.contains("interface ForgeStash"),
+            "forge.d.ts must contain 'interface ForgeStash'"
+        );
+        assert!(
+            dts.contains("interface StashPutOptions"),
+            "forge.d.ts must contain 'interface StashPutOptions'"
+        );
+    }
+
+    #[test]
+    fn build_dts_03_upgrade_md_exists() {
+        let upgrade_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("UPGRADE.md");
+        assert!(
+            upgrade_path.exists(),
+            "UPGRADE.md must exist at workspace root: {:?}",
+            upgrade_path
+        );
+    }
+
+    #[test]
+    fn build_dts_04_upgrade_md_mentions_dispatch_error() {
+        let upgrade_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("UPGRADE.md");
+        let content = std::fs::read_to_string(&upgrade_path).expect("read UPGRADE.md");
+        assert!(
+            content.contains("DispatchError"),
+            "UPGRADE.md must mention DispatchError migration"
+        );
+    }
 }

@@ -97,6 +97,7 @@ impl Default for RouterResourceDispatcher {
 
 #[async_trait::async_trait]
 impl ResourceDispatcher for RouterResourceDispatcher {
+    #[tracing::instrument(skip(self), fields(server, uri))]
     async fn read_resource(&self, server: &str, uri: &str) -> Result<Value, DispatchError> {
         let client = self
             .clients

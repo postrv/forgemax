@@ -31,6 +31,7 @@ impl TimeoutDispatcher {
 
 #[async_trait::async_trait]
 impl ToolDispatcher for TimeoutDispatcher {
+    #[tracing::instrument(skip(self, args), fields(server, tool))]
     async fn call_tool(
         &self,
         server: &str,
@@ -71,6 +72,7 @@ impl TimeoutResourceDispatcher {
 
 #[async_trait::async_trait]
 impl ResourceDispatcher for TimeoutResourceDispatcher {
+    #[tracing::instrument(skip(self), fields(server, uri))]
     async fn read_resource(
         &self,
         server: &str,

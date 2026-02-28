@@ -60,6 +60,9 @@ strsim = "0.11"
 # Lock-free data structures
 arc-swap = "1"
 
+# File watching
+notify = "7"
+
 # Security / audit
 sha2 = "0.10"
 uuid = { version = "1", features = ["v4"] }

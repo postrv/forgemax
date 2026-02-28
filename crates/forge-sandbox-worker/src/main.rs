@@ -132,7 +132,7 @@ impl StashDispatcher for IpcStashBridge {
         key: &str,
         value: serde_json::Value,
         ttl_secs: Option<u32>,
-        _current_group: Option<String>,
+        current_group: Option<String>,
     ) -> Result<serde_json::Value, forge_error::DispatchError> {
         let request_id = self.next_id.fetch_add(1, Ordering::SeqCst);
 
@@ -147,6 +147,7 @@ impl StashDispatcher for IpcStashBridge {
                 key: key.to_string(),
                 value,
                 ttl_secs,
+                group: current_group,
             })
             .map_err(|_| anyhow::anyhow!("IPC send channel closed"))?;
 
@@ -160,7 +161,7 @@ impl StashDispatcher for IpcStashBridge {
     async fn get(
         &self,
         key: &str,
-        _current_group: Option<String>,
+        current_group: Option<String>,
     ) -> Result<serde_json::Value, forge_error::DispatchError> {
         let request_id = self.next_id.fetch_add(1, Ordering::SeqCst);
 
@@ -173,6 +174,7 @@ impl StashDispatcher for IpcStashBridge {
             .send(ChildMessage::StashGet {
                 request_id,
                 key: key.to_string(),
+                group: current_group,
             })
             .map_err(|_| anyhow::anyhow!("IPC send channel closed"))?;
 
@@ -186,7 +188,7 @@ impl StashDispatcher for IpcStashBridge {
     async fn delete(
         &self,
         key: &str,
-        _current_group: Option<String>,
+        current_group: Option<String>,
     ) -> Result<serde_json::Value, forge_error::DispatchError> {
         let request_id = self.next_id.fetch_add(1, Ordering::SeqCst);
 
@@ -199,6 +201,7 @@ impl StashDispatcher for IpcStashBridge {
             .send(ChildMessage::StashDelete {
                 request_id,
                 key: key.to_string(),
+                group: current_group,
             })
             .map_err(|_| anyhow::anyhow!("IPC send channel closed"))?;
 
@@ -211,7 +214,7 @@ impl StashDispatcher for IpcStashBridge {
 
     async fn keys(
         &self,
-        _current_group: Option<String>,
+        current_group: Option<String>,
     ) -> Result<serde_json::Value, forge_error::DispatchError> {
         let request_id = self.next_id.fetch_add(1, Ordering::SeqCst);
 
@@ -221,7 +224,10 @@ impl StashDispatcher for IpcStashBridge {
             .map_err(|_| anyhow::anyhow!("IPC waiter channel closed"))?;
 
         self.tx
-            .send(ChildMessage::StashKeys { request_id })
+            .send(ChildMessage::StashKeys {
+                request_id,
+                group: current_group,
+            })
             .map_err(|_| anyhow::anyhow!("IPC send channel closed"))?;
 
         let result = resp_rx
@@ -341,6 +347,7 @@ async fn run_single_execution(
                 let _ = exec_tx.send(ChildMessage::ExecutionComplete {
                     result: Err(format!("failed to create tokio runtime: {}", e)),
                     error_kind: Some(ErrorKind::Execution),
+                    timeout_ms: None,
                 });
                 return;
             }
@@ -358,17 +365,19 @@ async fn run_single_execution(
             Ok(value) => ChildMessage::ExecutionComplete {
                 result: Ok(value),
                 error_kind: None,
+                timeout_ms: None,
             },
             Err(ref e) => {
-                let kind = match e {
-                    SandboxError::Timeout { .. } => ErrorKind::Timeout,
-                    SandboxError::HeapLimitExceeded => ErrorKind::HeapLimit,
-                    SandboxError::JsError { .. } => ErrorKind::JsError,
-                    _ => ErrorKind::Execution,
+                let (kind, structured_timeout_ms) = match e {
+                    SandboxError::Timeout { timeout_ms } => (ErrorKind::Timeout, Some(*timeout_ms)),
+                    SandboxError::HeapLimitExceeded => (ErrorKind::HeapLimit, None),
+                    SandboxError::JsError { .. } => (ErrorKind::JsError, None),
+                    _ => (ErrorKind::Execution, None),
                 };
                 ChildMessage::ExecutionComplete {
                     result: Err(e.to_string()),
                     error_kind: Some(kind),
+                    timeout_ms: structured_timeout_ms,
                 }
             }
         };
@@ -404,6 +413,7 @@ async fn run_single_execution(
                             let msg = ChildMessage::ExecutionComplete {
                                 result: Err("worker thread exited unexpectedly".into()),
                                 error_kind: Some(ErrorKind::Execution),
+                                timeout_ms: None,
                             };
                             write_message(stdout, &msg).await.ok();
                         }

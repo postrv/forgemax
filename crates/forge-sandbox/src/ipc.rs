@@ -4,6 +4,7 @@
 //! All messages are typed via [`ParentMessage`] and [`ChildMessage`] enums.
 
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 use serde_json::Value;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -107,6 +108,9 @@ pub enum ChildMessage {
         value: Value,
         /// TTL in seconds (None = use default).
         ttl_secs: Option<u32>,
+        /// Stash group for isolation (v0.3.1+). Absent in v0.3.0 workers → None.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        group: Option<String>,
     },
     /// Request the parent to get a value from the stash.
     StashGet {
@@ -114,6 +118,9 @@ pub enum ChildMessage {
         request_id: u64,
         /// Stash key.
         key: String,
+        /// Stash group for isolation (v0.3.1+). Absent in v0.3.0 workers → None.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        group: Option<String>,
     },
     /// Request the parent to delete a value from the stash.
     StashDelete {
@@ -121,11 +128,17 @@ pub enum ChildMessage {
         request_id: u64,
         /// Stash key.
         key: String,
+        /// Stash group for isolation (v0.3.1+). Absent in v0.3.0 workers → None.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        group: Option<String>,
     },
     /// Request the parent to list stash keys.
     StashKeys {
         /// Unique ID for correlating request ↔ response.
         request_id: u64,
+        /// Stash group for isolation (v0.3.1+). Absent in v0.3.0 workers → None.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        group: Option<String>,
     },
     /// Worker has been reset and is ready for a new execution.
     ResetComplete,
@@ -138,6 +151,11 @@ pub enum ChildMessage {
         /// (backward compatibility with workers that don't send this field).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error_kind: Option<ErrorKind>,
+        /// Structured timeout value in milliseconds (v0.3.1+).
+        /// Present only when `error_kind` is `Timeout`. Replaces fragile string parsing.
+        /// Absent in v0.3.0 workers → None.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_ms: Option<u64>,
     },
     /// A log message from the worker.
     Log {
@@ -242,6 +260,65 @@ pub async fn write_message<T: Serialize, W: AsyncWrite + Unpin>(
     writer.write_all(&payload).await?;
     writer.flush().await?;
     Ok(())
+}
+
+/// Write a raw JSON byte payload as a length-delimited IPC message.
+///
+/// This bypasses serialization entirely — useful for forwarding large
+/// tool/resource results without deserializing and re-serializing.
+pub async fn write_raw_message<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    payload: &[u8],
+) -> Result<(), std::io::Error> {
+    let len = u32::try_from(payload.len()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "raw IPC payload too large: {} bytes (max {} bytes)",
+                payload.len(),
+                u32::MAX
+            ),
+        )
+    })?;
+    writer.write_all(&len.to_be_bytes()).await?;
+    writer.write_all(payload).await?;
+    writer.flush().await?;
+    Ok(())
+}
+
+/// Read a raw JSON byte payload from an IPC message without deserializing.
+///
+/// Returns the raw bytes as an owned `Box<RawValue>` which can be forwarded
+/// without parsing. Returns `None` on EOF.
+pub async fn read_raw_message<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    max_size: usize,
+) -> Result<Option<Box<RawValue>>, std::io::Error> {
+    let mut len_buf = [0u8; 4];
+    match reader.read_exact(&mut len_buf).await {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e),
+    }
+
+    let len = u32::from_be_bytes(len_buf) as usize;
+
+    if len > max_size {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "raw IPC message too large: {} bytes (limit: {} bytes)",
+                len, max_size
+            ),
+        ));
+    }
+
+    let mut payload = vec![0u8; len];
+    reader.read_exact(&mut payload).await?;
+
+    let raw: Box<RawValue> = serde_json::from_slice(&payload)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    Ok(Some(raw))
 }
 
 /// Default maximum IPC message size: 8 MB.
@@ -419,6 +496,7 @@ mod tests {
         let msg = ChildMessage::ExecutionComplete {
             result: Ok(serde_json::json!([1, 2, 3])),
             error_kind: None,
+            timeout_ms: None,
         };
 
         let mut buf = Vec::new();
@@ -428,7 +506,9 @@ mod tests {
         let decoded: ChildMessage = read_message(&mut cursor).await.unwrap().unwrap();
 
         match decoded {
-            ChildMessage::ExecutionComplete { result, error_kind } => {
+            ChildMessage::ExecutionComplete {
+                result, error_kind, ..
+            } => {
                 assert_eq!(result.unwrap(), serde_json::json!([1, 2, 3]));
                 assert_eq!(error_kind, None);
             }
@@ -470,6 +550,7 @@ mod tests {
         let msg3 = ChildMessage::ExecutionComplete {
             result: Ok(serde_json::json!("done")),
             error_kind: None,
+            timeout_ms: None,
         };
 
         let mut buf = Vec::new();
@@ -496,6 +577,7 @@ mod tests {
         let msg = ChildMessage::ExecutionComplete {
             result: Err("failed to create tokio runtime: resource unavailable".into()),
             error_kind: Some(ErrorKind::Execution),
+            timeout_ms: None,
         };
 
         let mut buf = Vec::new();
@@ -505,7 +587,9 @@ mod tests {
         let decoded: ChildMessage = read_message(&mut cursor).await.unwrap().unwrap();
 
         match decoded {
-            ChildMessage::ExecutionComplete { result, error_kind } => {
+            ChildMessage::ExecutionComplete {
+                result, error_kind, ..
+            } => {
                 let err = result.unwrap_err();
                 assert!(
                     err.contains("tokio runtime"),
@@ -549,6 +633,7 @@ mod tests {
         let msg = ChildMessage::ExecutionComplete {
             result: Ok(serde_json::json!(large_data)),
             error_kind: None,
+            timeout_ms: None,
         };
 
         let mut buf = Vec::new();
@@ -709,6 +794,7 @@ mod tests {
             key: "my-key".into(),
             value: serde_json::json!({"data": 42}),
             ttl_secs: Some(60),
+            group: None,
         };
 
         let mut buf = Vec::new();
@@ -723,11 +809,13 @@ mod tests {
                 key,
                 value,
                 ttl_secs,
+                group,
             } => {
                 assert_eq!(request_id, 20);
                 assert_eq!(key, "my-key");
                 assert_eq!(value["data"], 42);
                 assert_eq!(ttl_secs, Some(60));
+                assert_eq!(group, None);
             }
             other => panic!("expected StashPut, got: {:?}", other),
         }
@@ -739,6 +827,7 @@ mod tests {
         let msg = ChildMessage::StashGet {
             request_id: 21,
             key: "lookup-key".into(),
+            group: None,
         };
 
         let mut buf = Vec::new();
@@ -748,9 +837,14 @@ mod tests {
         let decoded: ChildMessage = read_message(&mut cursor).await.unwrap().unwrap();
 
         match decoded {
-            ChildMessage::StashGet { request_id, key } => {
+            ChildMessage::StashGet {
+                request_id,
+                key,
+                group,
+            } => {
                 assert_eq!(request_id, 21);
                 assert_eq!(key, "lookup-key");
+                assert_eq!(group, None);
             }
             other => panic!("expected StashGet, got: {:?}", other),
         }
@@ -762,6 +856,7 @@ mod tests {
         let msg = ChildMessage::StashDelete {
             request_id: 22,
             key: "delete-me".into(),
+            group: None,
         };
 
         let mut buf = Vec::new();
@@ -771,9 +866,14 @@ mod tests {
         let decoded: ChildMessage = read_message(&mut cursor).await.unwrap().unwrap();
 
         match decoded {
-            ChildMessage::StashDelete { request_id, key } => {
+            ChildMessage::StashDelete {
+                request_id,
+                key,
+                group,
+            } => {
                 assert_eq!(request_id, 22);
                 assert_eq!(key, "delete-me");
+                assert_eq!(group, None);
             }
             other => panic!("expected StashDelete, got: {:?}", other),
         }
@@ -782,7 +882,10 @@ mod tests {
     // --- IPC-07: StashKeys round-trip ---
     #[tokio::test]
     async fn ipc_07_stash_keys_roundtrip() {
-        let msg = ChildMessage::StashKeys { request_id: 23 };
+        let msg = ChildMessage::StashKeys {
+            request_id: 23,
+            group: None,
+        };
 
         let mut buf = Vec::new();
         write_message(&mut buf, &msg).await.unwrap();
@@ -791,8 +894,9 @@ mod tests {
         let decoded: ChildMessage = read_message(&mut cursor).await.unwrap().unwrap();
 
         match decoded {
-            ChildMessage::StashKeys { request_id } => {
+            ChildMessage::StashKeys { request_id, group } => {
                 assert_eq!(request_id, 23);
+                assert_eq!(group, None);
             }
             other => panic!("expected StashKeys, got: {:?}", other),
         }
@@ -840,14 +944,17 @@ mod tests {
             key: "k".into(),
             value: serde_json::json!("v"),
             ttl_secs: None,
+            group: None,
         };
         let msg4 = ChildMessage::StashGet {
             request_id: 4,
             key: "k".into(),
+            group: None,
         };
         let msg5 = ChildMessage::ExecutionComplete {
             result: Ok(serde_json::json!("done")),
             error_kind: None,
+            timeout_ms: None,
         };
 
         let mut buf = Vec::new();
@@ -973,6 +1080,7 @@ mod tests {
             key: "k".into(),
             value: serde_json::json!("x".repeat(2048)),
             ttl_secs: Some(60),
+            group: None,
         };
         let mut buf = Vec::new();
         write_message(&mut buf, &msg).await.unwrap();
@@ -995,6 +1103,7 @@ mod tests {
         let msg = ChildMessage::ExecutionComplete {
             result: Err("execution timed out after 500ms".into()),
             error_kind: Some(ErrorKind::Timeout),
+            timeout_ms: Some(500),
         };
 
         let mut buf = Vec::new();
@@ -1004,9 +1113,14 @@ mod tests {
         let decoded: ChildMessage = read_message(&mut cursor).await.unwrap().unwrap();
 
         match decoded {
-            ChildMessage::ExecutionComplete { result, error_kind } => {
+            ChildMessage::ExecutionComplete {
+                result,
+                error_kind,
+                timeout_ms,
+            } => {
                 assert!(result.is_err());
                 assert_eq!(error_kind, Some(ErrorKind::Timeout));
+                assert_eq!(timeout_ms, Some(500));
             }
             other => panic!("expected ExecutionComplete, got: {:?}", other),
         }
@@ -1018,6 +1132,7 @@ mod tests {
         let msg = ChildMessage::ExecutionComplete {
             result: Err("V8 heap limit exceeded".into()),
             error_kind: Some(ErrorKind::HeapLimit),
+            timeout_ms: None,
         };
 
         let mut buf = Vec::new();
@@ -1027,7 +1142,9 @@ mod tests {
         let decoded: ChildMessage = read_message(&mut cursor).await.unwrap().unwrap();
 
         match decoded {
-            ChildMessage::ExecutionComplete { result, error_kind } => {
+            ChildMessage::ExecutionComplete {
+                result, error_kind, ..
+            } => {
                 assert!(result.is_err());
                 assert_eq!(error_kind, Some(ErrorKind::HeapLimit));
             }
@@ -1051,11 +1168,19 @@ mod tests {
         let decoded: ChildMessage = read_message(&mut cursor).await.unwrap().unwrap();
 
         match decoded {
-            ChildMessage::ExecutionComplete { result, error_kind } => {
+            ChildMessage::ExecutionComplete {
+                result,
+                error_kind,
+                timeout_ms,
+            } => {
                 assert!(result.is_err());
                 assert_eq!(
                     error_kind, None,
                     "missing error_kind should default to None"
+                );
+                assert_eq!(
+                    timeout_ms, None,
+                    "missing timeout_ms should default to None"
                 );
             }
             other => panic!("expected ExecutionComplete, got: {:?}", other),
@@ -1068,6 +1193,7 @@ mod tests {
         let msg = ChildMessage::ExecutionComplete {
             result: Err("ReferenceError: x is not defined".into()),
             error_kind: Some(ErrorKind::JsError),
+            timeout_ms: None,
         };
 
         let mut buf = Vec::new();
@@ -1077,7 +1203,9 @@ mod tests {
         let decoded: ChildMessage = read_message(&mut cursor).await.unwrap().unwrap();
 
         match decoded {
-            ChildMessage::ExecutionComplete { result, error_kind } => {
+            ChildMessage::ExecutionComplete {
+                result, error_kind, ..
+            } => {
                 assert_eq!(result.unwrap_err(), "ReferenceError: x is not defined");
                 assert_eq!(error_kind, Some(ErrorKind::JsError));
             }
@@ -1091,6 +1219,7 @@ mod tests {
         let msg = ChildMessage::ExecutionComplete {
             result: Ok(serde_json::json!(42)),
             error_kind: None,
+            timeout_ms: None,
         };
 
         let json = serde_json::to_string(&msg).unwrap();
@@ -1099,5 +1228,442 @@ mod tests {
             !json.contains("error_kind"),
             "success messages should not contain error_kind field: {json}"
         );
+        assert!(
+            !json.contains("timeout_ms"),
+            "success messages should not contain timeout_ms field: {json}"
+        );
+    }
+
+    // --- H1: Stash Group Isolation Tests ---
+
+    #[tokio::test]
+    async fn ipc_h1_01_stash_put_with_group_roundtrip() {
+        let msg = ChildMessage::StashPut {
+            request_id: 50,
+            key: "grouped-key".into(),
+            value: serde_json::json!({"data": "secret"}),
+            ttl_secs: Some(120),
+            group: Some("analytics".into()),
+        };
+
+        let mut buf = Vec::new();
+        write_message(&mut buf, &msg).await.unwrap();
+
+        let mut cursor = Cursor::new(buf);
+        let decoded: ChildMessage = read_message(&mut cursor).await.unwrap().unwrap();
+
+        match decoded {
+            ChildMessage::StashPut {
+                request_id,
+                key,
+                group,
+                ..
+            } => {
+                assert_eq!(request_id, 50);
+                assert_eq!(key, "grouped-key");
+                assert_eq!(group, Some("analytics".into()));
+            }
+            other => panic!("expected StashPut, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn ipc_h1_02_stash_get_with_group_roundtrip() {
+        let msg = ChildMessage::StashGet {
+            request_id: 51,
+            key: "grouped-key".into(),
+            group: Some("analytics".into()),
+        };
+
+        let mut buf = Vec::new();
+        write_message(&mut buf, &msg).await.unwrap();
+
+        let mut cursor = Cursor::new(buf);
+        let decoded: ChildMessage = read_message(&mut cursor).await.unwrap().unwrap();
+
+        match decoded {
+            ChildMessage::StashGet {
+                request_id,
+                key,
+                group,
+            } => {
+                assert_eq!(request_id, 51);
+                assert_eq!(key, "grouped-key");
+                assert_eq!(group, Some("analytics".into()));
+            }
+            other => panic!("expected StashGet, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn ipc_h1_03_stash_delete_with_group_roundtrip() {
+        let msg = ChildMessage::StashDelete {
+            request_id: 52,
+            key: "grouped-key".into(),
+            group: Some("analytics".into()),
+        };
+
+        let mut buf = Vec::new();
+        write_message(&mut buf, &msg).await.unwrap();
+
+        let mut cursor = Cursor::new(buf);
+        let decoded: ChildMessage = read_message(&mut cursor).await.unwrap().unwrap();
+
+        match decoded {
+            ChildMessage::StashDelete {
+                request_id,
+                key,
+                group,
+            } => {
+                assert_eq!(request_id, 52);
+                assert_eq!(key, "grouped-key");
+                assert_eq!(group, Some("analytics".into()));
+            }
+            other => panic!("expected StashDelete, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn ipc_h1_04_stash_keys_with_group_roundtrip() {
+        let msg = ChildMessage::StashKeys {
+            request_id: 53,
+            group: Some("analytics".into()),
+        };
+
+        let mut buf = Vec::new();
+        write_message(&mut buf, &msg).await.unwrap();
+
+        let mut cursor = Cursor::new(buf);
+        let decoded: ChildMessage = read_message(&mut cursor).await.unwrap().unwrap();
+
+        match decoded {
+            ChildMessage::StashKeys { request_id, group } => {
+                assert_eq!(request_id, 53);
+                assert_eq!(group, Some("analytics".into()));
+            }
+            other => panic!("expected StashKeys, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn ipc_h1_05_stash_put_without_group_backward_compat() {
+        // group: None → field absent in JSON
+        let msg = ChildMessage::StashPut {
+            request_id: 54,
+            key: "no-group-key".into(),
+            value: serde_json::json!("val"),
+            ttl_secs: None,
+            group: None,
+        };
+
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(
+            !json.contains("\"group\""),
+            "group:None should be absent in serialized JSON: {json}"
+        );
+
+        // Still deserializes correctly
+        let mut buf = Vec::new();
+        write_message(&mut buf, &msg).await.unwrap();
+        let mut cursor = Cursor::new(buf);
+        let decoded: ChildMessage = read_message(&mut cursor).await.unwrap().unwrap();
+        match decoded {
+            ChildMessage::StashPut { group, .. } => {
+                assert_eq!(group, None);
+            }
+            other => panic!("expected StashPut, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn ipc_h1_06_old_message_without_group_field_deserializes() {
+        // Simulate a v0.3.0 worker message that lacks the group field entirely
+        let json = r#"{"type":"StashPut","request_id":60,"key":"old-key","value":"old-val","ttl_secs":30}"#;
+        let mut buf = Vec::new();
+        let payload = json.as_bytes();
+        let len = payload.len() as u32;
+        buf.extend_from_slice(&len.to_be_bytes());
+        buf.extend_from_slice(payload);
+
+        let mut cursor = Cursor::new(buf);
+        let decoded: ChildMessage = read_message(&mut cursor).await.unwrap().unwrap();
+
+        match decoded {
+            ChildMessage::StashPut {
+                request_id,
+                key,
+                group,
+                ..
+            } => {
+                assert_eq!(request_id, 60);
+                assert_eq!(key, "old-key");
+                assert_eq!(
+                    group, None,
+                    "missing group field from v0.3.0 worker should deserialize as None"
+                );
+            }
+            other => panic!("expected StashPut, got: {:?}", other),
+        }
+
+        // Also test StashGet, StashDelete, StashKeys backward compat
+        let json_get = r#"{"type":"StashGet","request_id":61,"key":"old-key"}"#;
+        let mut buf = Vec::new();
+        let payload = json_get.as_bytes();
+        buf.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        buf.extend_from_slice(payload);
+        let mut cursor = Cursor::new(buf);
+        let decoded: ChildMessage = read_message(&mut cursor).await.unwrap().unwrap();
+        match decoded {
+            ChildMessage::StashGet { group, .. } => assert_eq!(group, None),
+            other => panic!("expected StashGet, got: {:?}", other),
+        }
+
+        let json_del = r#"{"type":"StashDelete","request_id":62,"key":"old-key"}"#;
+        let mut buf = Vec::new();
+        let payload = json_del.as_bytes();
+        buf.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        buf.extend_from_slice(payload);
+        let mut cursor = Cursor::new(buf);
+        let decoded: ChildMessage = read_message(&mut cursor).await.unwrap().unwrap();
+        match decoded {
+            ChildMessage::StashDelete { group, .. } => assert_eq!(group, None),
+            other => panic!("expected StashDelete, got: {:?}", other),
+        }
+
+        let json_keys = r#"{"type":"StashKeys","request_id":63}"#;
+        let mut buf = Vec::new();
+        let payload = json_keys.as_bytes();
+        buf.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        buf.extend_from_slice(payload);
+        let mut cursor = Cursor::new(buf);
+        let decoded: ChildMessage = read_message(&mut cursor).await.unwrap().unwrap();
+        match decoded {
+            ChildMessage::StashKeys { group, .. } => assert_eq!(group, None),
+            other => panic!("expected StashKeys, got: {:?}", other),
+        }
+    }
+
+    // --- Phase 2: Structured Timeout + RawValue Tests ---
+
+    #[tokio::test]
+    async fn ipc_t01_exec_complete_timeout_with_timeout_ms_roundtrip() {
+        let msg = ChildMessage::ExecutionComplete {
+            result: Err("execution timed out after 5000ms".into()),
+            error_kind: Some(ErrorKind::Timeout),
+            timeout_ms: Some(5000),
+        };
+
+        let mut buf = Vec::new();
+        write_message(&mut buf, &msg).await.unwrap();
+
+        let mut cursor = Cursor::new(buf);
+        let decoded: ChildMessage = read_message(&mut cursor).await.unwrap().unwrap();
+
+        match decoded {
+            ChildMessage::ExecutionComplete {
+                result,
+                error_kind,
+                timeout_ms,
+            } => {
+                assert!(result.is_err());
+                assert_eq!(error_kind, Some(ErrorKind::Timeout));
+                assert_eq!(timeout_ms, Some(5000));
+            }
+            other => panic!("expected ExecutionComplete, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn ipc_t02_timeout_ms_absent_backward_compat() {
+        // Simulate an old v0.3.0 worker that doesn't include timeout_ms
+        let json = r#"{"type":"ExecutionComplete","result":{"Err":"timed out after 3000ms"},"error_kind":"timeout"}"#;
+        let mut buf = Vec::new();
+        let payload = json.as_bytes();
+        buf.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        buf.extend_from_slice(payload);
+
+        let mut cursor = Cursor::new(buf);
+        let decoded: ChildMessage = read_message(&mut cursor).await.unwrap().unwrap();
+
+        match decoded {
+            ChildMessage::ExecutionComplete {
+                error_kind,
+                timeout_ms,
+                ..
+            } => {
+                assert_eq!(error_kind, Some(ErrorKind::Timeout));
+                assert_eq!(
+                    timeout_ms, None,
+                    "missing timeout_ms should default to None"
+                );
+            }
+            other => panic!("expected ExecutionComplete, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn ipc_t03_timeout_ms_serialization_omitted_when_none() {
+        let msg = ChildMessage::ExecutionComplete {
+            result: Err("some error".into()),
+            error_kind: Some(ErrorKind::JsError),
+            timeout_ms: None,
+        };
+
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(
+            !json.contains("timeout_ms"),
+            "timeout_ms:None should be omitted: {json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ipc_t04_timeout_ms_present_when_some() {
+        let msg = ChildMessage::ExecutionComplete {
+            result: Err("timed out".into()),
+            error_kind: Some(ErrorKind::Timeout),
+            timeout_ms: Some(10000),
+        };
+
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(
+            json.contains("\"timeout_ms\":10000"),
+            "timeout_ms should be present: {json}"
+        );
+    }
+
+    // --- RawValue passthrough tests ---
+
+    #[tokio::test]
+    async fn ipc_rv01_write_raw_message_roundtrip() {
+        let payload = br#"{"type":"StashResult","request_id":1,"result":{"Ok":{"data":42}}}"#;
+
+        let mut buf = Vec::new();
+        write_raw_message(&mut buf, payload).await.unwrap();
+
+        let mut cursor = Cursor::new(buf);
+        let raw = read_raw_message(&mut cursor, DEFAULT_MAX_IPC_MESSAGE_SIZE)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(raw.get(), std::str::from_utf8(payload).unwrap());
+    }
+
+    #[tokio::test]
+    async fn ipc_rv02_read_raw_message_preserves_bytes() {
+        // Write a regular message, then read it raw
+        let msg = ChildMessage::Log {
+            message: "test raw".into(),
+        };
+        let mut buf = Vec::new();
+        write_message(&mut buf, &msg).await.unwrap();
+
+        let mut cursor = Cursor::new(buf);
+        let raw = read_raw_message(&mut cursor, DEFAULT_MAX_IPC_MESSAGE_SIZE)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // The raw value should be valid JSON
+        let parsed: ChildMessage = serde_json::from_str(raw.get()).unwrap();
+        assert!(matches!(parsed, ChildMessage::Log { .. }));
+    }
+
+    #[tokio::test]
+    async fn ipc_rv03_raw_message_size_limit_enforced() {
+        let large_payload = format!(r#"{{"data":"{}"}}"#, "x".repeat(1024));
+        let mut buf = Vec::new();
+        write_raw_message(&mut buf, large_payload.as_bytes())
+            .await
+            .unwrap();
+
+        let mut cursor = Cursor::new(buf);
+        let result = read_raw_message(&mut cursor, 64).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("too large"), "error: {err}");
+    }
+
+    #[tokio::test]
+    async fn ipc_rv04_large_payload_stays_raw() {
+        // 1MB payload — read as raw without full Value parse
+        let large = format!(r#"{{"big":"{}"}}"#, "x".repeat(1_000_000));
+        let mut buf = Vec::new();
+        write_raw_message(&mut buf, large.as_bytes()).await.unwrap();
+
+        let mut cursor = Cursor::new(buf);
+        let raw = read_raw_message(&mut cursor, 2 * 1024 * 1024)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Should preserve the raw JSON string without parsing into Value
+        assert!(raw.get().len() > 1_000_000);
+        // Can still be parsed if needed
+        let val: Value = serde_json::from_str(raw.get()).unwrap();
+        assert_eq!(val["big"].as_str().unwrap().len(), 1_000_000);
+    }
+
+    #[tokio::test]
+    async fn ipc_rv05_rawvalue_backward_compat_with_value() {
+        // Write as regular message (Value), read as raw
+        let msg = ParentMessage::ToolCallResult {
+            request_id: 99,
+            result: Ok(serde_json::json!({"status": "ok", "count": 42})),
+        };
+        let mut buf = Vec::new();
+        write_message(&mut buf, &msg).await.unwrap();
+
+        let mut cursor = Cursor::new(buf.clone());
+        let raw = read_raw_message(&mut cursor, DEFAULT_MAX_IPC_MESSAGE_SIZE)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Parse the raw back as ParentMessage
+        let parsed: ParentMessage = serde_json::from_str(raw.get()).unwrap();
+        match parsed {
+            ParentMessage::ToolCallResult { request_id, result } => {
+                assert_eq!(request_id, 99);
+                assert!(result.is_ok());
+            }
+            other => panic!("expected ToolCallResult, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn ipc_rv06_raw_eof_returns_none() {
+        let mut cursor = Cursor::new(Vec::<u8>::new());
+        let result = read_raw_message(&mut cursor, DEFAULT_MAX_IPC_MESSAGE_SIZE)
+            .await
+            .unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn ipc_rv07_mixed_raw_and_value_messages() {
+        let mut buf = Vec::new();
+
+        // Write a typed message
+        let msg1 = ChildMessage::Log {
+            message: "first".into(),
+        };
+        write_message(&mut buf, &msg1).await.unwrap();
+
+        // Write a raw message
+        let raw_payload = br#"{"type":"Log","message":"raw second"}"#;
+        write_raw_message(&mut buf, raw_payload).await.unwrap();
+
+        // Read both: first typed, second raw
+        let mut cursor = Cursor::new(buf);
+        let d1: ChildMessage = read_message(&mut cursor).await.unwrap().unwrap();
+        assert!(matches!(d1, ChildMessage::Log { .. }));
+
+        let d2 = read_raw_message(&mut cursor, DEFAULT_MAX_IPC_MESSAGE_SIZE)
+            .await
+            .unwrap()
+            .unwrap();
+        let parsed: ChildMessage = serde_json::from_str(d2.get()).unwrap();
+        assert!(matches!(parsed, ChildMessage::Log { .. }));
     }
 }

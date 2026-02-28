@@ -106,13 +106,22 @@ pub fn validate_ast(code: &str) -> Result<(), AstViolation> {
         ));
     }
 
-    // 3. Walk AST
+    // 3. Walk AST (syntactic patterns)
     let mut walker = AstWalker { violations: vec![] };
     for stmt in &ret.program.body {
         walker.walk_statement(stmt);
         if !walker.violations.is_empty() {
             return Err(walker.violations.remove(0));
         }
+    }
+
+    // 4. Semantic alias detection: find variables initialized from dangerous identifiers
+    //    and check if they are later called. This catches patterns like:
+    //    `const e = eval; e("code")` and multi-hop `const a = eval; const b = a; b("code")`
+    let mut alias_checker = AliasChecker::new();
+    alias_checker.collect_aliases(&ret.program.body);
+    if let Some(violation) = alias_checker.check_alias_calls(&ret.program.body) {
+        return Err(violation);
     }
 
     Ok(())
@@ -867,6 +876,404 @@ impl AstWalker {
     }
 }
 
+/// Identifiers that are dangerous when called or used as constructors.
+const DANGEROUS_IDENTIFIERS: &[&str] = &[
+    "eval",
+    "Function",
+    "AsyncFunction",
+    "GeneratorFunction",
+    "Deno",
+    "Reflect",
+    "globalThis",
+    "WebAssembly",
+    "process",
+    "Proxy",
+];
+
+/// Semantic alias detection for sandbox escape prevention.
+///
+/// Detects patterns like `const e = eval; e("code")` by:
+/// 1. Collecting variable declarations initialized from dangerous identifiers
+/// 2. Multi-hop tracking: `const a = eval; const b = a;` → both `a` and `b` are dangerous
+/// 3. Checking call expressions for calls to dangerous aliases
+struct AliasChecker {
+    /// Set of variable names known to alias a dangerous identifier.
+    dangerous_aliases: std::collections::HashSet<String>,
+}
+
+impl AliasChecker {
+    fn new() -> Self {
+        Self {
+            dangerous_aliases: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Check if a name is a dangerous root identifier.
+    fn is_dangerous_root(name: &str) -> bool {
+        DANGEROUS_IDENTIFIERS.contains(&name)
+    }
+
+    /// Check if a name is dangerous (either a root or an alias).
+    fn is_dangerous(&self, name: &str) -> bool {
+        Self::is_dangerous_root(name) || self.dangerous_aliases.contains(name)
+    }
+
+    /// First pass: collect all variable aliases to dangerous identifiers.
+    /// Runs multiple passes to resolve multi-hop chains (const a = eval; const b = a;).
+    fn collect_aliases(&mut self, body: &[Statement<'_>]) {
+        // Run up to 10 passes to resolve multi-hop aliases
+        for _ in 0..10 {
+            let prev_count = self.dangerous_aliases.len();
+            self.collect_aliases_single_pass(body);
+            // Fixed point: no new aliases found
+            if self.dangerous_aliases.len() == prev_count {
+                break;
+            }
+        }
+    }
+
+    fn collect_aliases_single_pass(&mut self, body: &[Statement<'_>]) {
+        for stmt in body {
+            self.collect_from_statement(stmt);
+        }
+    }
+
+    fn collect_from_statement(&mut self, stmt: &Statement<'_>) {
+        match stmt {
+            Statement::VariableDeclaration(decl) => {
+                for declarator in &decl.declarations {
+                    self.check_declarator(declarator);
+                }
+            }
+            Statement::BlockStatement(block) => {
+                for s in &block.body {
+                    self.collect_from_statement(s);
+                }
+            }
+            Statement::IfStatement(ifs) => {
+                self.collect_from_statement(&ifs.consequent);
+                if let Some(alt) = &ifs.alternate {
+                    self.collect_from_statement(alt);
+                }
+            }
+            Statement::FunctionDeclaration(fd) => {
+                if let Some(body) = &fd.body {
+                    for s in &body.statements {
+                        self.collect_from_statement(s);
+                    }
+                }
+            }
+            Statement::ForStatement(fors) => {
+                if let Some(ForStatementInit::VariableDeclaration(decl)) = &fors.init {
+                    for declarator in &decl.declarations {
+                        self.check_declarator(declarator);
+                    }
+                }
+                self.collect_from_statement(&fors.body);
+            }
+            Statement::TryStatement(ts) => {
+                for s in &ts.block.body {
+                    self.collect_from_statement(s);
+                }
+                if let Some(handler) = &ts.handler {
+                    for s in &handler.body.body {
+                        self.collect_from_statement(s);
+                    }
+                }
+                if let Some(finalizer) = &ts.finalizer {
+                    for s in &finalizer.body {
+                        self.collect_from_statement(s);
+                    }
+                }
+            }
+            Statement::ExpressionStatement(es) => {
+                self.collect_from_expression(&es.expression);
+            }
+            _ => {}
+        }
+    }
+
+    fn collect_from_expression(&mut self, expr: &Expression<'_>) {
+        match expr {
+            Expression::ArrowFunctionExpression(arrow) => {
+                for s in &arrow.body.statements {
+                    self.collect_from_statement(s);
+                }
+            }
+            Expression::FunctionExpression(func) => {
+                if let Some(body) = &func.body {
+                    for s in &body.statements {
+                        self.collect_from_statement(s);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn check_declarator(&mut self, declarator: &VariableDeclarator<'_>) {
+        let Some(init) = &declarator.init else {
+            return;
+        };
+
+        // Pattern: const x = <dangerous_identifier>
+        if let Expression::Identifier(init_ident) = init {
+            let init_name = init_ident.name.as_str();
+            if self.is_dangerous(init_name) {
+                // Extract the binding name
+                if let Some(name) = Self::binding_name(&declarator.id) {
+                    self.dangerous_aliases.insert(name);
+                }
+            }
+        }
+
+        // Pattern: const { eval: e } = globalThis
+        if let Expression::Identifier(init_ident) = init {
+            if init_ident.name.as_str() == "globalThis" {
+                // Any destructuring from globalThis could extract dangerous names
+                if let BindingPattern::ObjectPattern(obj) = &declarator.id {
+                    for prop in &obj.properties {
+                        // Check if the property key is a dangerous name
+                        let key_name = match &prop.key {
+                            PropertyKey::StaticIdentifier(id) => Some(id.name.as_str()),
+                            PropertyKey::StringLiteral(s) => Some(s.value.as_str()),
+                            _ => None,
+                        };
+                        if let Some(key) = key_name {
+                            if Self::is_dangerous_root(key) {
+                                // The value binding gets the dangerous reference
+                                if let Some(name) = Self::binding_name(&prop.value) {
+                                    self.dangerous_aliases.insert(name);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Extract a simple binding name from a BindingPattern.
+    fn binding_name(pattern: &BindingPattern<'_>) -> Option<String> {
+        match pattern {
+            BindingPattern::BindingIdentifier(id) => Some(id.name.to_string()),
+            _ => None,
+        }
+    }
+
+    /// Second pass: check all call expressions for calls to dangerous aliases.
+    fn check_alias_calls(&self, body: &[Statement<'_>]) -> Option<AstViolation> {
+        for stmt in body {
+            if let Some(v) = self.check_alias_calls_in_statement(stmt) {
+                return Some(v);
+            }
+        }
+        None
+    }
+
+    fn check_alias_calls_in_statement(&self, stmt: &Statement<'_>) -> Option<AstViolation> {
+        match stmt {
+            Statement::ExpressionStatement(es) => self.check_alias_calls_in_expr(&es.expression),
+            Statement::VariableDeclaration(decl) => {
+                for declarator in &decl.declarations {
+                    if let Some(init) = &declarator.init {
+                        if let Some(v) = self.check_alias_calls_in_expr(init) {
+                            return Some(v);
+                        }
+                    }
+                }
+                None
+            }
+            Statement::BlockStatement(block) => {
+                for s in &block.body {
+                    if let Some(v) = self.check_alias_calls_in_statement(s) {
+                        return Some(v);
+                    }
+                }
+                None
+            }
+            Statement::ReturnStatement(ret) => {
+                if let Some(arg) = &ret.argument {
+                    return self.check_alias_calls_in_expr(arg);
+                }
+                None
+            }
+            Statement::IfStatement(ifs) => {
+                if let Some(v) = self.check_alias_calls_in_expr(&ifs.test) {
+                    return Some(v);
+                }
+                if let Some(v) = self.check_alias_calls_in_statement(&ifs.consequent) {
+                    return Some(v);
+                }
+                if let Some(alt) = &ifs.alternate {
+                    return self.check_alias_calls_in_statement(alt);
+                }
+                None
+            }
+            Statement::FunctionDeclaration(fd) => {
+                if let Some(body) = &fd.body {
+                    for s in &body.statements {
+                        if let Some(v) = self.check_alias_calls_in_statement(s) {
+                            return Some(v);
+                        }
+                    }
+                }
+                None
+            }
+            Statement::ForStatement(fors) => self.check_alias_calls_in_statement(&fors.body),
+            Statement::ForInStatement(fis) => self.check_alias_calls_in_statement(&fis.body),
+            Statement::ForOfStatement(fos) => self.check_alias_calls_in_statement(&fos.body),
+            Statement::WhileStatement(ws) => self.check_alias_calls_in_statement(&ws.body),
+            Statement::TryStatement(ts) => {
+                for s in &ts.block.body {
+                    if let Some(v) = self.check_alias_calls_in_statement(s) {
+                        return Some(v);
+                    }
+                }
+                if let Some(handler) = &ts.handler {
+                    for s in &handler.body.body {
+                        if let Some(v) = self.check_alias_calls_in_statement(s) {
+                            return Some(v);
+                        }
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn check_alias_calls_in_expr(&self, expr: &Expression<'_>) -> Option<AstViolation> {
+        match expr {
+            Expression::CallExpression(call) => {
+                // Check if callee is a dangerous alias
+                if let Expression::Identifier(ident) = &call.callee {
+                    let name = ident.name.as_str();
+                    if self.dangerous_aliases.contains(name) {
+                        return Some(AstViolation::BannedPattern {
+                            description: format!(
+                                "call to '{}' which is an alias of a dangerous identifier — \
+                                 aliasing sandbox-restricted identifiers and calling them is banned",
+                                name
+                            ),
+                        });
+                    }
+                }
+                // Check if callee is member access on a dangerous alias: alias.method()
+                if let Expression::StaticMemberExpression(member) = &call.callee {
+                    if let Expression::Identifier(obj) = &member.object {
+                        if self.dangerous_aliases.contains(obj.name.as_str()) {
+                            return Some(AstViolation::BannedPattern {
+                                description: format!(
+                                    "member call on '{}' which is an alias of a dangerous identifier — \
+                                     aliasing sandbox-restricted identifiers is banned",
+                                    obj.name.as_str()
+                                ),
+                            });
+                        }
+                    }
+                }
+                // Check arguments recursively
+                for arg in &call.arguments {
+                    if let Some(arg_expr) = arg.as_expression() {
+                        if let Some(v) = self.check_alias_calls_in_expr(arg_expr) {
+                            return Some(v);
+                        }
+                    }
+                }
+                // Check callee expression too
+                self.check_alias_calls_in_expr(&call.callee)
+            }
+            Expression::NewExpression(new_expr) => {
+                // Check: new aliasedProxy({}, handler)
+                if let Expression::Identifier(ident) = &new_expr.callee {
+                    let name = ident.name.as_str();
+                    if self.dangerous_aliases.contains(name) {
+                        return Some(AstViolation::BannedPattern {
+                            description: format!(
+                                "new '{}' which is an alias of a dangerous identifier — \
+                                 aliasing sandbox-restricted identifiers is banned",
+                                name
+                            ),
+                        });
+                    }
+                }
+                for arg in &new_expr.arguments {
+                    if let Some(arg_expr) = arg.as_expression() {
+                        if let Some(v) = self.check_alias_calls_in_expr(arg_expr) {
+                            return Some(v);
+                        }
+                    }
+                }
+                None
+            }
+            Expression::ArrowFunctionExpression(arrow) => {
+                for s in &arrow.body.statements {
+                    if let Some(v) = self.check_alias_calls_in_statement(s) {
+                        return Some(v);
+                    }
+                }
+                None
+            }
+            Expression::FunctionExpression(func) => {
+                if let Some(body) = &func.body {
+                    for s in &body.statements {
+                        if let Some(v) = self.check_alias_calls_in_statement(s) {
+                            return Some(v);
+                        }
+                    }
+                }
+                None
+            }
+            Expression::ConditionalExpression(cond) => {
+                if let Some(v) = self.check_alias_calls_in_expr(&cond.test) {
+                    return Some(v);
+                }
+                if let Some(v) = self.check_alias_calls_in_expr(&cond.consequent) {
+                    return Some(v);
+                }
+                self.check_alias_calls_in_expr(&cond.alternate)
+            }
+            Expression::SequenceExpression(seq) => {
+                for e in &seq.expressions {
+                    if let Some(v) = self.check_alias_calls_in_expr(e) {
+                        return Some(v);
+                    }
+                }
+                None
+            }
+            Expression::AssignmentExpression(assign) => {
+                self.check_alias_calls_in_expr(&assign.right)
+            }
+            Expression::BinaryExpression(bin) => {
+                if let Some(v) = self.check_alias_calls_in_expr(&bin.left) {
+                    return Some(v);
+                }
+                self.check_alias_calls_in_expr(&bin.right)
+            }
+            Expression::LogicalExpression(log) => {
+                if let Some(v) = self.check_alias_calls_in_expr(&log.left) {
+                    return Some(v);
+                }
+                self.check_alias_calls_in_expr(&log.right)
+            }
+            Expression::TemplateLiteral(tpl) => {
+                for e in &tpl.expressions {
+                    if let Some(v) = self.check_alias_calls_in_expr(e) {
+                        return Some(v);
+                    }
+                }
+                None
+            }
+            Expression::AwaitExpression(aw) => self.check_alias_calls_in_expr(&aw.argument),
+            Expression::ParenthesizedExpression(paren) => {
+                self.check_alias_calls_in_expr(&paren.expression)
+            }
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1178,5 +1585,119 @@ mod tests {
         let code = r#"async () => { const w = WebAssembly; }"#;
         let result = validate_ast(code);
         assert!(result.is_err(), "should detect WebAssembly reference");
+    }
+
+    // --- AST-12: Semantic alias detection tests ---
+
+    #[test]
+    fn ast12_01_detects_eval_alias() {
+        let code = r#"async () => { const e = eval; e('code'); }"#;
+        let result = validate_ast(code);
+        assert!(result.is_err(), "should detect eval alias call");
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("alias"), "error should mention alias: {msg}");
+    }
+
+    #[test]
+    fn ast12_02_detects_function_alias() {
+        let code = r#"async () => { const F = Function; F('return 1')(); }"#;
+        let result = validate_ast(code);
+        assert!(result.is_err(), "should detect Function alias call");
+    }
+
+    #[test]
+    fn ast12_03_detects_deno_alias_call() {
+        // Deno reference aliased then called via member access
+        let code = r#"async () => { const D = Deno; D.readFile('test'); }"#;
+        let result = validate_ast(code);
+        assert!(result.is_err(), "should detect Deno alias member call");
+    }
+
+    #[test]
+    fn ast12_04_detects_multi_hop_alias() {
+        let code = r#"async () => { const a = eval; const b = a; b('code'); }"#;
+        let result = validate_ast(code);
+        assert!(result.is_err(), "should detect multi-hop eval alias");
+    }
+
+    #[test]
+    fn ast12_05_detects_globalthis_alias_call() {
+        let code = r#"async () => { const g = globalThis; g.eval('code'); }"#;
+        let result = validate_ast(code);
+        assert!(
+            result.is_err(),
+            "should detect globalThis alias member call"
+        );
+    }
+
+    #[test]
+    fn ast12_06_detects_reflect_alias() {
+        // `const R = Reflect` is already caught by check_identifier,
+        // this confirms the alias path also works
+        let code = r#"async () => { const R = Reflect; }"#;
+        let result = validate_ast(code);
+        assert!(result.is_err(), "should detect Reflect reference");
+    }
+
+    #[test]
+    fn ast12_07_detects_destructured_eval() {
+        let code = r#"async () => { const { eval: e } = globalThis; e('code'); }"#;
+        let result = validate_ast(code);
+        assert!(
+            result.is_err(),
+            "should detect destructured eval from globalThis"
+        );
+    }
+
+    #[test]
+    fn ast12_08_no_false_positive_safe_string() {
+        let code = r#"async () => { const e = 'eval'; return e; }"#;
+        let result = validate_ast(code);
+        assert!(
+            result.is_ok(),
+            "string 'eval' should not trigger: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn ast12_09_no_false_positive_method_alias() {
+        let code = r#"async () => { const m = [].map; m(x => x); }"#;
+        let result = validate_ast(code);
+        assert!(
+            result.is_ok(),
+            "aliasing safe methods should not trigger: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn ast12_10_no_false_positive_parameter_shadow() {
+        // A function parameter named 'eval' is a legitimate shadow,
+        // not a reference to the global eval
+        let code = r#"async () => { function f(eval) { return eval; } return f(42); }"#;
+        let result = validate_ast(code);
+        assert!(
+            result.is_ok(),
+            "parameter shadow should not trigger: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn ast12_11_detects_proxy_alias() {
+        // `const P = Proxy` is already caught by check_identifier,
+        // verify the path works
+        let code = r#"async () => { const P = Proxy; }"#;
+        let result = validate_ast(code);
+        assert!(result.is_err(), "should detect Proxy alias");
+    }
+
+    #[test]
+    fn ast12_12_detects_webassembly_alias() {
+        // `const W = WebAssembly` is already caught by check_identifier
+        let code = r#"async () => { const W = WebAssembly; }"#;
+        let result = validate_ast(code);
+        assert!(result.is_err(), "should detect WebAssembly alias");
     }
 }
