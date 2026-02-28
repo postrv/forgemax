@@ -188,6 +188,13 @@ pub struct WorkerConfig {
     /// Maximum concurrent calls in forge.parallel().
     #[serde(default = "default_max_parallel")]
     pub max_parallel: usize,
+    /// Known tools for structured error fuzzy matching (v0.3.1+).
+    /// Each entry is `(server_name, tool_name)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub known_tools: Option<Vec<(String, String)>>,
+    /// Known server names for structured error detection (v0.3.1+).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub known_servers: Option<std::collections::HashSet<String>>,
 }
 
 fn default_max_ipc_message_size() -> usize {
@@ -214,6 +221,8 @@ impl From<&crate::SandboxConfig> for WorkerConfig {
             max_ipc_message_size: config.max_ipc_message_size,
             max_resource_size: config.max_resource_size,
             max_parallel: config.max_parallel,
+            known_tools: None,
+            known_servers: None,
         }
     }
 }
@@ -393,6 +402,8 @@ mod tests {
                 max_ipc_message_size: DEFAULT_MAX_IPC_MESSAGE_SIZE,
                 max_resource_size: 64 * 1024 * 1024,
                 max_parallel: 8,
+                known_tools: None,
+                known_servers: None,
             },
         };
 
@@ -996,6 +1007,8 @@ mod tests {
                 max_ipc_message_size: DEFAULT_MAX_IPC_MESSAGE_SIZE,
                 max_resource_size: 32 * 1024 * 1024,
                 max_parallel: 4,
+                known_tools: None,
+                known_servers: None,
             },
         };
 
@@ -1042,6 +1055,8 @@ mod tests {
                 max_ipc_message_size: DEFAULT_MAX_IPC_MESSAGE_SIZE,
                 max_resource_size: 64 * 1024 * 1024,
                 max_parallel: 8,
+                known_tools: None,
+                known_servers: None,
             },
         };
         let execute = ParentMessage::Execute {
@@ -1057,6 +1072,8 @@ mod tests {
                 max_ipc_message_size: DEFAULT_MAX_IPC_MESSAGE_SIZE,
                 max_resource_size: 64 * 1024 * 1024,
                 max_parallel: 8,
+                known_tools: None,
+                known_servers: None,
             },
         };
 

@@ -164,7 +164,7 @@ pub(crate) struct KnownTools(pub(crate) Vec<(String, String)>);
 /// - URIs longer than 2048 bytes
 /// - URIs containing null bytes
 /// - URIs containing control characters (U+0000..U+001F, U+007F)
-fn validate_resource_uri(uri: &str) -> Result<(), String> {
+pub(crate) fn validate_resource_uri(uri: &str) -> Result<(), String> {
     if uri.len() > 2048 {
         return Err(format!(
             "resource URI too long ({} bytes, max 2048 bytes)",

@@ -65,16 +65,20 @@ impl SandboxHost {
     /// 3. Routes tool call requests through the parent's dispatcher
     /// 4. Returns the execution result (or kills the child on timeout)
     ///
-    #[tracing::instrument(skip(code, config, dispatcher, resource_dispatcher, stash_dispatcher), fields(code_len = code.len()))]
+    #[tracing::instrument(skip(code, config, dispatcher, resource_dispatcher, stash_dispatcher, known_servers, known_tools), fields(code_len = code.len()))]
     pub async fn execute_in_child(
         code: &str,
         config: &crate::SandboxConfig,
         dispatcher: Arc<dyn ToolDispatcher>,
         resource_dispatcher: Option<Arc<dyn ResourceDispatcher>>,
         stash_dispatcher: Option<Arc<dyn StashDispatcher>>,
+        known_servers: Option<std::collections::HashSet<String>>,
+        known_tools: Option<Vec<(String, String)>>,
     ) -> Result<serde_json::Value, SandboxError> {
         let worker_bin = find_worker_binary()?;
-        let worker_config = WorkerConfig::from(config);
+        let mut worker_config = WorkerConfig::from(config);
+        worker_config.known_tools = known_tools;
+        worker_config.known_servers = known_servers;
         let timeout = config.timeout;
 
         // Spawn the worker with a clean environment.
@@ -248,12 +252,17 @@ where
                 server,
                 uri,
             }) => {
-                let result = match &resource_dispatcher {
-                    Some(rd) => rd
-                        .read_resource(&server, &uri)
-                        .await
-                        .map_err(|e| e.to_string()),
-                    None => Err("resource dispatcher not available".to_string()),
+                // Defense-in-depth: validate URI at host level too
+                let result = if let Err(e) = crate::ops::validate_resource_uri(&uri) {
+                    Err(e)
+                } else {
+                    match &resource_dispatcher {
+                        Some(rd) => rd
+                            .read_resource(&server, &uri)
+                            .await
+                            .map_err(|e| e.to_string()),
+                        None => Err("resource dispatcher not available".to_string()),
+                    }
                 };
 
                 let response = ParentMessage::ResourceReadResult { request_id, result };

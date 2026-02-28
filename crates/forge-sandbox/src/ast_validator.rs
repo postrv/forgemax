@@ -177,6 +177,9 @@ impl AstWalker {
                         "GeneratorFunction() constructor — dynamic code generation is banned in the sandbox",
                     ),
                     "Proxy" => self.report("Proxy() constructor is banned in the sandbox"),
+                    "require" => self.report(
+                        "require() is not available in the sandbox — use forge.callTool() to interact with external services",
+                    ),
                     _ => {}
                 }
             }
@@ -888,6 +891,7 @@ const DANGEROUS_IDENTIFIERS: &[&str] = &[
     "WebAssembly",
     "process",
     "Proxy",
+    "require",
 ];
 
 /// Semantic alias detection for sandbox escape prevention.
@@ -1699,5 +1703,24 @@ mod tests {
         let code = r#"async () => { const W = WebAssembly; }"#;
         let result = validate_ast(code);
         assert!(result.is_err(), "should detect WebAssembly alias");
+    }
+
+    #[test]
+    fn ast_detects_require_call() {
+        let code = r#"async () => { require('child_process'); }"#;
+        let result = validate_ast(code);
+        assert!(result.is_err(), "should detect require() call");
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, AstViolation::BannedPattern { .. }),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn ast_detects_require_alias() {
+        let code = r#"async () => { const r = require; r('fs'); }"#;
+        let result = validate_ast(code);
+        assert!(result.is_err(), "should detect require alias");
     }
 }

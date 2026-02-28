@@ -294,6 +294,8 @@ impl SandboxExecutor {
                                 auditing_dispatcher,
                                 auditing_resource_dispatcher,
                                 auditing_stash_dispatcher,
+                                known_servers,
+                                known_tools,
                             )
                             .await
                         }
@@ -306,6 +308,8 @@ impl SandboxExecutor {
                         auditing_dispatcher,
                         auditing_resource_dispatcher,
                         auditing_stash_dispatcher,
+                        known_servers,
+                        known_tools,
                     )
                     .await
                 }
@@ -671,9 +675,10 @@ fn build_execute_bootstrap(has_resource: bool, has_stash: bool, max_parallel: us
                                     return new Proxy({}, {
                                         get(_target2, tool) {
                                             return async (args) => {
+                                                const toolName = category === 'general' ? tool : `${category}.${tool}`;
                                                 return callTool(
                                                     name,
-                                                    `${category}.${tool}`,
+                                                    toolName,
                                                     args || {}
                                                 );
                                             };
@@ -701,20 +706,23 @@ fn build_execute_bootstrap(has_resource: bool, has_stash: bool, max_parallel: us
                             for (let i = 0; i < calls.length && !aborted; i += concurrency) {
                                 const batch = calls.slice(i, i + concurrency);
                                 await Promise.allSettled(
-                                    batch.map((fn, idx) => fn().then(
-                                        val => {
-                                            if (val && val.error === true && val.code) {
-                                                errors.push({ index: i + idx, error: val.message || val.code });
-                                            } else {
-                                                results[i + idx] = val;
+                                    batch.map((item, idx) => {
+                                        const fn_ = typeof item === 'function' ? item : item.fn;
+                                        return fn_().then(
+                                            val => {
+                                                if (val && val.error === true && val.code) {
+                                                    errors.push({ index: i + idx, error: val.message || val.code });
+                                                } else {
+                                                    results[i + idx] = val;
+                                                }
+                                                if (errors.length > 0 && failFast) aborted = true;
+                                            },
+                                            err => {
+                                                errors.push({ index: i + idx, error: err.message || String(err) });
+                                                if (failFast) aborted = true;
                                             }
-                                            if (errors.length > 0 && failFast) aborted = true;
-                                        },
-                                        err => {
-                                            errors.push({ index: i + idx, error: err.message || String(err) });
-                                            if (failFast) aborted = true;
-                                        }
-                                    ))
+                                        );
+                                    })
                                 );
                             }
 
@@ -1271,6 +1279,26 @@ mod tests {
             .unwrap();
         assert_eq!(result["server"], "narsil");
         assert_eq!(result["tool"], "ast.parse");
+        assert_eq!(result["status"], "ok");
+    }
+
+    #[tokio::test]
+    async fn forge_server_proxy_general_category_strips_prefix() {
+        let exec = executor();
+        let dispatcher: Arc<dyn ToolDispatcher> = Arc::new(TestDispatcher);
+
+        // Tools in the "general" category should NOT have "general." prepended
+        let code = r#"async () => {
+            const result = await forge.server("narsil").general.find_symbols({ pattern: "main" });
+            return result;
+        }"#;
+
+        let result = exec
+            .execute_code(code, dispatcher, None, None)
+            .await
+            .unwrap();
+        assert_eq!(result["server"], "narsil");
+        assert_eq!(result["tool"], "find_symbols");
         assert_eq!(result["status"], "ok");
     }
 

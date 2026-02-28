@@ -307,6 +307,8 @@ async fn run_single_execution(
 ) -> Result<()> {
     let sandbox_config = config.to_sandbox_config();
     let max_ipc_size = config.max_ipc_message_size;
+    let known_tools = config.known_tools;
+    let known_servers = config.known_servers;
 
     // Set up IPC channels
     let (tx, mut rx) = mpsc::unbounded_channel::<ChildMessage>();
@@ -353,12 +355,14 @@ async fn run_single_execution(
             }
         };
 
-        let result = rt.block_on(forge_sandbox::executor::run_execute(
+        let result = rt.block_on(forge_sandbox::executor::run_execute_with_known_servers(
             &sandbox_config,
             &code_owned,
             dispatcher,
             resource_dispatcher,
             stash_dispatcher,
+            known_servers,
+            known_tools,
         ));
 
         let child_result = match result {
