@@ -7,12 +7,12 @@ Instead of dumping every tool schema into the LLM's context window, Forgemax exp
 - **`search`** — query a capability manifest to discover tools (read-only, sandboxed)
 - **`execute`** — run JavaScript against the tool API in a sandboxed V8 isolate
 
-v0.2 adds three new capabilities inside the sandbox (the MCP surface stays at exactly 2 tools):
+Additional sandbox APIs (the MCP surface stays at exactly 2 tools):
 - **`forge.readResource(server, uri)`** — read MCP resources from downstream servers
 - **`forge.stash`** — session-scoped key-value store for sharing data across executions
 - **`forge.parallel(calls, opts)`** — bounded concurrent execution of tool/resource calls
 
-The LLM writes JavaScript that calls through typed proxy objects. Credentials, file paths, and internal state never leave the host — the sandbox only sees opaque bindings.
+The LLM writes JavaScript that calls through typed proxy objects. Credentials, file paths, and internal state never leave the host — the sandbox only sees opaque bindings. TypeScript definitions (`forge.d.ts`) are compiled into the binary and served in MCP server instructions, giving LLMs full type awareness.
 
 Forgemax's Code Mode approach draws inspiration from [Cloudflare's sandbox tool-calling pattern](https://blog.cloudflare.com/code-mode/) — their implementation of sandboxed code execution for MCP tool orchestration is excellent and well worth studying. We encourage supporting their work.
 
@@ -30,12 +30,14 @@ LLMs are trained on billions of lines of code. They're better at writing `narsil
 
 ```
 forgemax                 Binary entry point (stdio MCP transport)
-  forge-config           TOML config loading with env var expansion
-  forge-client           MCP client connections (stdio + HTTP/SSE)
+  forge-config           TOML config loading, env var expansion, file watching
+  forge-client           MCP client connections (stdio + HTTP/SSE), routing
   forge-server           MCP server handler (search + execute via rmcp)
-    forge-sandbox        V8 sandbox (deno_core, dual-mode execution)
+    forge-sandbox        V8 sandbox (deno_core, AST validator, worker pool)
       forgemax-worker    Isolated child process for V8 execution
-    forge-manifest       Hierarchical capability manifest registry
+    forge-manifest       Capability manifest, LiveManifest, TypeScript defs
+  forge-error            Typed DispatchError enum, structured errors, fuzzy matching
+  forge-audit            Audit event types and structured logging
   forge-test-server      Mock MCP server for integration tests
 ```
 
@@ -45,15 +47,17 @@ The core innovation. Uses `deno_core` to run LLM-generated JavaScript in a locke
 
 - No filesystem, network, environment, or child process access
 - Fresh runtime per execution (no state leakage)
-- Pre-execution validation (banned patterns caught before V8)
-- Timeout + heap limit enforcement
-- Output size caps
-- Tool call rate limiting
+- AST-based code validation via oxc — static analysis catches dangerous patterns before V8 runs (28 bypass tests)
+- Multi-hop alias detection — tracks `const e = eval; e("code")` and destructured `globalThis` through multiple assignment hops
+- Timeout + heap limit enforcement with typed errors (`Timeout`, `HeapLimit`, `JsError`) preserved across the IPC boundary
+- Output size caps and tool call rate limiting
 - Opaque bindings — credentials never exposed to sandbox code
 - Dual-mode execution: in-process (tests) or isolated child process (production)
-- Resource reading with URI validation, size truncation, and rate limiting
-- Session stash with TTL, group isolation, and size limits
+- Worker pool with warm process reuse, pre-warming, background reaping, and health checks (optional `worker-pool` feature)
+- Resource reading with URI scheme blocklist, path traversal prevention, and rate limiting
+- Session stash with TTL, group isolation, size limits, and per-execution rate limiting
 - Bounded parallel execution (`forge.parallel()`) with concurrency caps
+- Prometheus metrics for execution counters, duration histograms, and pool gauges (optional `metrics` feature)
 
 ### forgemax-worker
 
@@ -68,19 +72,27 @@ Queryable index of all tools across all connected MCP servers. Supports progress
 - **Layer 2**: Tool list per category (~500 tokens)
 - **Layer 3**: Full schema per tool (~200 tokens each)
 
-Built dynamically from live `tools/list` responses when downstream servers connect.
+Built dynamically from live `tools/list` responses when downstream servers connect. `LiveManifest` provides lock-free reads via `arc-swap` with atomic swap for background refresh — periodic re-discovery on a configurable interval, plus SIGHUP-triggered refresh on Unix. TypeScript definitions (`forge.d.ts`) are compiled into the binary at build time and served in MCP server instructions.
 
 ### forge-client
 
-MCP client connections to downstream servers. Supports stdio and HTTP/SSE transports. `RouterDispatcher` routes `callTool(server, tool, args)` to the correct downstream connection.
+MCP client connections to downstream servers. Supports stdio and HTTP/SSE transports. `RouterDispatcher` routes `callTool(server, tool, args)` to the correct downstream connection with pre-dispatch tool name validation — misspelled tools return `TOOL_NOT_FOUND` with Levenshtein-based suggestions before ever hitting the upstream server.
 
 ### forge-server
 
-Implements `ServerHandler` from rmcp. Exposes `search` and `execute` as MCP tools, wires them to the sandbox executor, and serves over stdio.
+Implements `ServerHandler` from rmcp. Exposes `search` and `execute` as MCP tools, wires them to the sandbox executor, and serves over stdio. Key operations are instrumented with `tracing` spans for structured observability.
+
+### forge-error
+
+Typed `DispatchError` enum replacing `anyhow::Error` across all dispatchers. Variants: `ServerNotFound`, `ToolNotFound`, `Timeout`, `CircuitOpen`, `GroupPolicyDenied`, `Upstream`, `RateLimit`, `Internal`. Includes fuzzy matching — `find_symbls` suggests `find_symbols` via Levenshtein distance. Errors serialize to structured JSON with `{error, code, message, retryable, suggested_fix}`.
+
+### forge-audit
+
+Audit event types for structured logging. Every sandbox execution is logged with code hash, tool calls, duration, outcome, worker reuse status, and pool size at acquisition. Code previews are redacted before logging.
 
 ### forge-config
 
-TOML configuration with environment variable expansion (`${GITHUB_TOKEN}`). Configures downstream servers, transports, sandbox limits, and execution mode.
+TOML configuration with environment variable expansion (`${GITHUB_TOKEN}`). Configures downstream servers, transports, sandbox limits, and execution mode. Optional config file watching via `notify` crate with debounced reload (requires `config-watch` feature).
 
 ## Install
 
@@ -257,13 +269,27 @@ async () => {
 }
 ```
 
+**5. Structured errors with fuzzy matching:**
+
+Typos in server or tool names return helpful suggestions instead of opaque errors:
+
+```json
+{
+  "error": true,
+  "code": "TOOL_NOT_FOUND",
+  "message": "Tool 'find_symbls' not found on server 'narsil'",
+  "retryable": true,
+  "suggested_fix": "Did you mean 'find_symbols'?"
+}
+```
+
 The sandbox executes JavaScript, routes `forge.callTool()` to real MCP servers via the `ToolDispatcher` trait, and returns JSON. The LLM never sees credentials, connection details, or raw API surfaces.
 
 ## Security Model
 
 ```
-Code Validator          Banned patterns, size limits, Unicode normalization,
-                        comment stripping, whitespace-aware matching
+  AST Validator         oxc-powered static analysis — import/require/eval/Deno/process
+                        blocked before V8 runs, multi-hop alias tracking, 28 bypass tests
         |
   V8 Bootstrap          eval/Function constructor removal at runtime
         |
@@ -273,12 +299,16 @@ Code Validator          Banned patterns, size limits, Unicode normalization,
         |
 Manifest Sanitization   Tool metadata sanitized to prevent prompt injection
         |
+  Typed Errors          Structured {code, message, retryable, suggested_fix} JSON —
+                        fuzzy matching suggests corrections for typos
+        |
  Content Size Limits    OOM prevention for text (10MB), binary (1MB) responses
         |
-  Resource Validation   URI validation (path traversal, null bytes, control chars)
+  Resource Validation   URI scheme blocklist (data/javascript/ftp/gopher/telnet/ldap),
+                        path traversal, null bytes, control chars
         |
   Session Stash         Key validation, value/total size limits, TTL enforcement,
-                        group isolation
+                        group isolation, per-execution rate limiting
         |
   Parallel Execution    Bounded concurrency, shared rate limit counter
         |
@@ -300,12 +330,16 @@ Manifest Sanitization   Tool metadata sanitized to prevent prompt injection
         |
 Process Isolation       Child process, clean env, kill-on-timeout (production mode)
         |
+  Worker Pool           Warm process reuse with health checks, idle reaping,
+                        typed error preservation across IPC boundary
+        |
  Binary Security        Absolute paths only, permission checks, no PATH fallback
         |
   IPC Protocol          Length-delimited JSON, configurable message size limits,
-                        protocol desync prevention
+                        protocol desync prevention, typed ErrorKind across boundary
         |
-  Audit Logging         Every execution logged — code hash, tool calls, duration, outcome
+  Audit Logging         Every execution logged — code hash, tool calls, duration,
+                        outcome, worker reuse, pool size, redacted code preview
 ```
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed security analysis and threat model.
@@ -338,8 +372,13 @@ cargo test --workspace
 | tokio | 1.x | Async runtime |
 | serde | 1.x | Serialization |
 | schemars | 1.0 | JSON Schema (matches rmcp) |
+| oxc_parser / oxc_ast | 0.115 | AST-based code validation |
+| arc-swap | 1.x | Lock-free LiveManifest reads |
+| strsim | 0.11 | Levenshtein fuzzy matching |
 | sha2 | 0.10 | Code hashing for audit log |
 | chrono | 0.4 | Audit timestamps |
+| notify | 7.x | Config file watching (optional) |
+| prometheus-client | 0.22 | Metrics export (optional) |
 
 ## License
 

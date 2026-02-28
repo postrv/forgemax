@@ -141,6 +141,8 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
           CRATES=(
+            forge-error
+            forge-audit
             forge-config
             forge-manifest
             forge-sandbox
