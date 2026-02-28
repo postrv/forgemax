@@ -7,16 +7,16 @@ class Forgemax < Formula
   on_macos do
     if Hardware::CPU.arm?
       url "https://github.com/postrv/forgemax/releases/download/v#{version}/forgemax-v#{version}-macos-aarch64.tar.gz"
-      sha256 "TODO_UPDATE_AFTER_RELEASE_BUILD"
+      sha256 "9f818a7a5199d1a078e6de15ce030130091d133aa1d2e887e7409d8fff412c4b"
     else
       url "https://github.com/postrv/forgemax/releases/download/v#{version}/forgemax-v#{version}-macos-x86_64.tar.gz"
-      sha256 "TODO_UPDATE_AFTER_RELEASE_BUILD"
+      sha256 "5d67a0adca840df6b0b2cc11937cdf0f35ba3aa43bf39730bd9baaf10a15d3a7"
     end
   end
 
   on_linux do
     url "https://github.com/postrv/forgemax/releases/download/v#{version}/forgemax-v#{version}-linux-x86_64.tar.gz"
-    sha256 "TODO_UPDATE_AFTER_RELEASE_BUILD"
+    sha256 "991e5600361f56444aa9eb5caef1dbc1a0339991b00b8cce3e66e993f798b2f3"
   end
 
   def install
