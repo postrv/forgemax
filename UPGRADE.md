@@ -8,8 +8,14 @@
 - **Worker stderr hardening (H3):** Worker stderr is now `Stdio::piped()` (debug, bounded to 4KB) or `Stdio::null()` (production). `Stdio::inherit()` is never used, preventing unbounded stderr leakage.
 - **URI scheme validation (M2):** `validate_resource_uri()` now blocks dangerous URI schemes (`data:`, `javascript:`, `ftp:`, `gopher:`, `telnet:`, `ldap:`, `dict:`). Custom MCP schemes (e.g., `postgres://`) are allowed.
 - **AST alias detection (AST-12):** The AST validator now detects aliased dangerous identifiers (`const e = eval; e("code")`), including multi-hop aliases and destructured eval from `globalThis`.
+- **AST `require()` blocking:** `require` added to `DANGEROUS_IDENTIFIERS` and `check_call_callee`, preventing `require('child_process')` and alias evasion (`const r = require; r('fs')`).
 - **Audit code_preview redaction:** `code_preview` in audit entries is now passed through `redact_error_message()` to strip credentials before logging.
 - **Stash operation limits:** Per-execution rate limiting for stash operations via `max_stash_calls` in `StashOverrides`.
+
+### Bug Fixes
+
+- **IPC error type preservation:** Introduced `IpcDispatchError` struct to preserve `DispatchError` variant (code, server, tool, timeout_ms) across the IPC boundary. Previously, typed errors were flattened to strings when crossing from host to worker, losing structured error information (fuzzy-match suggestions, error codes).
+- **Pre-dispatch tool name validation:** `RouterDispatcher` now validates tool names against known tools before dispatching to upstream servers. Previously, misspelled tool names were sent upstream and returned as generic `Upstream` errors with no fuzzy-match suggestions. Now returns `ToolNotFound` with Levenshtein-based suggestions (e.g., `find_symbls` → `Did you mean 'find_symbols'?`).
 
 ### New Features
 

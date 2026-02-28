@@ -14,7 +14,9 @@ use tokio::process::Command;
 use crate::error::SandboxError;
 use tokio::io::{AsyncRead, AsyncWrite};
 
-use crate::ipc::{read_message, write_message, ChildMessage, ParentMessage, WorkerConfig};
+use crate::ipc::{
+    read_message, write_message, ChildMessage, IpcDispatchError, ParentMessage, WorkerConfig,
+};
 use crate::{ResourceDispatcher, StashDispatcher, ToolDispatcher};
 
 /// Maximum bytes to capture from worker stderr in debug mode.
@@ -240,7 +242,7 @@ where
 
                 let response = ParentMessage::ToolCallResult {
                     request_id,
-                    result: tool_result.map_err(|e| e.to_string()),
+                    result: tool_result.map_err(|e| IpcDispatchError::from(&e)),
                 };
 
                 write_message(child_stdin, &response).await.map_err(|e| {
@@ -254,14 +256,16 @@ where
             }) => {
                 // Defense-in-depth: validate URI at host level too
                 let result = if let Err(e) = crate::ops::validate_resource_uri(&uri) {
-                    Err(e)
+                    Err(IpcDispatchError::from_string(e))
                 } else {
                     match &resource_dispatcher {
                         Some(rd) => rd
                             .read_resource(&server, &uri)
                             .await
-                            .map_err(|e| e.to_string()),
-                        None => Err("resource dispatcher not available".to_string()),
+                            .map_err(|e| IpcDispatchError::from(&e)),
+                        None => Err(IpcDispatchError::from_string(
+                            "resource dispatcher not available".to_string(),
+                        )),
                     }
                 };
 
@@ -285,8 +289,10 @@ where
                     Some(sd) => sd
                         .put(&key, value, ttl_secs, group)
                         .await
-                        .map_err(|e| e.to_string()),
-                    None => Err("stash dispatcher not available".to_string()),
+                        .map_err(|e| IpcDispatchError::from(&e)),
+                    None => Err(IpcDispatchError::from_string(
+                        "stash dispatcher not available".to_string(),
+                    )),
                 };
 
                 let response = ParentMessage::StashResult { request_id, result };
@@ -300,8 +306,13 @@ where
                 group,
             }) => {
                 let result = match &stash_dispatcher {
-                    Some(sd) => sd.get(&key, group).await.map_err(|e| e.to_string()),
-                    None => Err("stash dispatcher not available".to_string()),
+                    Some(sd) => sd
+                        .get(&key, group)
+                        .await
+                        .map_err(|e| IpcDispatchError::from(&e)),
+                    None => Err(IpcDispatchError::from_string(
+                        "stash dispatcher not available".to_string(),
+                    )),
                 };
 
                 let response = ParentMessage::StashResult { request_id, result };
@@ -315,8 +326,13 @@ where
                 group,
             }) => {
                 let result = match &stash_dispatcher {
-                    Some(sd) => sd.delete(&key, group).await.map_err(|e| e.to_string()),
-                    None => Err("stash dispatcher not available".to_string()),
+                    Some(sd) => sd
+                        .delete(&key, group)
+                        .await
+                        .map_err(|e| IpcDispatchError::from(&e)),
+                    None => Err(IpcDispatchError::from_string(
+                        "stash dispatcher not available".to_string(),
+                    )),
                 };
 
                 let response = ParentMessage::StashResult { request_id, result };
@@ -326,8 +342,13 @@ where
             }
             Some(ChildMessage::StashKeys { request_id, group }) => {
                 let result = match &stash_dispatcher {
-                    Some(sd) => sd.keys(group).await.map_err(|e| e.to_string()),
-                    None => Err("stash dispatcher not available".to_string()),
+                    Some(sd) => sd
+                        .keys(group)
+                        .await
+                        .map_err(|e| IpcDispatchError::from(&e)),
+                    None => Err(IpcDispatchError::from_string(
+                        "stash dispatcher not available".to_string(),
+                    )),
                 };
 
                 let response = ParentMessage::StashResult { request_id, result };

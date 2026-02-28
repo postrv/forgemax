@@ -246,7 +246,7 @@ async () => {
   const schema = await forge.readResource("db", "postgres://mydb/tables");
 
   // Store it in the session stash for later executions
-  await forge.stash.put("db_schema", schema, 3600);
+  await forge.stash.put("db_schema", schema, { ttl: 3600 });
 
   // Make parallel calls
   const { results } = await forge.parallel([
@@ -312,15 +312,17 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed security analysis and threat
 
 ## Tests
 
-406 tests across the workspace:
+620 tests across the workspace:
 
 ```
-forge-sandbox       252 unit + 17 integration (child process + security)
-forge-manifest       31 (builders + dynamic generation + sanitization)
-forge-config         32 (parsing, validation, env expansion, groups, stash)
-forge-client         39 unit (router, timeout, circuit breaker, header sanitization) + 12 e2e
-forge-server          8 unit + 11 integration (resource, stash, parallel)
-forge-cli             4 unit (config parsing, stash config)
+forge-sandbox       395 unit + 28 integration (child process, security, AST, worker pool)
+forge-manifest       45 (builders, dynamic generation, sanitization, live refresh)
+forge-config         38 (parsing, validation, env expansion, groups, stash)
+forge-client         42 unit (router, timeout, circuit breaker, header sanitization) + 12 e2e
+forge-error          24 (typed errors, fuzzy matching, structured errors)
+forge-server         11 unit + 11 integration (resource, stash, parallel)
+forge-cli            12 unit (config parsing, stash config, wiring)
+forge-audit           1 (event types)
 ```
 
 ```bash

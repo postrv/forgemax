@@ -640,7 +640,7 @@ checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
 
 [[package]]
 name = "forge-audit"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "chrono",
  "serde",
@@ -649,7 +649,7 @@ dependencies = [
 
 [[package]]
 name = "forge-cli"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -669,7 +669,7 @@ dependencies = [
 
 [[package]]
 name = "forge-client"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -688,7 +688,7 @@ dependencies = [
 
 [[package]]
 name = "forge-config"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "notify",
  "serde",
@@ -703,7 +703,7 @@ dependencies = [
 
 [[package]]
 name = "forge-error"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "serde",
@@ -714,7 +714,7 @@ dependencies = [
 
 [[package]]
 name = "forge-manifest"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "arc-swap",
  "serde",
@@ -723,7 +723,7 @@ dependencies = [
 
 [[package]]
 name = "forge-sandbox"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -752,7 +752,7 @@ dependencies = [
 
 [[package]]
 name = "forge-sandbox-worker"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -767,7 +767,7 @@ dependencies = [
 
 [[package]]
 name = "forge-server"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -784,7 +784,7 @@ dependencies = [
 
 [[package]]
 name = "forge-test-server"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "rmcp",
  "schemars",

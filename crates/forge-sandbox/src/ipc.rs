@@ -28,6 +28,99 @@ pub enum ErrorKind {
     Execution,
 }
 
+/// Structured dispatch error for IPC transport.
+///
+/// Preserves [`forge_error::DispatchError`] variant information across the
+/// parent ↔ worker process boundary. Without this, all errors would be
+/// flattened to `DispatchError::Internal` in ChildProcess mode, losing
+/// error codes like `SERVER_NOT_FOUND` and fuzzy match suggestions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IpcDispatchError {
+    /// Error code matching `DispatchError::code()` output.
+    pub code: String,
+    /// Human-readable error message.
+    pub message: String,
+    /// Server name (for ServerNotFound, ToolNotFound, Timeout, CircuitOpen, Upstream).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<String>,
+    /// Tool name (for ToolNotFound).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+    /// Timeout in milliseconds (for Timeout).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+}
+
+impl IpcDispatchError {
+    /// Create from a plain string error message (used for non-dispatch errors
+    /// like "stash dispatcher not available" or URI validation failures).
+    pub fn from_string(msg: String) -> Self {
+        Self {
+            code: "INTERNAL".to_string(),
+            message: msg,
+            server: None,
+            tool: None,
+            timeout_ms: None,
+        }
+    }
+
+    /// Reconstruct the appropriate [`forge_error::DispatchError`] variant.
+    pub fn to_dispatch_error(self) -> forge_error::DispatchError {
+        match self.code.as_str() {
+            "SERVER_NOT_FOUND" => forge_error::DispatchError::ServerNotFound(
+                self.server.unwrap_or(self.message),
+            ),
+            "TOOL_NOT_FOUND" => forge_error::DispatchError::ToolNotFound {
+                server: self.server.unwrap_or_default(),
+                tool: self.tool.unwrap_or_default(),
+            },
+            "TIMEOUT" => forge_error::DispatchError::Timeout {
+                server: self.server.unwrap_or_default(),
+                timeout_ms: self.timeout_ms.unwrap_or(0),
+            },
+            "CIRCUIT_OPEN" => forge_error::DispatchError::CircuitOpen(
+                self.server.unwrap_or(self.message),
+            ),
+            "GROUP_POLICY_DENIED" => forge_error::DispatchError::GroupPolicyDenied {
+                reason: self.message,
+            },
+            "UPSTREAM_ERROR" => forge_error::DispatchError::Upstream {
+                server: self.server.unwrap_or_default(),
+                message: self.message,
+            },
+            "RATE_LIMIT" => forge_error::DispatchError::RateLimit(self.message),
+            _ => forge_error::DispatchError::Internal(anyhow::anyhow!("{}", self.message)),
+        }
+    }
+}
+
+impl From<&forge_error::DispatchError> for IpcDispatchError {
+    fn from(e: &forge_error::DispatchError) -> Self {
+        let (server, tool, timeout_ms) = match e {
+            forge_error::DispatchError::ServerNotFound(s) => (Some(s.clone()), None, None),
+            forge_error::DispatchError::ToolNotFound { server, tool } => {
+                (Some(server.clone()), Some(tool.clone()), None)
+            }
+            forge_error::DispatchError::Timeout {
+                server, timeout_ms, ..
+            } => (Some(server.clone()), None, Some(*timeout_ms)),
+            forge_error::DispatchError::CircuitOpen(s) => (Some(s.clone()), None, None),
+            forge_error::DispatchError::Upstream { server, .. } => {
+                (Some(server.clone()), None, None)
+            }
+            _ => (None, None, None),
+        };
+
+        Self {
+            code: e.code().to_string(),
+            message: e.to_string(),
+            server,
+            tool,
+            timeout_ms,
+        }
+    }
+}
+
 /// Messages sent from the parent process to the worker child.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -46,15 +139,15 @@ pub enum ParentMessage {
     ToolCallResult {
         /// Matches the request_id from ChildMessage::ToolCallRequest.
         request_id: u64,
-        /// The tool call result, or an error message.
-        result: Result<Value, String>,
+        /// The tool call result, or a structured dispatch error.
+        result: Result<Value, IpcDispatchError>,
     },
     /// Response to a resource read request from the child.
     ResourceReadResult {
         /// Matches the request_id from ChildMessage::ResourceReadRequest.
         request_id: u64,
-        /// The resource content, or an error message.
-        result: Result<Value, String>,
+        /// The resource content, or a structured dispatch error.
+        result: Result<Value, IpcDispatchError>,
     },
     /// Reset the worker for a new execution (pool mode).
     ///
@@ -68,8 +161,8 @@ pub enum ParentMessage {
     StashResult {
         /// Matches the request_id from the stash request.
         request_id: u64,
-        /// The stash operation result, or an error message.
-        result: Result<Value, String>,
+        /// The stash operation result, or a structured dispatch error.
+        result: Result<Value, IpcDispatchError>,
     },
 }
 
@@ -453,7 +546,7 @@ mod tests {
     async fn roundtrip_parent_tool_result_error() {
         let msg = ParentMessage::ToolCallResult {
             request_id: 7,
-            result: Err("connection refused".into()),
+            result: Err(IpcDispatchError::from_string("connection refused".into())),
         };
 
         let mut buf = Vec::new();
@@ -465,7 +558,9 @@ mod tests {
         match decoded {
             ParentMessage::ToolCallResult { request_id, result } => {
                 assert_eq!(request_id, 7);
-                assert_eq!(result.unwrap_err(), "connection refused");
+                let err = result.unwrap_err();
+                assert_eq!(err.message, "connection refused");
+                assert_eq!(err.code, "INTERNAL");
             }
             other => panic!("expected ToolCallResult, got: {:?}", other),
         }
@@ -779,7 +874,7 @@ mod tests {
     async fn ipc_03_resource_read_result_error_roundtrip() {
         let msg = ParentMessage::ResourceReadResult {
             request_id: 12,
-            result: Err("resource not found".into()),
+            result: Err(IpcDispatchError::from_string("resource not found".into())),
         };
 
         let mut buf = Vec::new();
@@ -791,7 +886,9 @@ mod tests {
         match decoded {
             ParentMessage::ResourceReadResult { request_id, result } => {
                 assert_eq!(request_id, 12);
-                assert_eq!(result.unwrap_err(), "resource not found");
+                let err = result.unwrap_err();
+                assert_eq!(err.message, "resource not found");
+                assert_eq!(err.code, "INTERNAL");
             }
             other => panic!("expected ResourceReadResult, got: {:?}", other),
         }

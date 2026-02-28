@@ -258,6 +258,9 @@ async fn main() -> Result<()> {
             })
             .collect();
 
+        // Extract tool names for pre-dispatch validation before mcp_tools is consumed
+        let tool_names: Vec<String> = mcp_tools.iter().map(|t| t.name.clone()).collect();
+
         let description = server_config.description.as_deref().unwrap_or("MCP server");
         let server_entry = server_entry_from_tools(name, description, mcp_tools);
         manifest_builder = manifest_builder.add_server(server_entry);
@@ -337,7 +340,8 @@ async fn main() -> Result<()> {
             client
         };
 
-        // Add client to router
+        // Register known tool names for pre-dispatch validation, then add client
+        router.set_known_tools(name.clone(), tool_names);
         router.add_client(name.clone(), client);
     }
 

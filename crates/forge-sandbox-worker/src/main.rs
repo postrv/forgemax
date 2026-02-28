@@ -12,10 +12,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use forge_error::DispatchError;
 use forge_sandbox::error::SandboxError;
 use forge_sandbox::ipc::{
-    read_message, read_message_with_limit, write_message, ChildMessage, ErrorKind, ParentMessage,
+    read_message, read_message_with_limit, write_message, ChildMessage, ErrorKind,
+    IpcDispatchError, ParentMessage,
 };
 use forge_sandbox::{ResourceDispatcher, StashDispatcher, ToolDispatcher};
 use tokio::io::{self, AsyncWriteExt, BufReader};
@@ -29,7 +29,8 @@ struct IpcToolBridge {
     /// Sender for outgoing child messages (tool requests, logs).
     tx: mpsc::UnboundedSender<ChildMessage>,
     /// Sender for registering response waiters, keyed by request_id.
-    waiter_tx: mpsc::UnboundedSender<(u64, oneshot::Sender<Result<serde_json::Value, String>>)>,
+    waiter_tx:
+        mpsc::UnboundedSender<(u64, oneshot::Sender<Result<serde_json::Value, IpcDispatchError>>)>,
     /// Atomic counter for generating unique request IDs (shared with other bridges).
     next_id: Arc<AtomicU64>,
 }
@@ -65,7 +66,7 @@ impl ToolDispatcher for IpcToolBridge {
             .await
             .map_err(|_| anyhow::anyhow!("IPC response channel closed"))?;
 
-        result.map_err(|e| DispatchError::Internal(anyhow::anyhow!("{}", e)))
+        result.map_err(|e| e.to_dispatch_error())
     }
 }
 
@@ -77,7 +78,8 @@ struct IpcResourceBridge {
     /// Sender for outgoing child messages.
     tx: mpsc::UnboundedSender<ChildMessage>,
     /// Sender for registering response waiters, keyed by request_id.
-    waiter_tx: mpsc::UnboundedSender<(u64, oneshot::Sender<Result<serde_json::Value, String>>)>,
+    waiter_tx:
+        mpsc::UnboundedSender<(u64, oneshot::Sender<Result<serde_json::Value, IpcDispatchError>>)>,
     /// Atomic counter for generating unique request IDs.
     next_id: Arc<AtomicU64>,
 }
@@ -108,7 +110,7 @@ impl ResourceDispatcher for IpcResourceBridge {
             .await
             .map_err(|_| anyhow::anyhow!("IPC response channel closed"))?;
 
-        result.map_err(|e| DispatchError::Internal(anyhow::anyhow!("{}", e)))
+        result.map_err(|e| e.to_dispatch_error())
     }
 }
 
@@ -120,7 +122,8 @@ struct IpcStashBridge {
     /// Sender for outgoing child messages.
     tx: mpsc::UnboundedSender<ChildMessage>,
     /// Sender for registering response waiters, keyed by request_id.
-    waiter_tx: mpsc::UnboundedSender<(u64, oneshot::Sender<Result<serde_json::Value, String>>)>,
+    waiter_tx:
+        mpsc::UnboundedSender<(u64, oneshot::Sender<Result<serde_json::Value, IpcDispatchError>>)>,
     /// Atomic counter for generating unique request IDs.
     next_id: Arc<AtomicU64>,
 }
@@ -155,7 +158,7 @@ impl StashDispatcher for IpcStashBridge {
             .await
             .map_err(|_| anyhow::anyhow!("IPC response channel closed"))?;
 
-        result.map_err(|e| DispatchError::Internal(anyhow::anyhow!("{}", e)))
+        result.map_err(|e| e.to_dispatch_error())
     }
 
     async fn get(
@@ -182,7 +185,7 @@ impl StashDispatcher for IpcStashBridge {
             .await
             .map_err(|_| anyhow::anyhow!("IPC response channel closed"))?;
 
-        result.map_err(|e| DispatchError::Internal(anyhow::anyhow!("{}", e)))
+        result.map_err(|e| e.to_dispatch_error())
     }
 
     async fn delete(
@@ -209,7 +212,7 @@ impl StashDispatcher for IpcStashBridge {
             .await
             .map_err(|_| anyhow::anyhow!("IPC response channel closed"))?;
 
-        result.map_err(|e| DispatchError::Internal(anyhow::anyhow!("{}", e)))
+        result.map_err(|e| e.to_dispatch_error())
     }
 
     async fn keys(
@@ -234,7 +237,7 @@ impl StashDispatcher for IpcStashBridge {
             .await
             .map_err(|_| anyhow::anyhow!("IPC response channel closed"))?;
 
-        result.map_err(|e| DispatchError::Internal(anyhow::anyhow!("{}", e)))
+        result.map_err(|e| e.to_dispatch_error())
     }
 }
 
@@ -312,8 +315,10 @@ async fn run_single_execution(
 
     // Set up IPC channels
     let (tx, mut rx) = mpsc::unbounded_channel::<ChildMessage>();
-    let (waiter_tx, mut waiter_rx) =
-        mpsc::unbounded_channel::<(u64, oneshot::Sender<Result<serde_json::Value, String>>)>();
+    let (waiter_tx, mut waiter_rx) = mpsc::unbounded_channel::<(
+        u64,
+        oneshot::Sender<Result<serde_json::Value, IpcDispatchError>>,
+    )>();
 
     let shared_next_id = Arc::new(AtomicU64::new(1));
 
@@ -392,7 +397,7 @@ async fn run_single_execution(
     // IPC event loop
     let mut pending_waiters: std::collections::HashMap<
         u64,
-        oneshot::Sender<Result<serde_json::Value, String>>,
+        oneshot::Sender<Result<serde_json::Value, IpcDispatchError>>,
     > = std::collections::HashMap::new();
     let mut execution_done = false;
 

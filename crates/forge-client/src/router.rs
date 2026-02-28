@@ -1,6 +1,6 @@
 //! Router dispatcher for routing tool calls to the correct downstream MCP client.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use forge_error::DispatchError;
@@ -9,8 +9,14 @@ use serde_json::Value;
 
 /// A [`ToolDispatcher`] that routes `call_tool(server, tool, args)` to the
 /// correct downstream MCP client based on server name.
+///
+/// Validates both server names and tool names before dispatching, returning
+/// [`DispatchError::ServerNotFound`] or [`DispatchError::ToolNotFound`] with
+/// fuzzy-match suggestions when appropriate.
 pub struct RouterDispatcher {
     clients: HashMap<String, Arc<dyn ToolDispatcher>>,
+    /// Known tool names per server, for pre-dispatch validation.
+    known_tools: HashMap<String, HashSet<String>>,
 }
 
 impl RouterDispatcher {
@@ -18,12 +24,26 @@ impl RouterDispatcher {
     pub fn new() -> Self {
         Self {
             clients: HashMap::new(),
+            known_tools: HashMap::new(),
         }
     }
 
     /// Register a dispatcher for a named server.
     pub fn add_client(&mut self, name: impl Into<String>, client: Arc<dyn ToolDispatcher>) {
-        self.clients.insert(name.into(), client);
+        let name = name.into();
+        self.clients.insert(name.clone(), client);
+        // Ensure a tools entry exists even if no tools are registered yet
+        self.known_tools.entry(name).or_default();
+    }
+
+    /// Register known tool names for a server (for pre-dispatch validation).
+    pub fn set_known_tools(
+        &mut self,
+        server: impl Into<String>,
+        tools: impl IntoIterator<Item = String>,
+    ) {
+        self.known_tools
+            .insert(server.into(), tools.into_iter().collect());
     }
 
     /// List all registered server names.
@@ -58,6 +78,18 @@ impl ToolDispatcher for RouterDispatcher {
             .clients
             .get(server)
             .ok_or_else(|| DispatchError::ServerNotFound(server.into()))?;
+
+        // Pre-dispatch tool name validation: if we know the server's tools,
+        // check the tool exists before sending to the upstream server.
+        if let Some(tools) = self.known_tools.get(server) {
+            if !tools.is_empty() && !tools.contains(tool) {
+                return Err(DispatchError::ToolNotFound {
+                    server: server.into(),
+                    tool: tool.into(),
+                });
+            }
+        }
+
         client.call_tool(server, tool, args).await
     }
 }
@@ -294,6 +326,44 @@ mod tests {
         let router = RouterDispatcher::new();
         let result = router.call_tool("any", "tool", serde_json::json!({})).await;
         assert!(matches!(result, Err(DispatchError::ServerNotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn router_returns_tool_not_found_for_unknown_tool() {
+        let mut router = RouterDispatcher::new();
+        router.set_known_tools("server", vec!["tool_a".into(), "tool_b".into()]);
+        router.add_client("server", Arc::new(MockDispatcher::new("server")));
+
+        // Known tool works
+        let result = router
+            .call_tool("server", "tool_a", serde_json::json!({}))
+            .await;
+        assert!(result.is_ok(), "known tool should succeed");
+
+        // Unknown tool returns ToolNotFound
+        let result = router
+            .call_tool("server", "tool_x", serde_json::json!({}))
+            .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, DispatchError::ToolNotFound { ref server, ref tool }
+                if server == "server" && tool == "tool_x"),
+            "expected ToolNotFound, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn router_skips_tool_validation_when_no_tools_registered() {
+        let mut router = RouterDispatcher::new();
+        // No set_known_tools call — tools list is empty
+        router.add_client("server", Arc::new(MockDispatcher::new("server")));
+
+        // Should pass through to the client even though tool name is unknown
+        let result = router
+            .call_tool("server", "anything", serde_json::json!({}))
+            .await;
+        assert!(result.is_ok(), "should pass through when no tools registered");
     }
 
     // --- v0.2 Resource Router Tests (RS-C05..RS-C06) ---
