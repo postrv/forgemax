@@ -653,7 +653,7 @@ mod tests {
     }
 
     #[test]
-    fn ver_01_cargo_pkg_version_is_030() {
-        assert_eq!(env!("CARGO_PKG_VERSION"), "0.3.0");
+    fn ver_01_cargo_pkg_version_is_031() {
+        assert_eq!(env!("CARGO_PKG_VERSION"), "0.3.1");
     }
 }

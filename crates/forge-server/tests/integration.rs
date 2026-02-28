@@ -538,11 +538,18 @@ async fn rs_i06_read_resource_timeout_enforcement() {
     );
     let json = result.unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-    // Sandbox-level async timeout returns {"error":"async timeout"} (not a structured DispatchError)
-    assert_eq!(
-        parsed["error"].as_str().unwrap(),
-        "async timeout",
-        "should report async timeout, got: {parsed:?}"
+    // The sandbox has two timeout mechanisms racing: tokio::time::timeout (async)
+    // and a CPU watchdog thread. Both use the same 500ms timeout. Whichever fires
+    // first determines the error message:
+    //   - Async timeout → "async timeout"
+    //   - CPU watchdog  → "execution timed out after 500ms"
+    // Both are correct — the test verifies timeout enforcement, not which fires first.
+    let error_msg = parsed["error"]
+        .as_str()
+        .expect("should have an error field");
+    assert!(
+        error_msg == "async timeout" || error_msg.contains("timed out"),
+        "should report a timeout error, got: {error_msg:?}"
     );
 }
 
