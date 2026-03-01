@@ -23,7 +23,7 @@ All notable changes to Forgemax will be documented in this file.
 - **README.md:** Added CLI commands table, examples section, doctor in quick start, link to SECURITY.md.
 - **`find_worker_binary` visibility:** Changed from `pub(crate)` to `pub` for use by `forgemax doctor`.
 - **forge-cli features:** Added feature forwarding section for `worker-pool`, `metrics`, `config-watch`.
-- **Test count:** ~700 tests (up from 618).
+- **Test count:** ~740 tests (up from 618).
 
 ## [0.3.1] - 2026-02-28
 

@@ -1,7 +1,7 @@
 class Forgemax < Formula
   desc "Code Mode MCP Gateway — collapses N servers x M tools into 2 tools"
   homepage "https://github.com/postrv/forgemax"
-  version "0.3.1"
+  version "0.4.0"
   license "FSL-1.1-ALv2"
 
   on_macos do
