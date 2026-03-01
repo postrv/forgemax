@@ -157,11 +157,11 @@ fn ex_05_no_hardcoded_secrets() {
         let active = active_lines.join("\n");
 
         for pattern in &[
-            "sk-",             // API keys
-            "ghp_",            // GitHub personal access tokens
-            "password",        // Hardcoded passwords
-            "Bearer ",         // Hardcoded bearer tokens
-            "Authorization:",  // Hardcoded auth headers
+            "sk-",            // API keys
+            "ghp_",           // GitHub personal access tokens
+            "password",       // Hardcoded passwords
+            "Bearer ",        // Hardcoded bearer tokens
+            "Authorization:", // Hardcoded auth headers
         ] {
             assert!(
                 !active.contains(pattern),
@@ -219,10 +219,7 @@ fn ex_08_group_isolation_configs_have_groups() {
         !open_config.groups.is_empty(),
         "open config should define groups"
     );
-    let has_open = open_config
-        .groups
-        .values()
-        .any(|g| g.isolation == "open");
+    let has_open = open_config.groups.values().any(|g| g.isolation == "open");
     assert!(has_open, "open config should have open isolation");
 }
 

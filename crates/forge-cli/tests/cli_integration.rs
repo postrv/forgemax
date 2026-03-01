@@ -103,10 +103,7 @@ fn cli_int_03_unknown_subcommand_errors() {
         .output()
         .expect("failed to execute forgemax");
 
-    assert!(
-        !output.status.success(),
-        "unknown subcommand should fail"
-    );
+    assert!(!output.status.success(), "unknown subcommand should fail");
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -152,19 +149,10 @@ fn cli_int_05_doctor_with_valid_config() {
 
     let dir = tempfile::tempdir().unwrap();
     let config = dir.path().join("forge.toml");
-    std::fs::write(
-        &config,
-        "[sandbox]\ntimeout_secs = 5\nmax_heap_mb = 64\n",
-    )
-    .unwrap();
+    std::fs::write(&config, "[sandbox]\ntimeout_secs = 5\nmax_heap_mb = 64\n").unwrap();
 
     let output = Command::new(&bin)
-        .args([
-            "doctor",
-            "--json",
-            "--config",
-            config.to_str().unwrap(),
-        ])
+        .args(["doctor", "--json", "--config", config.to_str().unwrap()])
         .output()
         .expect("failed to execute forgemax doctor");
 
@@ -176,7 +164,8 @@ fn cli_int_05_doctor_with_valid_config() {
         let config_check = checks.iter().find(|c| c["name"] == "config_valid");
         assert!(config_check.is_some(), "should have config_valid check");
         assert_eq!(
-            config_check.unwrap()["status"], "pass",
+            config_check.unwrap()["status"],
+            "pass",
             "valid config should pass"
         );
     }
@@ -398,12 +387,7 @@ fn cli_int_11_doctor_never_leaks_env_values() {
     .unwrap();
 
     let output = Command::new(&bin)
-        .args([
-            "doctor",
-            "--json",
-            "--config",
-            config.to_str().unwrap(),
-        ])
+        .args(["doctor", "--json", "--config", config.to_str().unwrap()])
         .env("FORGE_TEST_SECRET_VALUE", "super_secret_token_12345")
         .output()
         .expect("failed to execute forgemax doctor");
@@ -446,8 +430,5 @@ fn cli_int_12_run_rejects_banned_code() {
         .expect("failed to execute forgemax run");
 
     // Should fail because AST validator rejects import()
-    assert!(
-        !output.status.success(),
-        "run with import() should fail"
-    );
+    assert!(!output.status.success(), "run with import() should fail");
 }

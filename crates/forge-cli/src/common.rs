@@ -161,9 +161,7 @@ pub fn feature_status_line() -> String {
 }
 
 /// Connect to all downstream servers and build the capability manifest.
-pub async fn connect_and_build_manifest(
-    config: &ForgeConfig,
-) -> Result<ConnectResult> {
+pub async fn connect_and_build_manifest(config: &ForgeConfig) -> Result<ConnectResult> {
     let mut router = RouterDispatcher::new();
     let mut resource_router = RouterResourceDispatcher::new();
     let mut manifest_builder = ManifestBuilder::new();
@@ -351,9 +349,7 @@ pub fn find_env_var_refs(input: &str) -> Vec<String> {
 }
 
 /// Build a HashMap of group configurations from the ForgeConfig.
-pub fn build_group_map(
-    config: &ForgeConfig,
-) -> HashMap<String, (Vec<String>, String)> {
+pub fn build_group_map(config: &ForgeConfig) -> HashMap<String, (Vec<String>, String)> {
     config
         .groups
         .iter()
@@ -425,8 +421,7 @@ mod tests {
         use forge_sandbox::audit::TracingAuditLogger;
         let logger = Arc::new(TracingAuditLogger);
         let config = SandboxConfig::default();
-        let _executor =
-            forge_sandbox::executor::SandboxExecutor::with_audit_logger(config, logger);
+        let _executor = forge_sandbox::executor::SandboxExecutor::with_audit_logger(config, logger);
     }
 
     #[test]
@@ -504,12 +499,8 @@ mod tests {
 
         let manifest = ManifestBuilder::new().build();
         let dispatcher: Arc<dyn ToolDispatcher> = Arc::new(StubDispatcher);
-        let server = forge_server::ForgeServer::new(
-            SandboxConfig::default(),
-            manifest,
-            dispatcher,
-            None,
-        );
+        let server =
+            forge_server::ForgeServer::new(SandboxConfig::default(), manifest, dispatcher, None);
         let live = server.live_manifest();
         assert_eq!(live.current().total_servers(), 0);
     }

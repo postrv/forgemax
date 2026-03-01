@@ -123,10 +123,7 @@ fn check_env_vars(config_path: Option<&PathBuf>) -> DoctorCheck {
                     DoctorCheck {
                         name: "env_vars".into(),
                         status: CheckStatus::Fail,
-                        message: format!(
-                            "unresolved env vars: {}",
-                            missing.join(", ")
-                        ),
+                        message: format!("unresolved env vars: {}", missing.join(", ")),
                         fix: Some("Set the missing environment variables before starting".into()),
                     }
                 }
@@ -160,9 +157,7 @@ fn check_worker_binary() -> DoctorCheck {
             name: "worker_binary".into(),
             status: CheckStatus::Fail,
             message: format!("worker binary not found: {}", e),
-            fix: Some(
-                "Set FORGE_WORKER_BIN or install forgemax-worker alongside forgemax".into(),
-            ),
+            fix: Some("Set FORGE_WORKER_BIN or install forgemax-worker alongside forgemax".into()),
         },
     }
 }
@@ -257,10 +252,7 @@ fn check_groups(config_path: Option<&PathBuf>) -> DoctorCheck {
         .flat_map(|g| g.servers.iter().map(|s| s.as_str()))
         .collect();
 
-    let orphaned: Vec<&str> = server_names
-        .difference(&grouped_servers)
-        .copied()
-        .collect();
+    let orphaned: Vec<&str> = server_names.difference(&grouped_servers).copied().collect();
 
     if orphaned.is_empty() {
         DoctorCheck {
@@ -277,10 +269,7 @@ fn check_groups(config_path: Option<&PathBuf>) -> DoctorCheck {
         DoctorCheck {
             name: "groups".into(),
             status: CheckStatus::Warn,
-            message: format!(
-                "servers not in any group: {}",
-                orphaned.join(", ")
-            ),
+            message: format!("servers not in any group: {}", orphaned.join(", ")),
             fix: Some("Add ungrouped servers to a group or leave ungrouped if intentional".into()),
         }
     }
@@ -422,41 +411,36 @@ pub async fn execute(args: &DoctorArgs, config_path: Option<PathBuf>) -> Result<
                         )
                         .await
                         {
-                            Ok(Ok(client)) => {
-                                match client.list_tools().await {
-                                    Ok(tools) => {
-                                        checks.push(DoctorCheck {
-                                            name: format!("server_{}", name),
-                                            status: CheckStatus::Pass,
-                                            message: format!(
-                                                "server '{}': connected, {} tools",
-                                                name,
-                                                tools.len()
-                                            ),
-                                            fix: None,
-                                        });
-                                    }
-                                    Err(e) => {
-                                        checks.push(DoctorCheck {
-                                            name: format!("server_{}", name),
-                                            status: CheckStatus::Fail,
-                                            message: format!(
-                                                "server '{}': connected but list_tools failed: {}",
-                                                name, e
-                                            ),
-                                            fix: None,
-                                        });
-                                    }
+                            Ok(Ok(client)) => match client.list_tools().await {
+                                Ok(tools) => {
+                                    checks.push(DoctorCheck {
+                                        name: format!("server_{}", name),
+                                        status: CheckStatus::Pass,
+                                        message: format!(
+                                            "server '{}': connected, {} tools",
+                                            name,
+                                            tools.len()
+                                        ),
+                                        fix: None,
+                                    });
                                 }
-                            }
+                                Err(e) => {
+                                    checks.push(DoctorCheck {
+                                        name: format!("server_{}", name),
+                                        status: CheckStatus::Fail,
+                                        message: format!(
+                                            "server '{}': connected but list_tools failed: {}",
+                                            name, e
+                                        ),
+                                        fix: None,
+                                    });
+                                }
+                            },
                             Ok(Err(e)) => {
                                 checks.push(DoctorCheck {
                                     name: format!("server_{}", name),
                                     status: CheckStatus::Fail,
-                                    message: format!(
-                                        "server '{}': connection failed: {}",
-                                        name, e
-                                    ),
+                                    message: format!("server '{}': connection failed: {}", name, e),
                                     fix: Some(format!(
                                         "Verify server '{}' is installed and running",
                                         name
@@ -483,10 +467,7 @@ pub async fn execute(args: &DoctorArgs, config_path: Option<PathBuf>) -> Result<
                         checks.push(DoctorCheck {
                             name: format!("server_{}", name),
                             status: CheckStatus::Fail,
-                            message: format!(
-                                "server '{}': invalid transport config: {}",
-                                name, e
-                            ),
+                            message: format!("server '{}': invalid transport config: {}", name, e),
                             fix: None,
                         });
                     }
@@ -496,9 +477,18 @@ pub async fn execute(args: &DoctorArgs, config_path: Option<PathBuf>) -> Result<
     }
 
     let has_fail = checks.iter().any(|c| c.status == CheckStatus::Fail);
-    let pass_count = checks.iter().filter(|c| c.status == CheckStatus::Pass).count();
-    let warn_count = checks.iter().filter(|c| c.status == CheckStatus::Warn).count();
-    let fail_count = checks.iter().filter(|c| c.status == CheckStatus::Fail).count();
+    let pass_count = checks
+        .iter()
+        .filter(|c| c.status == CheckStatus::Pass)
+        .count();
+    let warn_count = checks
+        .iter()
+        .filter(|c| c.status == CheckStatus::Warn)
+        .count();
+    let fail_count = checks
+        .iter()
+        .filter(|c| c.status == CheckStatus::Fail)
+        .count();
 
     let summary = format!(
         "{} passed, {} warnings, {} failed",
@@ -513,10 +503,7 @@ pub async fn execute(args: &DoctorArgs, config_path: Option<PathBuf>) -> Result<
     };
 
     if args.json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&report)?
-        );
+        println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         for check in &report.checks {
             let status_str = match check.status {
@@ -645,7 +632,10 @@ servers = ["a"]
         .unwrap();
         let check = check_groups(Some(&path));
         assert_eq!(check.status, CheckStatus::Warn);
-        assert!(check.message.contains("b"), "should mention orphaned server");
+        assert!(
+            check.message.contains("b"),
+            "should mention orphaned server"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -653,7 +643,10 @@ servers = ["a"]
     fn dr_11_check_features() {
         let check = check_features();
         // With default features on, should pass. With --no-default-features, Warn is expected.
-        if cfg!(feature = "worker-pool") && cfg!(feature = "metrics") && cfg!(feature = "config-watch") {
+        if cfg!(feature = "worker-pool")
+            && cfg!(feature = "metrics")
+            && cfg!(feature = "config-watch")
+        {
             assert_eq!(check.status, CheckStatus::Pass);
         } else {
             assert_eq!(check.status, CheckStatus::Warn);
@@ -785,7 +778,11 @@ timeout_secs = 1
 
         // Verify the env var check works against this config
         let env_check = check_env_vars(Some(&path));
-        assert_eq!(env_check.status, CheckStatus::Pass, "no env var refs expected");
+        assert_eq!(
+            env_check.status,
+            CheckStatus::Pass,
+            "no env var refs expected"
+        );
         let _ = args; // acknowledge args
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -31,10 +31,7 @@ pub async fn execute(args: &ManifestArgs, config_path: Option<PathBuf>) -> Resul
 
     // Filter by server if requested
     if let Some(ref server_name) = args.server {
-        let found = manifest
-            .servers
-            .iter()
-            .find(|s| s.name == *server_name);
+        let found = manifest.servers.iter().find(|s| s.name == *server_name);
 
         match found {
             Some(server) => {
@@ -128,10 +125,7 @@ fn print_server_human(server: &forge_manifest::ServerEntry, layer: u8) {
     }
 }
 
-fn print_all_json(
-    manifest: &forge_manifest::Manifest,
-    layer: u8,
-) -> Result<()> {
+fn print_all_json(manifest: &forge_manifest::Manifest, layer: u8) -> Result<()> {
     let json = match layer {
         0 => {
             let summary = serde_json::json!({
@@ -150,10 +144,7 @@ fn print_all_json(
     Ok(())
 }
 
-fn print_server_json(
-    server: &forge_manifest::ServerEntry,
-    layer: u8,
-) -> Result<()> {
+fn print_server_json(server: &forge_manifest::ServerEntry, layer: u8) -> Result<()> {
     let json = match layer {
         0 => {
             let tool_count: usize = server.categories.values().map(|c| c.tools.len()).sum();

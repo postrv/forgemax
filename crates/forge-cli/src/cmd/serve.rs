@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
-use forge_manifest::{LiveManifest, ManifestBuilder, McpTool, server_entry_from_tools};
+use forge_manifest::{server_entry_from_tools, LiveManifest, ManifestBuilder, McpTool};
 use forge_sandbox::audit::TracingAuditLogger;
 use forge_sandbox::groups::GroupPolicy;
 use forge_sandbox::ExecutionMode;

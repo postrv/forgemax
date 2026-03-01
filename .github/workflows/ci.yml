@@ -98,8 +98,9 @@ jobs:
           done
       - name: Scan for credential patterns
         run: |
-          # Scan for hardcoded secrets (excluding example/template files)
-          ! grep -rn "sk-[a-zA-Z0-9]" --include="*.rs" --include="*.toml" . \
+          # Scan for realistic API keys (20+ char) in source and config files.
+          # Short test fixtures (sk-123, sk-secret-12345) are allowed in test code.
+          ! grep -rn "sk-[a-zA-Z0-9]\{20,\}" --include="*.rs" --include="*.toml" . \
             || { echo "Possible hardcoded API key found"; exit 1; }
 
   example-validation:

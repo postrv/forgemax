@@ -179,7 +179,10 @@ mod tests {
 
         let pretty = serde_json::to_string_pretty(&value).unwrap();
         assert!(pretty.contains("\"result\""));
-        assert!(pretty.lines().count() > 1, "pretty format should be multi-line");
+        assert!(
+            pretty.lines().count() > 1,
+            "pretty format should be multi-line"
+        );
     }
 
     #[test]
@@ -208,7 +211,9 @@ isolation = "strict"
         let config = forge_config::ForgeConfig::from_toml(toml).unwrap();
         assert_eq!(config.groups.len(), 1);
         assert_eq!(config.groups["secure"].isolation, "strict");
-        assert!(config.groups["secure"].servers.contains(&"internal".to_string()));
+        assert!(config.groups["secure"]
+            .servers
+            .contains(&"internal".to_string()));
     }
 
     #[test]
@@ -239,7 +244,10 @@ isolation = "strict"
         // The redaction module in forge-sandbox handles this; verify the pattern exists
         let has_path = sensitive.contains("/home/");
         let has_ip = sensitive.contains("192.168");
-        assert!(has_path && has_ip, "test string should contain sensitive patterns");
+        assert!(
+            has_path && has_ip,
+            "test string should contain sensitive patterns"
+        );
     }
 
     #[test]
@@ -252,6 +260,9 @@ isolation = "strict"
 
         // But from_toml with empty string gives a valid empty config
         let config = forge_config::ForgeConfig::from_toml("").unwrap();
-        assert!(config.servers.is_empty(), "empty config should have no servers");
+        assert!(
+            config.servers.is_empty(),
+            "empty config should have no servers"
+        );
     }
 }

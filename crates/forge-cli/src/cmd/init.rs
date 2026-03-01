@@ -117,12 +117,7 @@ pub async fn execute(args: &InitArgs) -> Result<()> {
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&args.output, std::fs::Permissions::from_mode(0o600))
-            .with_context(|| {
-                format!(
-                    "failed to set permissions on {}",
-                    args.output.display()
-                )
-            })?;
+            .with_context(|| format!("failed to set permissions on {}", args.output.display()))?;
     }
 
     eprintln!("Created {}", args.output.display());
@@ -171,8 +166,7 @@ mod tests {
     #[test]
     fn in_04_production_template_parses() {
         let content = include_str!("../../../../forge.toml.example.production");
-        forge_config::ForgeConfig::from_toml(content)
-            .expect("production template must parse");
+        forge_config::ForgeConfig::from_toml(content).expect("production template must parse");
     }
 
     #[tokio::test]
