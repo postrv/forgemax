@@ -153,11 +153,13 @@ jobs:
           )
           for crate in "${CRATES[@]}"; do
             echo "Publishing $crate..."
-            cargo publish -p "$crate" --allow-dirty || {
-              echo "Warning: $crate may already be published, continuing..."
-            }
-            # Wait for crates.io index to update
-            sleep 30
+            for attempt in 1 2 3; do
+              cargo publish -p "$crate" --allow-dirty && break
+              echo "Attempt $attempt failed for $crate, waiting for index sync..."
+              sleep 30
+            done
+            # Wait for crates.io index to update before next crate
+            sleep 45
           done
 
   build-binaries:

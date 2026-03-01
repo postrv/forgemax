@@ -6,7 +6,7 @@
   "architecture": {
     "64bit": {
       "url": "https://github.com/postrv/forgemax/releases/download/v0.4.0/forgemax-v0.4.0-windows-x86_64.zip",
-      "hash": "1671bbd6de63b6cf44dab456597011be20566ce228afab51074696ee6d849f8a"
+      "hash": "e7b55ae875ebc640a2099db1e0f6c093390f358d6d893d352e668081f9dc8459"
     }
   },
   "bin": [
