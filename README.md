@@ -104,7 +104,7 @@ Audit event types for structured logging. Every sandbox execution is logged with
 
 ### forge-config
 
-TOML configuration with environment variable expansion (`${GITHUB_TOKEN}`). Configures downstream servers, transports, sandbox limits, and execution mode. Optional config file watching via `notify` crate with debounced reload (requires `config-watch` feature).
+TOML configuration with environment variable expansion (`${GITHUB_TOKEN}`). Configures downstream servers, transports, sandbox limits, and execution mode. Optional config file watching via `notify` crate with debounced reload (requires `config-watch` feature). Startup concurrency is configurable (`startup_concurrency`, default 8) for parallel server connections.
 
 ## Install
 
@@ -392,7 +392,7 @@ Run an example: `forgemax run examples/basic-tool-chaining.js`
 
 ## Tests
 
-~700 tests across the workspace:
+~780 tests across the workspace:
 
 ```bash
 cargo test --workspace

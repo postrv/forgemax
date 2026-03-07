@@ -2,6 +2,23 @@
 
 All notable changes to Forgemax will be documented in this file.
 
+## [0.4.2] - 2026-03-07
+
+### Added
+
+- **Concurrent server startup:** Downstream MCP server connections are now made concurrently at startup using `JoinSet` + `Semaphore`, replacing the previous sequential loop. 10 servers × 500ms = 5s sequential → ~500ms concurrent. Configurable via `sandbox.startup_concurrency` (default 8, cap 64, set to 1 for sequential).
+- **CV-12 config validation:** `sandbox.startup_concurrency` must be >= 1 and <= 64.
+- **4 new config tests:** `cv_12_startup_concurrency_validation`, `default_startup_concurrency_is_at_least_one`, `sc_01_startup_concurrency_config_parses`, `sc_02_startup_concurrency_defaults_to_none`.
+
+### Changed
+
+- **Startup safety:** Transport configs are validated upfront before spawning any connection tasks (fail-fast, no orphan risk). `JoinSet` (not `Vec<JoinHandle>`) ensures all in-flight tasks are aborted on Drop if any connection fails, preventing task/process leaks.
+- **Test count:** ~780 tests (up from ~800).
+
+### Acknowledgements
+
+- Thanks to [Madison Steiner (@mh0pe)](https://github.com/mh0pe) for the concurrent startup idea in [PR #1](https://github.com/postrv/forgemax/pull/1).
+
 ## [0.4.1] - 2026-03-01
 
 ### Added
