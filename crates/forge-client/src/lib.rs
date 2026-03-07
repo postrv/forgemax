@@ -376,6 +376,26 @@ impl ToolDispatcher for McpClient {
                 message: format!("tool call failed: tool='{}': {}", tool, e),
             })?;
 
+        // Tool-level errors (isError: true) mean the server is healthy but
+        // the tool rejected the request (wrong params, missing state, etc.).
+        // These must NOT trip the circuit breaker.
+        if result.is_error == Some(true) && result.structured_content.is_none() {
+            let error_text = result
+                .content
+                .iter()
+                .filter_map(|c| match &c.raw {
+                    RawContent::Text(t) => Some(t.text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            return Err(forge_error::DispatchError::ToolError {
+                server: self.name.clone(),
+                tool: tool.to_string(),
+                message: format!("tool returned error: {}", error_text),
+            });
+        }
+
         call_tool_result_to_value(result).map_err(|e| forge_error::DispatchError::Upstream {
             server: self.name.clone(),
             message: e.to_string(),
@@ -764,6 +784,50 @@ mod tests {
         assert!(!is_sensitive_header("Content-Type"));
         assert!(!is_sensitive_header("Accept"));
         assert!(!is_sensitive_header("User-Agent"));
+    }
+
+    // --- isError classification tests ---
+
+    #[test]
+    fn call_tool_result_is_error_true_returns_err() {
+        let result = CallToolResult {
+            content: vec![Content::text("Invalid params: missing field 'base_url'")],
+            is_error: Some(true),
+            structured_content: None,
+            meta: None,
+        };
+        let err = call_tool_result_to_value(result);
+        assert!(err.is_err());
+        let msg = err.unwrap_err().to_string();
+        assert!(
+            msg.contains("Invalid params"),
+            "expected error text, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn call_tool_result_success_returns_ok() {
+        let result = CallToolResult {
+            content: vec![Content::text(r#"{"status": "ok"}"#)],
+            is_error: None,
+            structured_content: None,
+            meta: None,
+        };
+        let val = call_tool_result_to_value(result).unwrap();
+        assert_eq!(val["status"], "ok");
+    }
+
+    #[test]
+    fn call_tool_result_structured_content_takes_priority_over_is_error() {
+        let structured = serde_json::json!({"data": "important"});
+        let result = CallToolResult {
+            content: vec![Content::text("error text")],
+            is_error: Some(true),
+            structured_content: Some(structured.clone()),
+            meta: None,
+        };
+        let val = call_tool_result_to_value(result).unwrap();
+        assert_eq!(val, structured);
     }
 
     /// Compile-time guard: TransportConfig is #[non_exhaustive].

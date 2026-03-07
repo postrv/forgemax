@@ -46,12 +46,31 @@ pub enum DispatchError {
         reason: String,
     },
 
-    /// An upstream MCP server returned an error.
+    /// An upstream MCP server returned an error at the transport or RPC level.
+    ///
+    /// This indicates a potential server health issue (connection refused,
+    /// broken pipe, JSON-RPC protocol error). The server may be down or
+    /// malfunctioning.
     #[error("upstream error from '{server}': {message}")]
     Upstream {
         /// The server that returned the error.
         server: String,
         /// The error message from the upstream server.
+        message: String,
+    },
+
+    /// A tool returned an application-level error (MCP `isError: true`).
+    ///
+    /// The downstream server is healthy — the tool processed the request but
+    /// returned an error (e.g., bad parameters, missing prerequisite state).
+    /// This does NOT indicate a server health issue.
+    #[error("tool error on '{server}' calling '{tool}': {message}")]
+    ToolError {
+        /// The server that hosted the tool.
+        server: String,
+        /// The tool that returned the error.
+        tool: String,
+        /// The error message from the tool.
         message: String,
     },
 
@@ -74,8 +93,30 @@ impl DispatchError {
             Self::CircuitOpen(_) => "CIRCUIT_OPEN",
             Self::GroupPolicyDenied { .. } => "GROUP_POLICY_DENIED",
             Self::Upstream { .. } => "UPSTREAM_ERROR",
+            Self::ToolError { .. } => "TOOL_ERROR",
             Self::RateLimit(_) => "RATE_LIMIT",
             Self::Internal(_) => "INTERNAL",
+        }
+    }
+
+    /// Whether this error indicates the server is unhealthy and should count
+    /// toward the circuit breaker failure threshold.
+    ///
+    /// Returns `true` for errors suggesting the server is down or unresponsive
+    /// (`Timeout`, `Upstream` transport/RPC failures, `Internal`).
+    /// Returns `false` for errors where the server responded coherently but the
+    /// request was invalid (`ToolError`, `ToolNotFound`, etc).
+    pub fn trips_circuit_breaker(&self) -> bool {
+        match self {
+            Self::Timeout { .. } => true,
+            Self::Upstream { .. } => true,
+            Self::Internal(_) => true,
+            Self::ToolError { .. } => false,
+            Self::ServerNotFound(_) => false,
+            Self::ToolNotFound { .. } => false,
+            Self::GroupPolicyDenied { .. } => false,
+            Self::RateLimit(_) => false,
+            Self::CircuitOpen(_) => false,
         }
     }
 
@@ -86,6 +127,7 @@ impl DispatchError {
             Self::CircuitOpen(_) => true,
             Self::RateLimit(_) => true,
             Self::Upstream { .. } => true,
+            Self::ToolError { .. } => false,
             Self::ServerNotFound(_) => false,
             Self::ToolNotFound { .. } => false,
             Self::GroupPolicyDenied { .. } => false,
@@ -117,6 +159,9 @@ impl DispatchError {
                 } else {
                     None
                 }
+            }
+            Self::ToolError { .. } => {
+                Some("Check the tool's input_schema for correct parameter names".to_string())
             }
             Self::CircuitOpen(_) => Some("Retry after a delay".to_string()),
             Self::Timeout { .. } => Some("Retry with a simpler operation".to_string()),
@@ -292,6 +337,14 @@ mod tests {
                 },
                 "UPSTREAM_ERROR",
             ),
+            (
+                DispatchError::ToolError {
+                    server: "s".into(),
+                    tool: "t".into(),
+                    message: "m".into(),
+                },
+                "TOOL_ERROR",
+            ),
             (DispatchError::RateLimit("x".into()), "RATE_LIMIT"),
             (DispatchError::Internal(anyhow::anyhow!("x")), "INTERNAL"),
         ];
@@ -324,8 +377,54 @@ mod tests {
             tool: "t".into()
         }
         .retryable());
+        assert!(!DispatchError::ToolError {
+            server: "s".into(),
+            tool: "t".into(),
+            message: "m".into()
+        }
+        .retryable());
         assert!(!DispatchError::GroupPolicyDenied { reason: "r".into() }.retryable());
         assert!(!DispatchError::Internal(anyhow::anyhow!("x")).retryable());
+    }
+
+    // --- trips_circuit_breaker tests ---
+
+    #[test]
+    fn trips_cb_true_for_server_faults() {
+        assert!(DispatchError::Timeout {
+            server: "s".into(),
+            timeout_ms: 5000
+        }
+        .trips_circuit_breaker());
+        assert!(DispatchError::Upstream {
+            server: "s".into(),
+            message: "connection refused".into()
+        }
+        .trips_circuit_breaker());
+        assert!(DispatchError::Internal(anyhow::anyhow!("unexpected")).trips_circuit_breaker());
+    }
+
+    #[test]
+    fn trips_cb_false_for_tool_error() {
+        assert!(!DispatchError::ToolError {
+            server: "arbiter".into(),
+            tool: "scan".into(),
+            message: "Invalid params: missing field 'base_url'".into()
+        }
+        .trips_circuit_breaker());
+    }
+
+    #[test]
+    fn trips_cb_false_for_client_errors() {
+        assert!(!DispatchError::ServerNotFound("x".into()).trips_circuit_breaker());
+        assert!(!DispatchError::ToolNotFound {
+            server: "s".into(),
+            tool: "t".into()
+        }
+        .trips_circuit_breaker());
+        assert!(!DispatchError::GroupPolicyDenied { reason: "r".into() }.trips_circuit_breaker());
+        assert!(!DispatchError::RateLimit("x".into()).trips_circuit_breaker());
+        assert!(!DispatchError::CircuitOpen("x".into()).trips_circuit_breaker());
     }
 
     #[test]
@@ -422,6 +521,33 @@ mod tests {
         let json = err.to_structured_error(None);
         assert_eq!(json["retryable"], true);
         assert!(json["suggested_fix"].as_str().unwrap().contains("Retry"));
+    }
+
+    #[test]
+    fn display_tool_error() {
+        let err = DispatchError::ToolError {
+            server: "arbiter".into(),
+            tool: "scan_target".into(),
+            message: "tool returned error: Invalid params: missing field 'base_url'".into(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "tool error on 'arbiter' calling 'scan_target': tool returned error: Invalid params: missing field 'base_url'"
+        );
+    }
+
+    #[test]
+    fn structured_error_tool_error_has_schema_suggestion() {
+        let err = DispatchError::ToolError {
+            server: "arbiter".into(),
+            tool: "scan".into(),
+            message: "Invalid params: missing field 'base_url'".into(),
+        };
+        let json = err.to_structured_error(None);
+        assert_eq!(json["code"], "TOOL_ERROR");
+        assert_eq!(json["retryable"], false);
+        let fix = json["suggested_fix"].as_str().unwrap();
+        assert!(fix.contains("input_schema"), "expected schema hint, got: {fix}");
     }
 
     #[test]

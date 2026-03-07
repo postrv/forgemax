@@ -40,10 +40,10 @@ pub struct IpcDispatchError {
     pub code: String,
     /// Human-readable error message.
     pub message: String,
-    /// Server name (for ServerNotFound, ToolNotFound, Timeout, CircuitOpen, Upstream).
+    /// Server name (for ServerNotFound, ToolNotFound, ToolError, Timeout, CircuitOpen, Upstream).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server: Option<String>,
-    /// Tool name (for ToolNotFound).
+    /// Tool name (for ToolNotFound, ToolError).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool: Option<String>,
     /// Timeout in milliseconds (for Timeout).
@@ -88,6 +88,11 @@ impl IpcDispatchError {
                 server: self.server.unwrap_or_default(),
                 message: self.message,
             },
+            "TOOL_ERROR" => forge_error::DispatchError::ToolError {
+                server: self.server.unwrap_or_default(),
+                tool: self.tool.unwrap_or_default(),
+                message: self.message,
+            },
             "RATE_LIMIT" => forge_error::DispatchError::RateLimit(self.message),
             _ => forge_error::DispatchError::Internal(anyhow::anyhow!("{}", self.message)),
         }
@@ -107,6 +112,9 @@ impl From<&forge_error::DispatchError> for IpcDispatchError {
             forge_error::DispatchError::CircuitOpen(s) => (Some(s.clone()), None, None),
             forge_error::DispatchError::Upstream { server, .. } => {
                 (Some(server.clone()), None, None)
+            }
+            forge_error::DispatchError::ToolError { server, tool, .. } => {
+                (Some(server.clone()), Some(tool.clone()), None)
             }
             _ => (None, None, None),
         };
@@ -1779,5 +1787,75 @@ mod tests {
             .unwrap();
         let parsed: ChildMessage = serde_json::from_str(d2.get()).unwrap();
         assert!(matches!(parsed, ChildMessage::Log { .. }));
+    }
+
+    // --- ToolError IPC round-trip tests ---
+
+    #[tokio::test]
+    async fn tool_error_round_trips_through_ipc() {
+        let original = forge_error::DispatchError::ToolError {
+            server: "arbiter".into(),
+            tool: "scan_target".into(),
+            message: "tool returned error: Invalid params: missing field 'base_url'".into(),
+        };
+
+        // Convert to IPC form
+        let ipc_err = IpcDispatchError::from(&original);
+        assert_eq!(ipc_err.code, "TOOL_ERROR");
+        assert_eq!(ipc_err.server, Some("arbiter".into()));
+        assert_eq!(ipc_err.tool, Some("scan_target".into()));
+        assert!(ipc_err.message.contains("Invalid params"));
+
+        // Round-trip through serialization
+        let json = serde_json::to_string(&ipc_err).unwrap();
+        let deserialized: IpcDispatchError = serde_json::from_str(&json).unwrap();
+
+        // Reconstruct DispatchError
+        let reconstructed = deserialized.to_dispatch_error();
+        assert!(matches!(
+            reconstructed,
+            forge_error::DispatchError::ToolError {
+                ref server,
+                ref tool,
+                ..
+            } if server == "arbiter" && tool == "scan_target"
+        ));
+        assert!(!reconstructed.trips_circuit_breaker());
+        assert_eq!(reconstructed.code(), "TOOL_ERROR");
+    }
+
+    #[tokio::test]
+    async fn tool_error_ipc_message_roundtrip() {
+        let msg = ParentMessage::ToolCallResult {
+            request_id: 42,
+            result: Err(IpcDispatchError::from(
+                &forge_error::DispatchError::ToolError {
+                    server: "arbiter".into(),
+                    tool: "scan".into(),
+                    message: "bad params".into(),
+                },
+            )),
+        };
+
+        let mut buf = Vec::new();
+        write_message(&mut buf, &msg).await.unwrap();
+
+        let mut cursor = Cursor::new(buf);
+        let decoded: ParentMessage = read_message(&mut cursor).await.unwrap().unwrap();
+
+        match decoded {
+            ParentMessage::ToolCallResult { request_id, result } => {
+                assert_eq!(request_id, 42);
+                let err = result.unwrap_err();
+                assert_eq!(err.code, "TOOL_ERROR");
+                assert_eq!(err.server, Some("arbiter".into()));
+                assert_eq!(err.tool, Some("scan".into()));
+
+                // Verify it reconstructs to the correct variant
+                let dispatch_err = err.to_dispatch_error();
+                assert!(!dispatch_err.trips_circuit_breaker());
+            }
+            other => panic!("expected ToolCallResult, got: {:?}", other),
+        }
     }
 }
