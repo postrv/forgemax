@@ -87,7 +87,7 @@ pub async fn execute(args: &InitArgs) -> Result<()> {
     }
 
     let content = match args.example.as_deref() {
-        Some("production") => include_str!("../../../../forge.toml.example.production").to_string(),
+        Some("production") => include_str!("../../forge.toml.example.production").to_string(),
         Some(other) => {
             anyhow::bail!(
                 "unknown example template: '{}'. Available: production",
@@ -165,7 +165,7 @@ mod tests {
 
     #[test]
     fn in_04_production_template_parses() {
-        let content = include_str!("../../../../forge.toml.example.production");
+        let content = include_str!("../../forge.toml.example.production");
         forge_config::ForgeConfig::from_toml(content).expect("production template must parse");
     }
 
@@ -283,7 +283,7 @@ mod tests {
 
     #[tokio::test]
     async fn in_11_production_example_has_circuit_breakers() {
-        let content = include_str!("../../../../forge.toml.example.production");
+        let content = include_str!("../../forge.toml.example.production");
         let config = forge_config::ForgeConfig::from_toml(content).unwrap();
 
         // Production config should have circuit breakers enabled on servers

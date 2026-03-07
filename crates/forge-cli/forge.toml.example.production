@@ -1,0 +1,94 @@
+# Forge — Production Configuration Example
+#
+# This example demonstrates a hardened production configuration with:
+# - Worker pool enabled for process reuse (~5-10ms vs ~50ms per call)
+# - Circuit breakers on all servers
+# - Strict group isolation between internal and external services
+# - Stash limits tuned for production workloads
+#
+# Copy and adapt for your deployment:
+#   cp forge.toml.example.production forge.toml
+#
+# Environment variables are expanded: ${VAR_NAME}
+# Set file permissions: chmod 600 forge.toml
+
+# ─── Downstream Servers ─────────────────────────────────────────────
+
+[servers.narsil]
+command = "narsil-mcp"
+args = ["--repos", "."]
+transport = "stdio"
+description = "Code intelligence"
+timeout_secs = 30
+circuit_breaker = true
+failure_threshold = 3
+recovery_timeout_secs = 30
+
+[servers.github]
+command = "docker"
+args = ["run", "-i", "--rm", "-e", "GITHUB_PERSONAL_ACCESS_TOKEN", "ghcr.io/github/github-mcp-server"]
+transport = "stdio"
+description = "GitHub API"
+timeout_secs = 30
+circuit_breaker = true
+failure_threshold = 3
+recovery_timeout_secs = 30
+
+[servers.supabase]
+command = "npx"
+args = ["-y", "@supabase/mcp-server-supabase@latest", "--access-token", "${SUPABASE_ACCESS_TOKEN}"]
+transport = "stdio"
+description = "Database and auth"
+timeout_secs = 30
+circuit_breaker = true
+failure_threshold = 3
+recovery_timeout_secs = 30
+
+# ─── Sandbox Settings ───────────────────────────────────────────────
+
+[sandbox]
+timeout_secs = 5
+max_heap_mb = 64
+max_concurrent = 8
+max_tool_calls = 50
+execution_mode = "child_process"
+max_resource_size_mb = 7
+max_ipc_message_size_mb = 64
+max_parallel = 8
+startup_concurrency = 4    # Connect up to 4 servers concurrently at startup
+
+# ─── Worker Pool ─────────────────────────────────────────────────────
+
+[sandbox.pool]
+enabled = true
+min_workers = 2
+max_workers = 8
+max_idle_secs = 60
+max_uses = 50
+
+# ─── Session Stash ──────────────────────────────────────────────────
+
+[sandbox.stash]
+max_keys = 256
+max_value_size_mb = 16
+max_total_size_mb = 128
+default_ttl_secs = 3600
+max_ttl_secs = 86400
+
+# ─── Server Groups ──────────────────────────────────────────────────
+#
+# Strict isolation: data from internal servers cannot flow to external
+# servers within a single execute() call.
+
+[groups.internal]
+servers = ["supabase"]
+isolation = "strict"
+
+[groups.devtools]
+servers = ["narsil", "github"]
+isolation = "strict"
+
+# ─── Manifest Refresh ───────────────────────────────────────────────
+
+[manifest]
+refresh_interval_secs = 300
