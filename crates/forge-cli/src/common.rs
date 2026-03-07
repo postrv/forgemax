@@ -160,88 +160,154 @@ pub fn feature_status_line() -> String {
     )
 }
 
+/// Result of connecting to a single downstream server.
+struct ServerConnectionResult {
+    name: String,
+    description: String,
+    client: Arc<McpClient>,
+    mcp_tools: Vec<McpTool>,
+    tool_names: Vec<String>,
+    resources: Vec<forge_client::ResourceInfo>,
+    server_config: forge_config::ServerConfig,
+}
+
 /// Connect to all downstream servers and build the capability manifest.
+///
+/// Connections are made concurrently (controlled by `sandbox.startup_concurrency`,
+/// default 8). Transport configs are validated upfront before spawning any tasks.
+/// Uses `JoinSet` so that all in-flight tasks are aborted on Drop if any connection
+/// fails (preventing task/process leaks).
 pub async fn connect_and_build_manifest(config: &ForgeConfig) -> Result<ConnectResult> {
+    // Phase 1: Compute concurrency
+    let concurrency = config
+        .sandbox
+        .startup_concurrency
+        .unwrap_or_else(forge_config::default_startup_concurrency);
+
+    // Phase 2: Validate ALL transport configs upfront (fail fast, no orphans)
+    let mut validated: Vec<(String, forge_config::ServerConfig, TransportConfig)> =
+        Vec::with_capacity(config.servers.len());
+    for (name, server_config) in &config.servers {
+        let transport_config = to_transport_config(server_config)
+            .with_context(|| format!("invalid transport config for server '{}'", name))?;
+        validated.push((name.clone(), server_config.clone(), transport_config));
+    }
+
+    // Phase 3: Spawn concurrent connection tasks via JoinSet + Semaphore
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
+    let mut join_set = tokio::task::JoinSet::new();
+
+    for (name, server_config, transport_config) in validated {
+        let sem = semaphore.clone();
+        join_set.spawn(async move {
+            let _permit = sem
+                .acquire()
+                .await
+                .map_err(|_| anyhow::anyhow!("semaphore closed"))?;
+
+            tracing::info!(server = %name, "connecting to downstream server");
+
+            let client = McpClient::connect(name.clone(), &transport_config)
+                .await
+                .with_context(|| format!("failed to connect to server '{}'", name))?;
+
+            let tools = client
+                .list_tools()
+                .await
+                .with_context(|| format!("failed to list tools for server '{}'", name))?;
+
+            let resources = match client.list_resources().await {
+                Ok(res) => {
+                    if !res.is_empty() {
+                        tracing::info!(
+                            server = %name,
+                            resource_count = res.len(),
+                            "discovered resources"
+                        );
+                    }
+                    res
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        server = %name,
+                        error = %e,
+                        "server does not support resources (graceful degradation)"
+                    );
+                    Vec::new()
+                }
+            };
+
+            let mcp_tools: Vec<McpTool> = tools
+                .into_iter()
+                .map(|t| McpTool {
+                    name: t.name,
+                    description: t.description,
+                    input_schema: Some(t.input_schema),
+                })
+                .collect();
+
+            let tool_names: Vec<String> = mcp_tools.iter().map(|t| t.name.clone()).collect();
+            let description = server_config
+                .description
+                .as_deref()
+                .unwrap_or("MCP server")
+                .to_string();
+
+            tracing::info!(
+                server = %name,
+                tool_count = mcp_tools.len(),
+                resource_count = resources.len(),
+                "discovered capabilities"
+            );
+
+            Ok(ServerConnectionResult {
+                name,
+                description,
+                client: Arc::new(client),
+                mcp_tools,
+                tool_names,
+                resources,
+                server_config,
+            })
+        });
+    }
+
+    // Phase 4: Collect results (fail fast — JoinSet Drop aborts the rest)
+    let mut results: Vec<ServerConnectionResult> = Vec::new();
+    while let Some(join_result) = join_set.join_next().await {
+        let result: Result<ServerConnectionResult> =
+            join_result.map_err(|e| anyhow::anyhow!("server connection task panicked: {}", e))?;
+        results.push(result?);
+    }
+
+    // Phase 5: Sequential assembly (manifest, timeout/CB wrappers, router)
     let mut router = RouterDispatcher::new();
     let mut resource_router = RouterResourceDispatcher::new();
     let mut manifest_builder = ManifestBuilder::new();
     let mut has_any_resources = false;
     let mut client_refs: Vec<(String, String, Arc<McpClient>)> = Vec::new();
 
-    for (name, server_config) in &config.servers {
-        let transport_config = to_transport_config(server_config)?;
+    for result in results {
+        let ServerConnectionResult {
+            name,
+            description,
+            client,
+            mcp_tools,
+            tool_names,
+            resources,
+            server_config,
+        } = result;
 
-        tracing::info!(server = %name, "connecting to downstream server");
-
-        let client = McpClient::connect(name.clone(), &transport_config)
-            .await
-            .with_context(|| format!("failed to connect to server '{}'", name))?;
-
-        // Discover tools
-        let tools = client
-            .list_tools()
-            .await
-            .with_context(|| format!("failed to list tools for server '{}'", name))?;
-
-        // Discover resources (graceful degradation if not supported)
-        let resources = match client.list_resources().await {
-            Ok(res) => {
-                if !res.is_empty() {
-                    tracing::info!(
-                        server = %name,
-                        resource_count = res.len(),
-                        "discovered resources"
-                    );
-                }
-                res
-            }
-            Err(e) => {
-                tracing::debug!(
-                    server = %name,
-                    error = %e,
-                    "server does not support resources (graceful degradation)"
-                );
-                Vec::new()
-            }
-        };
-
-        tracing::info!(
-            server = %name,
-            tool_count = tools.len(),
-            resource_count = resources.len(),
-            "discovered capabilities"
-        );
-
-        // Build manifest entry from live tool list
-        let mcp_tools: Vec<McpTool> = tools
-            .into_iter()
-            .map(|t| McpTool {
-                name: t.name,
-                description: t.description,
-                input_schema: Some(t.input_schema),
-            })
-            .collect();
-
-        // Extract tool names for pre-dispatch validation before mcp_tools is consumed
-        let tool_names: Vec<String> = mcp_tools.iter().map(|t| t.name.clone()).collect();
-
-        let description = server_config.description.as_deref().unwrap_or("MCP server");
-        let server_entry = server_entry_from_tools(name, description, mcp_tools);
+        let server_entry = server_entry_from_tools(&name, &description, mcp_tools);
         manifest_builder = manifest_builder.add_server(server_entry);
 
-        // Arc the client so it can be shared between tool and resource dispatchers.
-        let client = Arc::new(client);
-
-        // Retain reference for manifest refresh
-        let desc_str = description.to_string();
-        client_refs.push((name.clone(), desc_str, client.clone()));
+        client_refs.push((name.clone(), description, client.clone()));
 
         // Wire resource dispatcher if any resources exist
         if !resources.is_empty() {
             has_any_resources = true;
             let resource_client: Arc<dyn ResourceDispatcher> = client.clone();
 
-            // Wrap resource client with per-server timeout if configured
             let resource_client: Arc<dyn ResourceDispatcher> =
                 if let Some(secs) = server_config.timeout_secs {
                     Arc::new(TimeoutResourceDispatcher::new(
@@ -253,7 +319,6 @@ pub async fn connect_and_build_manifest(config: &ForgeConfig) -> Result<ConnectR
                     resource_client
                 };
 
-            // Wrap with circuit breaker if enabled
             let resource_client: Arc<dyn ResourceDispatcher> =
                 if server_config.circuit_breaker == Some(true) {
                     let cb_config = CircuitBreakerConfig {
@@ -303,7 +368,6 @@ pub async fn connect_and_build_manifest(config: &ForgeConfig) -> Result<ConnectR
             client
         };
 
-        // Register known tool names for pre-dispatch validation, then add client
         router.set_known_tools(name.clone(), tool_names);
         router.add_client(name.clone(), client);
     }

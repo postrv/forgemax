@@ -174,6 +174,11 @@ pub struct SandboxOverrides {
     #[serde(default)]
     pub max_parallel: Option<usize>,
 
+    /// Maximum number of servers to connect to concurrently at startup.
+    /// Defaults to 8. Set to 1 for sequential startup.
+    #[serde(default)]
+    pub startup_concurrency: Option<usize>,
+
     /// Stash configuration overrides.
     #[serde(default)]
     pub stash: Option<StashOverrides>,
@@ -410,6 +415,15 @@ impl ForgeConfig {
             }
         }
 
+        // CV-12: startup_concurrency must be >= 1 and <= 64
+        if let Some(sc) = self.sandbox.startup_concurrency {
+            if sc == 0 || sc > 64 {
+                return Err(ConfigError::Invalid(
+                    "sandbox.startup_concurrency must be >= 1 and <= 64".into(),
+                ));
+            }
+        }
+
         // Validate pool config
         if let Some(ref pool) = self.sandbox.pool {
             self.validate_pool(pool)?;
@@ -463,6 +477,11 @@ impl ForgeConfig {
 
         Ok(())
     }
+}
+
+/// Default startup concurrency for connecting to downstream servers.
+pub fn default_startup_concurrency() -> usize {
+    8
 }
 
 /// Expand `${ENV_VAR}` patterns in a string using environment variables.
@@ -1256,6 +1275,52 @@ mod tests {
         assert!(config.sandbox.stash.is_none());
         assert!(config.sandbox.pool.is_none());
         assert_eq!(config.servers.len(), 1);
+    }
+
+    // --- Startup concurrency tests (CV-12, SC-01..SC-02) ---
+
+    #[test]
+    fn cv_12_startup_concurrency_validation() {
+        // 0 is invalid
+        let toml = "[sandbox]\nstartup_concurrency = 0";
+        let err = ForgeConfig::from_toml(toml).unwrap_err().to_string();
+        assert!(err.contains("startup_concurrency"), "got: {err}");
+
+        // 65 is invalid
+        let toml = "[sandbox]\nstartup_concurrency = 65";
+        let err = ForgeConfig::from_toml(toml).unwrap_err().to_string();
+        assert!(err.contains("startup_concurrency"), "got: {err}");
+
+        // 1 is valid (sequential)
+        let toml = "[sandbox]\nstartup_concurrency = 1";
+        assert!(ForgeConfig::from_toml(toml).is_ok());
+
+        // 8 is valid (default)
+        let toml = "[sandbox]\nstartup_concurrency = 8";
+        assert!(ForgeConfig::from_toml(toml).is_ok());
+
+        // 64 is valid (max)
+        let toml = "[sandbox]\nstartup_concurrency = 64";
+        assert!(ForgeConfig::from_toml(toml).is_ok());
+    }
+
+    #[test]
+    fn default_startup_concurrency_is_at_least_one() {
+        assert!(default_startup_concurrency() >= 1);
+    }
+
+    #[test]
+    fn sc_01_startup_concurrency_config_parses() {
+        let toml = "[sandbox]\nstartup_concurrency = 4";
+        let config = ForgeConfig::from_toml(toml).unwrap();
+        assert_eq!(config.sandbox.startup_concurrency, Some(4));
+    }
+
+    #[test]
+    fn sc_02_startup_concurrency_defaults_to_none() {
+        let toml = "[sandbox]\ntimeout_secs = 5";
+        let config = ForgeConfig::from_toml(toml).unwrap();
+        assert!(config.sandbox.startup_concurrency.is_none());
     }
 
     /// Compile-time guard: ConfigError is #[non_exhaustive].

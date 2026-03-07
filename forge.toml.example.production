@@ -55,6 +55,7 @@ execution_mode = "child_process"
 max_resource_size_mb = 7
 max_ipc_message_size_mb = 64
 max_parallel = 8
+startup_concurrency = 4    # Connect up to 4 servers concurrently at startup
 
 # ─── Worker Pool ─────────────────────────────────────────────────────
 
