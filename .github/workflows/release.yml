@@ -92,6 +92,7 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
+          VERSION="${GITHUB_REF_NAME#v}"
           CRATES=(
             forge-error
             forge-audit
@@ -103,16 +104,55 @@ jobs:
             forge-server
             forge-cli
           )
+
+          wait_for_crate() {
+            local crate="$1" version="$2"
+            echo "Waiting for $crate $version to appear in crates.io index..."
+            for i in $(seq 1 30); do
+              sleep 10
+              cargo update --dry-run 2>&1 || true
+              if cargo search "$crate" 2>/dev/null | grep -q "\"$version\""; then
+                echo "$crate $version is now available"
+                return 0
+              fi
+              echo "  attempt $i/30: $crate $version not yet indexed..."
+            done
+            echo "::warning::Timed out waiting for $crate $version in index (5 min)"
+            return 1
+          }
+
+          FAILED=()
           for crate in "${CRATES[@]}"; do
-            echo "Publishing $crate..."
-            for attempt in 1 2 3; do
-              cargo publish -p "$crate" --allow-dirty && break
-              echo "Attempt $attempt failed for $crate, waiting for index sync..."
+            echo "::group::Publishing $crate"
+            PUBLISHED=false
+            for attempt in 1 2 3 4 5; do
+              if cargo publish -p "$crate" --allow-dirty 2>&1; then
+                PUBLISHED=true
+                break
+              fi
+              OUTPUT=$(cargo publish -p "$crate" --allow-dirty 2>&1 || true)
+              if echo "$OUTPUT" | grep -q "already uploaded"; then
+                echo "$crate $VERSION is already published"
+                PUBLISHED=true
+                break
+              fi
+              echo "Attempt $attempt/5 failed for $crate, waiting for index sync..."
               sleep 30
             done
-            # Wait for crates.io index to update before next crate
-            sleep 45
+            echo "::endgroup::"
+
+            if [ "$PUBLISHED" = true ]; then
+              wait_for_crate "$crate" "$VERSION" || true
+            else
+              echo "::error::Failed to publish $crate after 5 attempts"
+              FAILED+=("$crate")
+            fi
           done
+
+          if [ ${#FAILED[@]} -gt 0 ]; then
+            echo "::error::Failed to publish: ${FAILED[*]}"
+            exit 1
+          fi
 
   build-binaries:
     name: Build binaries
