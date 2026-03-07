@@ -199,7 +199,7 @@ Quick start:
 install().catch((err) => {
   console.error(`Failed to install forgemax: ${err.message}`);
   console.error(
-    "\nFallback: install from source with `cargo install forge-cli`"
+    "\nFallback: install from source with `cargo install forgemax`"
   );
   process.exit(1);
 });

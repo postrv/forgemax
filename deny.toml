@@ -31,7 +31,7 @@ allow = [
 # Workspace crates use FSL-1.1-ALv2 (Functional Source License),
 # which is not a standard SPDX identifier. Allow it explicitly.
 exceptions = [
-    { allow = ["FSL-1.1-ALv2"], crate = "forge-cli" },
+    { allow = ["FSL-1.1-ALv2"], crate = "forgemax" },
     { allow = ["FSL-1.1-ALv2"], crate = "forge-sandbox" },
     { allow = ["FSL-1.1-ALv2"], crate = "forge-sandbox-worker" },
     { allow = ["FSL-1.1-ALv2"], crate = "forge-manifest" },

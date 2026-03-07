@@ -509,7 +509,7 @@ mod tests {
                     "error should not mention PATH: {msg}"
                 );
                 assert!(
-                    msg.contains("FORGE_WORKER_BIN") || msg.contains("forge-cli"),
+                    msg.contains("FORGE_WORKER_BIN") || msg.contains("forgemax"),
                     "error should guide user: {msg}"
                 );
             }

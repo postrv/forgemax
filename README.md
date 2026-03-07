@@ -136,7 +136,7 @@ scoop install forgemax
 
 **Cargo** (from source):
 ```bash
-cargo install forge-cli
+cargo install forgemax
 ```
 
 **From source**:

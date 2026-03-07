@@ -114,7 +114,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: ./.github/actions/fetch-v8
       - name: Build release binary
-        run: cargo build --release -p forge-cli
+        run: cargo build --release -p forgemax
       - name: Create minimal test config
         run: |
           cat > /tmp/forge-doctor-test.toml <<'EOF'

@@ -44,7 +44,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the full system design. Key crates:
 | `forge-server` | MCP server (rmcp), search + execute tools |
 | `forge-client` | MCP client connections, router, timeout, circuit breaker |
 | `forge-config` | TOML config, env var expansion, validation |
-| `forge-cli` | Binary entry point, clap subcommands |
+| `forgemax` (dir: `forge-cli`) | Binary entry point, clap subcommands |
 | `forge-error` | Typed DispatchError with fuzzy matching |
 | `forge-audit` | Audit event types |
 | `forge-test-server` | Mock MCP server for integration tests |

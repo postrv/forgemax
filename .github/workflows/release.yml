@@ -38,14 +38,14 @@ jobs:
         run: |
           TAG_VERSION="${GITHUB_REF_NAME#v}"
           CARGO_VERSION=$(cargo metadata --no-deps --format-version 1 | \
-            jq -r '.packages[] | select(.name == "forge-cli") | .version')
+            jq -r '.packages[] | select(.name == "forgemax") | .version')
           if [ "$TAG_VERSION" != "$CARGO_VERSION" ]; then
             echo "::error::Tag version ($TAG_VERSION) does not match Cargo.toml version ($CARGO_VERSION)"
             exit 1
           fi
       - name: Verify --version output
         run: |
-          cargo build --release -p forge-cli
+          cargo build --release -p forgemax
           VERSION_OUTPUT=$(./target/release/forgemax --version)
           EXPECTED="forgemax ${GITHUB_REF_NAME#v}"
           if [ "$VERSION_OUTPUT" != "$EXPECTED" ]; then
@@ -102,7 +102,7 @@ jobs:
             forge-sandbox-worker
             forge-client
             forge-server
-            forge-cli
+            forgemax
           )
 
           wait_for_crate() {

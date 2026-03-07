@@ -20,7 +20,7 @@ function Get-LatestVersion {
     }
     catch {
         Write-Err "Failed to fetch latest version: $_"
-        Write-Err "Try: cargo install forge-cli"
+        Write-Err "Try: cargo install forgemax"
         exit 1
     }
 }
@@ -55,7 +55,7 @@ function Install-Forgemax {
     }
     catch {
         Write-Err "Download failed: $_"
-        Write-Err "Try: cargo install forge-cli"
+        Write-Err "Try: cargo install forgemax"
         exit 1
     }
 

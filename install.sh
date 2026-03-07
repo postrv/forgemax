@@ -32,7 +32,7 @@ detect_platform() {
     Darwin*) os="macos" ;;
     *)
       error "Unsupported OS: $(uname -s)"
-      error "Try: cargo install forge-cli"
+      error "Try: cargo install forgemax"
       exit 1
       ;;
   esac
@@ -42,7 +42,7 @@ detect_platform() {
     aarch64|arm64) arch="aarch64" ;;
     *)
       error "Unsupported architecture: $(uname -m)"
-      error "Try: cargo install forge-cli"
+      error "Try: cargo install forgemax"
       exit 1
       ;;
   esac
@@ -132,7 +132,7 @@ main() {
     version="$(get_latest_version)"
     if [ -z "$version" ]; then
       error "Failed to determine latest version"
-      error "Try: cargo install forge-cli"
+      error "Try: cargo install forgemax"
       exit 1
     fi
     info "Latest version: v${version}"
@@ -145,7 +145,7 @@ main() {
   if ! download "$archive_url" "$archive_file"; then
     rm -f "$archive_file"
     error "Download failed"
-    error "Try: cargo install forge-cli"
+    error "Try: cargo install forgemax"
     exit 1
   fi
 

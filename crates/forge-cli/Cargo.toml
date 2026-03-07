@@ -1,5 +1,5 @@
 [package]
-name = "forge-cli"
+name = "forgemax"
 description = "Forgemax Code Mode MCP Gateway - CLI entry point"
 version.workspace = true
 edition.workspace = true

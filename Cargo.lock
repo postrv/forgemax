@@ -745,29 +745,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "forge-cli"
-version = "0.4.2"
-dependencies = [
- "anyhow",
- "async-trait",
- "clap",
- "forge-client",
- "forge-config",
- "forge-error",
- "forge-manifest",
- "forge-sandbox",
- "forge-server",
- "rmcp",
- "serde",
- "serde_json",
- "strsim",
- "tempfile",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "forge-client"
 version = "0.4.2"
 dependencies = [
@@ -892,6 +869,29 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "forgemax"
+version = "0.4.2"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "clap",
+ "forge-client",
+ "forge-config",
+ "forge-error",
+ "forge-manifest",
+ "forge-sandbox",
+ "forge-server",
+ "rmcp",
+ "serde",
+ "serde_json",
+ "strsim",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
