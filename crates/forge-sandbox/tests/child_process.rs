@@ -58,7 +58,9 @@ impl ToolDispatcher for SlowDispatcher {
 fn child_process_config() -> SandboxConfig {
     SandboxConfig {
         execution_mode: ExecutionMode::ChildProcess,
-        timeout: Duration::from_secs(120),
+        // Generous timeout for macOS CI runners where child process spawn + V8
+        // init can take 60s+ per test. The actual JS execution is instant.
+        timeout: Duration::from_secs(300),
         ..Default::default()
     }
 }
