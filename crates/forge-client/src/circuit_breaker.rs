@@ -670,7 +670,10 @@ mod tests {
         }
 
         let st = cb.state.lock().await;
-        assert_eq!(st.consecutive_failures, 2, "ToolError should not reset counter");
+        assert_eq!(
+            st.consecutive_failures, 2,
+            "ToolError should not reset counter"
+        );
         assert_eq!(st.state, CircuitState::Closed);
     }
 

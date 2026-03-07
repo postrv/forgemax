@@ -547,7 +547,10 @@ mod tests {
         assert_eq!(json["code"], "TOOL_ERROR");
         assert_eq!(json["retryable"], false);
         let fix = json["suggested_fix"].as_str().unwrap();
-        assert!(fix.contains("input_schema"), "expected schema hint, got: {fix}");
+        assert!(
+            fix.contains("input_schema"),
+            "expected schema hint, got: {fix}"
+        );
     }
 
     #[test]
