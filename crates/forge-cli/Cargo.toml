@@ -7,7 +7,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = true
-keywords = ["mcp", "model-context-protocol", "gateway", "ai", "code-mode"]
+keywords = ["mcp", "mcp-gateway", "gateway", "ai", "code-mode"]
 categories = ["command-line-utilities", "development-tools"]
 
 [[bin]]
