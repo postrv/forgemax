@@ -137,6 +137,14 @@ pub struct ServerConfig {
     /// Seconds to wait before probing a tripped circuit (default: 30).
     #[serde(default)]
     pub recovery_timeout_secs: Option<u64>,
+
+    /// Enable automatic reconnection on transport death (default: true for stdio).
+    #[serde(default)]
+    pub reconnect: Option<bool>,
+
+    /// Maximum reconnect backoff in seconds (default: 30).
+    #[serde(default)]
+    pub max_reconnect_backoff_secs: Option<u64>,
 }
 
 /// Sandbox configuration overrides.

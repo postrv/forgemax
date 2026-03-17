@@ -23,6 +23,8 @@ timeout_secs = 30
 circuit_breaker = true
 failure_threshold = 3
 recovery_timeout_secs = 30
+reconnect = true
+max_reconnect_backoff_secs = 30
 
 [servers.github]
 command = "docker"

@@ -9,6 +9,7 @@
 //! correct downstream server.
 
 pub mod circuit_breaker;
+pub mod reconnect;
 pub mod router;
 pub mod timeout;
 
@@ -28,6 +29,7 @@ use tokio::process::Command;
 pub use circuit_breaker::{
     CircuitBreakerConfig, CircuitBreakerDispatcher, CircuitBreakerResourceDispatcher,
 };
+pub use reconnect::ReconnectingClient;
 pub use router::{RouterDispatcher, RouterResourceDispatcher};
 pub use timeout::{TimeoutDispatcher, TimeoutResourceDispatcher};
 
@@ -296,10 +298,7 @@ impl McpClient {
         let result = self
             .inner
             .peer()
-            .read_resource(rmcp::model::ReadResourceRequestParams {
-                uri: uri.to_string(),
-                meta: None,
-            })
+            .read_resource(rmcp::model::ReadResourceRequestParams::new(uri))
             .await
             .with_context(|| {
                 format!(
@@ -364,16 +363,22 @@ impl ToolDispatcher for McpClient {
         let result: CallToolResult = self
             .inner
             .peer()
-            .call_tool(CallToolRequestParams {
-                meta: None,
-                name: Cow::Owned(tool.to_string()),
-                arguments,
-                task: None,
-            })
+            .call_tool(CallToolRequestParams::new(tool.to_string()).with_arguments(arguments.unwrap_or_default()))
             .await
-            .map_err(|e| forge_error::DispatchError::Upstream {
-                server: self.name.clone(),
-                message: format!("tool call failed: tool='{}': {}", tool, e),
+            .map_err(|e| {
+                let msg = format!("tool call failed: tool='{}': {}", tool, e);
+                let err_str = e.to_string();
+                if is_transport_dead(&err_str) {
+                    forge_error::DispatchError::TransportDead {
+                        server: self.name.clone(),
+                        reason: msg,
+                    }
+                } else {
+                    forge_error::DispatchError::Upstream {
+                        server: self.name.clone(),
+                        message: msg,
+                    }
+                }
             })?;
 
         // Tool-level errors (isError: true) mean the server is healthy but
@@ -410,13 +415,35 @@ impl ResourceDispatcher for McpClient {
         _server: &str,
         uri: &str,
     ) -> Result<Value, forge_error::DispatchError> {
-        self.read_resource(uri)
-            .await
-            .map_err(|e| forge_error::DispatchError::Upstream {
-                server: self.name.clone(),
-                message: format!("resource read failed: uri='{}': {}", uri, e),
-            })
+        self.read_resource(uri).await.map_err(|e| {
+            let msg = format!("resource read failed: uri='{}': {}", uri, e);
+            let err_str = e.to_string();
+            if is_transport_dead(&err_str) {
+                forge_error::DispatchError::TransportDead {
+                    server: self.name.clone(),
+                    reason: msg,
+                }
+            } else {
+                forge_error::DispatchError::Upstream {
+                    server: self.name.clone(),
+                    message: msg,
+                }
+            }
+        })
     }
+}
+
+/// Returns true if the error string indicates a permanently dead transport.
+///
+/// Detects patterns from rmcp's internal channel overflow, broken pipes,
+/// and closed transports that indicate the MCP client session is unrecoverable.
+fn is_transport_dead(err_str: &str) -> bool {
+    err_str.contains("TransportClosed")
+        || err_str.contains("transport closed")
+        || err_str.contains("channel closed")
+        || err_str.contains("broken pipe")
+        || err_str.contains("Broken pipe")
+        || err_str.contains("BrokenPipe")
 }
 
 /// Convert a resource content item to a JSON Value.
@@ -790,12 +817,9 @@ mod tests {
 
     #[test]
     fn call_tool_result_is_error_true_returns_err() {
-        let result = CallToolResult {
-            content: vec![Content::text("Invalid params: missing field 'base_url'")],
-            is_error: Some(true),
-            structured_content: None,
-            meta: None,
-        };
+        let result = CallToolResult::error(vec![Content::text(
+            "Invalid params: missing field 'base_url'",
+        )]);
         let err = call_tool_result_to_value(result);
         assert!(err.is_err());
         let msg = err.unwrap_err().to_string();
@@ -807,12 +831,7 @@ mod tests {
 
     #[test]
     fn call_tool_result_success_returns_ok() {
-        let result = CallToolResult {
-            content: vec![Content::text(r#"{"status": "ok"}"#)],
-            is_error: None,
-            structured_content: None,
-            meta: None,
-        };
+        let result = CallToolResult::success(vec![Content::text(r#"{"status": "ok"}"#)]);
         let val = call_tool_result_to_value(result).unwrap();
         assert_eq!(val["status"], "ok");
     }
@@ -820,14 +839,30 @@ mod tests {
     #[test]
     fn call_tool_result_structured_content_takes_priority_over_is_error() {
         let structured = serde_json::json!({"data": "important"});
-        let result = CallToolResult {
-            content: vec![Content::text("error text")],
-            is_error: Some(true),
-            structured_content: Some(structured.clone()),
-            meta: None,
-        };
+        let mut result = CallToolResult::error(vec![Content::text("error text")]);
+        result.structured_content = Some(structured.clone());
         let val = call_tool_result_to_value(result).unwrap();
         assert_eq!(val, structured);
+    }
+
+    // --- Transport death detection tests ---
+
+    #[test]
+    fn transport_dead_detects_transport_closed() {
+        assert!(is_transport_dead("TransportClosed: channel full"));
+        assert!(is_transport_dead("error: transport closed unexpectedly"));
+        assert!(is_transport_dead("channel closed by peer"));
+        assert!(is_transport_dead("broken pipe while writing"));
+        assert!(is_transport_dead("Broken pipe (os error 32)"));
+        assert!(is_transport_dead("BrokenPipe"));
+    }
+
+    #[test]
+    fn transport_dead_rejects_normal_errors() {
+        assert!(!is_transport_dead("tool not found: echo"));
+        assert!(!is_transport_dead("timeout after 5000ms"));
+        assert!(!is_transport_dead("Invalid params: missing field"));
+        assert!(!is_transport_dead("connection refused"));
     }
 
     /// Compile-time guard: TransportConfig is #[non_exhaustive].

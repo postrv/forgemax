@@ -103,22 +103,14 @@ impl TestServer {
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for TestServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            capabilities: ServerCapabilities::builder()
+        ServerInfo::new(
+            ServerCapabilities::builder()
                 .enable_tools()
                 .enable_resources()
                 .build(),
-            instructions: Some("Test MCP server for Forge integration tests".into()),
-            server_info: Implementation {
-                name: "forge-test-server".into(),
-                version: "0.1.0".into(),
-                title: None,
-                description: None,
-                icons: None,
-                website_url: None,
-            },
-            ..Default::default()
-        }
+        )
+        .with_instructions("Test MCP server for Forge integration tests")
+        .with_server_info(Implementation::new("forge-test-server", "0.1.0"))
     }
 
     fn list_resources(
@@ -126,24 +118,20 @@ impl ServerHandler for TestServer {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ListResourcesResult, ErrorData>> + Send + '_ {
-        std::future::ready(Ok(ListResourcesResult {
-            meta: None,
-            next_cursor: None,
-            resources: vec![
-                {
-                    let mut r = RawResource::new("file:///logs/app.log", "Application Log");
-                    r.description = Some("Recent application log entries".into());
-                    r.mime_type = Some("text/plain".into());
-                    Resource::new(r, None)
-                },
-                {
-                    let mut r = RawResource::new("db://schema/users", "Users Table Schema");
-                    r.description = Some("Schema for the users table".into());
-                    r.mime_type = Some("application/json".into());
-                    Resource::new(r, None)
-                },
-            ],
-        }))
+        std::future::ready(Ok(ListResourcesResult::with_all_items(vec![
+            {
+                let mut r = RawResource::new("file:///logs/app.log", "Application Log");
+                r.description = Some("Recent application log entries".into());
+                r.mime_type = Some("text/plain".into());
+                Resource::new(r, None)
+            },
+            {
+                let mut r = RawResource::new("db://schema/users", "Users Table Schema");
+                r.description = Some("Schema for the users table".into());
+                r.mime_type = Some("application/json".into());
+                Resource::new(r, None)
+            },
+        ])))
     }
 
     fn read_resource(
@@ -152,20 +140,20 @@ impl ServerHandler for TestServer {
         _context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ReadResourceResult, ErrorData>> + Send + '_ {
         std::future::ready(match request.uri.as_str() {
-            "file:///logs/app.log" => Ok(ReadResourceResult {
-                contents: vec![ResourceContents::text(
+            "file:///logs/app.log" => Ok(ReadResourceResult::new(vec![
+                ResourceContents::text(
                     "2024-01-01 INFO startup complete",
                     "file:///logs/app.log",
-                )],
-            }),
-            "db://schema/users" => Ok(ReadResourceResult {
-                contents: vec![ResourceContents::TextResourceContents {
+                ),
+            ])),
+            "db://schema/users" => Ok(ReadResourceResult::new(vec![
+                ResourceContents::TextResourceContents {
                     uri: "db://schema/users".into(),
                     mime_type: Some("application/json".into()),
                     text: r#"{"table":"users","columns":["id","name","email"]}"#.into(),
                     meta: None,
-                }],
-            }),
+                },
+            ])),
             _ => Err(ErrorData::resource_not_found(
                 format!("resource not found: {}", request.uri),
                 None,

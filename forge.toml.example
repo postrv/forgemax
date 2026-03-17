@@ -108,6 +108,15 @@ url = "https://mcp.atlassian.com/v1/sse"
 transport = "sse"
 timeout_secs = 30
 
+# ─── Transport Resilience ───────────────────────────────────────────
+#
+# Auto-reconnection is enabled by default for stdio servers. If the
+# transport dies (broken pipe, channel overflow), the gateway will
+# reconnect with exponential backoff. Configure per-server:
+#
+# reconnect = true              # Enable/disable (default: true for stdio)
+# max_reconnect_backoff_secs = 30  # Max backoff between retries (default: 30)
+
 # ─── Sandbox Settings ────────────────────────────────────────────────
 
 [sandbox]

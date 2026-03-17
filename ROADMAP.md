@@ -1,13 +1,23 @@
 # Forgemax Roadmap
 
-## v0.4.0 — Platform Release (current)
+## v0.4.0 — Platform Release
 
 - CLI subcommands: `doctor`, `manifest`, `run`, `init`
 - Production features default-on: worker-pool, metrics, config-watch
 - Documentation: SECURITY.md, CONTRIBUTING.md, examples/
 - Production configuration template
+- SHA256 installer verification, doctor enhancements, structure-aware truncation
+- Concurrent server startup via JoinSet + Semaphore
 
-## v0.5.0 — Observability
+## v0.5.0 — Transport Resilience (current)
+
+- `TransportDead` error variant distinguishing permanent transport failures from transient errors
+- `ReconnectingClient` decorator with exponential backoff auto-reconnection
+- Per-server `reconnect` and `max_reconnect_backoff_secs` configuration
+- rmcp 1.2.0 migration (`#[non_exhaustive]` structs, builder API)
+- deno_core 0.391, V8 146.8
+
+## v0.6.0 — Observability
 
 - Prometheus metrics endpoint (HTTP)
 - OpenTelemetry tracing integration
@@ -15,12 +25,11 @@
 - Health check endpoint
 - Dashboard templates (Grafana)
 
-## v0.6.0 — Ecosystem
+## v0.7.0 — Ecosystem
 
-- Plugin system for custom validators
 - Server discovery (auto-detect MCP servers on PATH)
 - Configuration profiles (dev/staging/production)
-- Streamable HTTP transport support
+- Plugin system for custom validators
 
 ## v1.0.0 — Stability
 

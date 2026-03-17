@@ -169,6 +169,7 @@ struct ServerConnectionResult {
     tool_names: Vec<String>,
     resources: Vec<forge_client::ResourceInfo>,
     server_config: forge_config::ServerConfig,
+    transport_config: TransportConfig,
 }
 
 /// Connect to all downstream servers and build the capability manifest.
@@ -268,6 +269,7 @@ pub async fn connect_and_build_manifest(config: &ForgeConfig) -> Result<ConnectR
                 tool_names,
                 resources,
                 server_config,
+                transport_config,
             })
         });
     }
@@ -296,6 +298,7 @@ pub async fn connect_and_build_manifest(config: &ForgeConfig) -> Result<ConnectR
             tool_names,
             resources,
             server_config,
+            transport_config,
         } = result;
 
         let server_entry = server_entry_from_tools(&name, &description, mcp_tools);
@@ -303,10 +306,34 @@ pub async fn connect_and_build_manifest(config: &ForgeConfig) -> Result<ConnectR
 
         client_refs.push((name.clone(), description, client.clone()));
 
+        // Wrap with ReconnectingClient for transport resilience.
+        // Default: enabled for stdio (pipe-based, susceptible to channel overflow).
+        let reconnect_enabled = server_config
+            .reconnect
+            .unwrap_or(server_config.transport == "stdio");
+
+        let (tool_client, resource_client): (
+            Arc<dyn ToolDispatcher>,
+            Arc<dyn ResourceDispatcher>,
+        ) = if reconnect_enabled {
+            let max_backoff = std::time::Duration::from_secs(
+                server_config.max_reconnect_backoff_secs.unwrap_or(30),
+            );
+            let rc = Arc::new(forge_client::ReconnectingClient::new(
+                name.clone(),
+                transport_config,
+                client.clone(),
+                max_backoff,
+            ));
+            (rc.clone(), rc)
+        } else {
+            (client.clone(), client.clone())
+        };
+
         // Wire resource dispatcher if any resources exist
         if !resources.is_empty() {
             has_any_resources = true;
-            let resource_client: Arc<dyn ResourceDispatcher> = client.clone();
+            let resource_client: Arc<dyn ResourceDispatcher> = resource_client.clone();
 
             let resource_client: Arc<dyn ResourceDispatcher> =
                 if let Some(secs) = server_config.timeout_secs {
@@ -340,7 +367,7 @@ pub async fn connect_and_build_manifest(config: &ForgeConfig) -> Result<ConnectR
         }
 
         // Wrap client with per-server timeout if configured
-        let client: Arc<dyn ToolDispatcher> = client;
+        let client: Arc<dyn ToolDispatcher> = tool_client;
         let client: Arc<dyn ToolDispatcher> = if let Some(secs) = server_config.timeout_secs {
             Arc::new(TimeoutDispatcher::new(
                 client,
@@ -437,6 +464,8 @@ mod tests {
             circuit_breaker: None,
             failure_threshold: None,
             recovery_timeout_secs: None,
+            reconnect: None,
+            max_reconnect_backoff_secs: None,
         }
     }
 

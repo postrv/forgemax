@@ -88,6 +88,10 @@ impl IpcDispatchError {
                 server: self.server.unwrap_or_default(),
                 message: self.message,
             },
+            "TRANSPORT_DEAD" => forge_error::DispatchError::TransportDead {
+                server: self.server.unwrap_or_default(),
+                reason: self.message,
+            },
             "TOOL_ERROR" => forge_error::DispatchError::ToolError {
                 server: self.server.unwrap_or_default(),
                 tool: self.tool.unwrap_or_default(),
@@ -111,6 +115,9 @@ impl From<&forge_error::DispatchError> for IpcDispatchError {
             } => (Some(server.clone()), None, Some(*timeout_ms)),
             forge_error::DispatchError::CircuitOpen(s) => (Some(s.clone()), None, None),
             forge_error::DispatchError::Upstream { server, .. } => {
+                (Some(server.clone()), None, None)
+            }
+            forge_error::DispatchError::TransportDead { server, .. } => {
                 (Some(server.clone()), None, None)
             }
             forge_error::DispatchError::ToolError { server, tool, .. } => {

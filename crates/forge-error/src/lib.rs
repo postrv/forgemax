@@ -59,6 +59,16 @@ pub enum DispatchError {
         message: String,
     },
 
+    /// The transport to the server has died permanently (pipe broken, channel closed).
+    /// Unlike Upstream (transient), this requires reconnection before further calls succeed.
+    #[error("transport dead for server '{server}': {reason}")]
+    TransportDead {
+        /// The server whose transport died.
+        server: String,
+        /// Description of the transport failure.
+        reason: String,
+    },
+
     /// A tool returned an application-level error (MCP `isError: true`).
     ///
     /// The downstream server is healthy — the tool processed the request but
@@ -93,6 +103,7 @@ impl DispatchError {
             Self::CircuitOpen(_) => "CIRCUIT_OPEN",
             Self::GroupPolicyDenied { .. } => "GROUP_POLICY_DENIED",
             Self::Upstream { .. } => "UPSTREAM_ERROR",
+            Self::TransportDead { .. } => "TRANSPORT_DEAD",
             Self::ToolError { .. } => "TOOL_ERROR",
             Self::RateLimit(_) => "RATE_LIMIT",
             Self::Internal(_) => "INTERNAL",
@@ -110,6 +121,7 @@ impl DispatchError {
         match self {
             Self::Timeout { .. } => true,
             Self::Upstream { .. } => true,
+            Self::TransportDead { .. } => true,
             Self::Internal(_) => true,
             Self::ToolError { .. } => false,
             Self::ServerNotFound(_) => false,
@@ -127,6 +139,7 @@ impl DispatchError {
             Self::CircuitOpen(_) => true,
             Self::RateLimit(_) => true,
             Self::Upstream { .. } => true,
+            Self::TransportDead { .. } => false,
             Self::ToolError { .. } => false,
             Self::ServerNotFound(_) => false,
             Self::ToolNotFound { .. } => false,
@@ -166,6 +179,10 @@ impl DispatchError {
             Self::CircuitOpen(_) => Some("Retry after a delay".to_string()),
             Self::Timeout { .. } => Some("Retry with a simpler operation".to_string()),
             Self::RateLimit(_) => Some("Reduce request frequency".to_string()),
+            Self::TransportDead { .. } => Some(
+                "Server transport is dead. Gateway may auto-reconnect, or restart the gateway."
+                    .to_string(),
+            ),
             _ => None,
         };
 
@@ -336,6 +353,13 @@ mod tests {
                     message: "m".into(),
                 },
                 "UPSTREAM_ERROR",
+            ),
+            (
+                DispatchError::TransportDead {
+                    server: "s".into(),
+                    reason: "pipe broken".into(),
+                },
+                "TRANSPORT_DEAD",
             ),
             (
                 DispatchError::ToolError {
@@ -592,5 +616,62 @@ mod tests {
         );
         assert!(result.is_some());
         assert!(result.unwrap().contains("narsil"));
+    }
+
+    // --- TransportDead tests ---
+
+    #[test]
+    fn display_transport_dead() {
+        let err = DispatchError::TransportDead {
+            server: "arbiter".into(),
+            reason: "channel closed".into(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "transport dead for server 'arbiter': channel closed"
+        );
+    }
+
+    #[test]
+    fn transport_dead_code() {
+        let err = DispatchError::TransportDead {
+            server: "s".into(),
+            reason: "r".into(),
+        };
+        assert_eq!(err.code(), "TRANSPORT_DEAD");
+    }
+
+    #[test]
+    fn transport_dead_trips_circuit_breaker() {
+        assert!(DispatchError::TransportDead {
+            server: "s".into(),
+            reason: "pipe broken".into(),
+        }
+        .trips_circuit_breaker());
+    }
+
+    #[test]
+    fn transport_dead_not_retryable() {
+        assert!(!DispatchError::TransportDead {
+            server: "s".into(),
+            reason: "pipe broken".into(),
+        }
+        .retryable());
+    }
+
+    #[test]
+    fn structured_error_transport_dead() {
+        let err = DispatchError::TransportDead {
+            server: "arbiter".into(),
+            reason: "channel closed".into(),
+        };
+        let json = err.to_structured_error(None);
+        assert_eq!(json["code"], "TRANSPORT_DEAD");
+        assert_eq!(json["retryable"], false);
+        let fix = json["suggested_fix"].as_str().unwrap();
+        assert!(
+            fix.contains("transport is dead"),
+            "expected transport dead suggestion, got: {fix}"
+        );
     }
 }

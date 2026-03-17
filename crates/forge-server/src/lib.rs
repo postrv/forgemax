@@ -421,9 +421,8 @@ impl ServerHandler for ForgeServer {
             manifest.total_tools(),
         );
 
-        ServerInfo {
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            instructions: Some(format!(
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_instructions(format!(
                 "Forgemax Code Mode Gateway ({stats}). \
                  Use search() to discover available tools, then execute() to call them.\n\
                  \n\
@@ -455,17 +454,8 @@ impl ServerHandler for ForgeServer {
                  {dts}\n\
                  ```",
                 dts = forge_manifest::FORGE_DTS
-            )),
-            server_info: Implementation {
-                name: "forge".into(),
-                version: env!("CARGO_PKG_VERSION").into(),
-                title: None,
-                description: None,
-                icons: None,
-                website_url: None,
-            },
-            ..Default::default()
-        }
+            ))
+            .with_server_info(Implementation::new("forge", env!("CARGO_PKG_VERSION")))
     }
 }
 

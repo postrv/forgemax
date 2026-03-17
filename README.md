@@ -88,7 +88,7 @@ Built dynamically from live `tools/list` responses when downstream servers conne
 
 ### forge-client
 
-MCP client connections to downstream servers. Supports stdio and HTTP/SSE transports. `RouterDispatcher` routes `callTool(server, tool, args)` to the correct downstream connection with pre-dispatch tool name validation — misspelled tools return `TOOL_NOT_FOUND` with Levenshtein-based suggestions before ever hitting the upstream server.
+MCP client connections to downstream servers. Supports stdio and HTTP/SSE transports. `RouterDispatcher` routes `callTool(server, tool, args)` to the correct downstream connection with pre-dispatch tool name validation — misspelled tools return `TOOL_NOT_FOUND` with Levenshtein-based suggestions before ever hitting the upstream server. `ReconnectingClient` decorator auto-reconnects on permanent transport failures (broken pipe, channel overflow) with exponential backoff — default enabled for stdio transports.
 
 ### forge-server
 
@@ -96,7 +96,7 @@ Implements `ServerHandler` from rmcp. Exposes `search` and `execute` as MCP tool
 
 ### forge-error
 
-Typed `DispatchError` enum replacing `anyhow::Error` across all dispatchers. Variants: `ServerNotFound`, `ToolNotFound`, `Timeout`, `CircuitOpen`, `GroupPolicyDenied`, `Upstream`, `RateLimit`, `Internal`. Includes fuzzy matching — `find_symbls` suggests `find_symbols` via Levenshtein distance. Errors serialize to structured JSON with `{error, code, message, retryable, suggested_fix}`.
+Typed `DispatchError` enum replacing `anyhow::Error` across all dispatchers. Variants: `ServerNotFound`, `ToolNotFound`, `Timeout`, `CircuitOpen`, `GroupPolicyDenied`, `Upstream`, `TransportDead`, `RateLimit`, `Internal`. `TransportDead` distinguishes permanent transport failures (broken pipe, channel closed) from transient upstream errors — triggers circuit breaker but is not retryable without reconnection. Includes fuzzy matching — `find_symbls` suggests `find_symbols` via Levenshtein distance. Errors serialize to structured JSON with `{error, code, message, retryable, suggested_fix}`.
 
 ### forge-audit
 
@@ -104,7 +104,7 @@ Audit event types for structured logging. Every sandbox execution is logged with
 
 ### forge-config
 
-TOML configuration with environment variable expansion (`${GITHUB_TOKEN}`). Configures downstream servers, transports, sandbox limits, and execution mode. Optional config file watching via `notify` crate with debounced reload (requires `config-watch` feature). Startup concurrency is configurable (`startup_concurrency`, default 8) for parallel server connections.
+TOML configuration with environment variable expansion (`${GITHUB_TOKEN}`). Configures downstream servers, transports, sandbox limits, and execution mode. Per-server `reconnect` and `max_reconnect_backoff_secs` fields control auto-reconnection on transport death (default: enabled for stdio). Optional config file watching via `notify` crate with debounced reload (requires `config-watch` feature). Startup concurrency is configurable (`startup_concurrency`, default 8) for parallel server connections.
 
 ## Install
 
@@ -228,6 +228,8 @@ timeout_secs = 30
 circuit_breaker = true
 failure_threshold = 3
 recovery_timeout_secs = 60
+reconnect = true                   # Auto-reconnect on transport death (default: true for stdio)
+max_reconnect_backoff_secs = 30    # Max backoff between retries
 
 # Cross-server data flow isolation
 [groups.internal]
@@ -355,6 +357,10 @@ Manifest Sanitization   Tool metadata sanitized to prevent prompt injection
   Circuit Breakers      Closed → Open → HalfOpen state machine per server,
                         prevents cascade failures from flaky downstreams
         |
+Transport Resilience    TransportDead detection (broken pipe, channel overflow),
+                        auto-reconnection with exponential backoff (1s → max),
+                        CAS-guarded concurrent reconnection prevention
+        |
   Server Groups         Opt-in strict/open isolation policies controlling
                         cross-server data flow within a single execution
         |
@@ -392,7 +398,7 @@ Run an example: `forgemax run examples/basic-tool-chaining.js`
 
 ## Tests
 
-~780 tests across the workspace:
+~790 tests across the workspace:
 
 ```bash
 cargo test --workspace
@@ -402,8 +408,8 @@ cargo test --workspace
 
 | Crate | Version | Purpose |
 |---|---|---|
-| deno_core | 0.385 | V8 sandbox runtime |
-| rmcp | 0.16 | MCP protocol (server + client) |
+| deno_core | 0.391 | V8 sandbox runtime |
+| rmcp | 1.2 | MCP protocol (server + client) |
 | tokio | 1.x | Async runtime |
 | serde | 1.x | Serialization |
 | schemars | 1.0 | JSON Schema (matches rmcp) |

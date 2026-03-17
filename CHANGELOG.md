@@ -2,6 +2,28 @@
 
 All notable changes to Forgemax will be documented in this file.
 
+## [0.5.0] - 2026-03-17
+
+### Added
+
+- **TransportDead error variant:** New `DispatchError::TransportDead` distinguishes permanent transport failures (broken pipe, channel closed) from transient upstream errors. Not retryable — requires reconnection at a higher layer.
+- **ReconnectingClient decorator:** Auto-reconnects on `TransportDead` errors with exponential backoff (1s → 2s → 4s → ... → max). Uses `RwLock` for zero-contention reads during normal operation. Default enabled for stdio transports.
+- **Reconnect config fields:** `reconnect` (bool) and `max_reconnect_backoff_secs` (u64) on `[servers.*]` config.
+- **Transport death detection:** `McpClient` now classifies rmcp errors containing "TransportClosed", "channel closed", or "broken pipe" as `TransportDead` instead of `Upstream`.
+- **IPC support:** `TRANSPORT_DEAD` error code preserved across the parent ↔ worker IPC boundary.
+
+### Changed (Dependencies)
+
+- **rmcp:** 0.17 → 1.2.0 (breaking: `#[non_exhaustive]` on model structs, migrated to constructor/builder API)
+- **deno_core:** 0.387 → 0.391
+- **deno_error:** 0.7 → =0.7.1 (pinned to match deno_core 0.391)
+- **v8:** 146.1 → 146.8
+
+### Changed
+
+- **rmcp API migration:** All struct literal constructions (`Implementation`, `ServerInfo`, `CallToolResult`, `ReadResourceResult`, `ListResourcesResult`, `CallToolRequestParams`, `ReadResourceRequestParams`) migrated to use `new()`/`with_*()` builder methods per rmcp 1.2's `#[non_exhaustive]` policy.
+- **Decorator chain order:** `McpClient → ReconnectingClient → TimeoutDispatcher → CircuitBreakerDispatcher → Router` (reconnection sits below timeout/CB so transport death is caught before circuit breaker probing).
+
 ## [0.4.2] - 2026-03-07
 
 ### Added
