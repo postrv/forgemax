@@ -17,7 +17,7 @@ All notable changes to Forgemax will be documented in this file.
 - **rmcp:** 0.17 → 1.2.0 (breaking: `#[non_exhaustive]` on model structs, migrated to constructor/builder API)
 - **deno_core:** 0.387 → 0.391
 - **deno_error:** 0.7 → =0.7.1 (pinned to match deno_core 0.391)
-- **v8:** 146.1 → 146.8
+- **v8:** 146.1 → 146.3
 
 ### Changed
 

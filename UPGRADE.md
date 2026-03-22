@@ -1,5 +1,48 @@
 # Upgrading Forgemax
 
+## v0.5.0 (Transport Resilience + Dependency Upgrades)
+
+### Breaking: rmcp 0.17 → 1.2.0
+
+rmcp 1.2 marks all model structs `#[non_exhaustive]`. If you construct rmcp types directly (e.g., `Implementation { ... }`), you must migrate to the builder API:
+
+```rust
+// Before (rmcp 0.17)
+Implementation {
+    name: "my-server".into(),
+    version: "1.0".into(),
+}
+
+// After (rmcp 1.2)
+Implementation::new("my-server", Some("1.0"))
+```
+
+Affected types: `Implementation`, `ServerInfo`, `CallToolResult`, `ReadResourceResult`, `ListResourcesResult`, `CallToolRequestParams`, `ReadResourceRequestParams`.
+
+### New Config Fields
+
+Two optional fields on `[servers.*]`:
+
+```toml
+[servers.my-server]
+reconnect = true                  # Enable auto-reconnect on transport death (default: true for stdio)
+max_reconnect_backoff_secs = 30   # Max backoff between reconnect attempts (default: 30)
+```
+
+### New Error Variant
+
+`DispatchError::TransportDead` is a new variant for permanent transport failures (broken pipe, channel closed). If you match exhaustively on `DispatchError`, add a branch for `TransportDead`. It is not retryable — the `ReconnectingClient` decorator handles reconnection automatically.
+
+### Decorator Chain Change
+
+The client decorator chain is now: `McpClient → ReconnectingClient → Timeout → CircuitBreaker → Router`. The reconnecting layer sits below timeout/circuit-breaker so transport death is caught before circuit breaker probing.
+
+### Configuration Compatibility
+
+v0.4.x configuration files work without modification. The new `reconnect` and `max_reconnect_backoff_secs` fields default to safe values when absent.
+
+---
+
 ## v0.4.0 (Platform Release)
 
 ### Feature Flag Migration
