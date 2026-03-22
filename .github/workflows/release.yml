@@ -131,7 +131,7 @@ jobs:
                 break
               fi
               OUTPUT=$(cargo publish -p "$crate" --allow-dirty 2>&1 || true)
-              if echo "$OUTPUT" | grep -q "already uploaded"; then
+              if echo "$OUTPUT" | grep -qE "already uploaded|already exists"; then
                 echo "$crate $VERSION is already published"
                 PUBLISHED=true
                 break
