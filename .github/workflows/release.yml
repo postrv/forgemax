@@ -100,8 +100,8 @@ jobs:
             forge-manifest
             forge-sandbox
             forge-sandbox-worker
-            forge-client
             forge-server
+            forge-client
             forgemax
           )
 
