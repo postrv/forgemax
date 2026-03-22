@@ -312,23 +312,21 @@ pub async fn connect_and_build_manifest(config: &ForgeConfig) -> Result<ConnectR
             .reconnect
             .unwrap_or(server_config.transport == "stdio");
 
-        let (tool_client, resource_client): (
-            Arc<dyn ToolDispatcher>,
-            Arc<dyn ResourceDispatcher>,
-        ) = if reconnect_enabled {
-            let max_backoff = std::time::Duration::from_secs(
-                server_config.max_reconnect_backoff_secs.unwrap_or(30),
-            );
-            let rc = Arc::new(forge_client::ReconnectingClient::new(
-                name.clone(),
-                transport_config,
-                client.clone(),
-                max_backoff,
-            ));
-            (rc.clone(), rc)
-        } else {
-            (client.clone(), client.clone())
-        };
+        let (tool_client, resource_client): (Arc<dyn ToolDispatcher>, Arc<dyn ResourceDispatcher>) =
+            if reconnect_enabled {
+                let max_backoff = std::time::Duration::from_secs(
+                    server_config.max_reconnect_backoff_secs.unwrap_or(30),
+                );
+                let rc = Arc::new(forge_client::ReconnectingClient::new(
+                    name.clone(),
+                    transport_config,
+                    client.clone(),
+                    max_backoff,
+                ));
+                (rc.clone(), rc)
+            } else {
+                (client.clone(), client.clone())
+            };
 
         // Wire resource dispatcher if any resources exist
         if !resources.is_empty() {

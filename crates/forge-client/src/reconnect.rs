@@ -162,8 +162,7 @@ impl ResourceDispatcher for ReconnectingClient {
         uri: &str,
     ) -> Result<Value, forge_error::DispatchError> {
         let client = self.current_client().await;
-        let result =
-            ResourceDispatcher::read_resource(client.as_ref(), server, uri).await;
+        let result = ResourceDispatcher::read_resource(client.as_ref(), server, uri).await;
 
         match result {
             Err(forge_error::DispatchError::TransportDead { .. }) => {
@@ -174,8 +173,7 @@ impl ResourceDispatcher for ReconnectingClient {
                 );
                 if self.try_reconnect().await {
                     let new_client = self.current_client().await;
-                    ResourceDispatcher::read_resource(new_client.as_ref(), server, uri)
-                        .await
+                    ResourceDispatcher::read_resource(new_client.as_ref(), server, uri).await
                 } else {
                     Err(forge_error::DispatchError::TransportDead {
                         server: self.name.clone(),

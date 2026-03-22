@@ -140,12 +140,10 @@ impl ServerHandler for TestServer {
         _context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ReadResourceResult, ErrorData>> + Send + '_ {
         std::future::ready(match request.uri.as_str() {
-            "file:///logs/app.log" => Ok(ReadResourceResult::new(vec![
-                ResourceContents::text(
-                    "2024-01-01 INFO startup complete",
-                    "file:///logs/app.log",
-                ),
-            ])),
+            "file:///logs/app.log" => Ok(ReadResourceResult::new(vec![ResourceContents::text(
+                "2024-01-01 INFO startup complete",
+                "file:///logs/app.log",
+            )])),
             "db://schema/users" => Ok(ReadResourceResult::new(vec![
                 ResourceContents::TextResourceContents {
                     uri: "db://schema/users".into(),

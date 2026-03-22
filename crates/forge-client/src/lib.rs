@@ -363,7 +363,10 @@ impl ToolDispatcher for McpClient {
         let result: CallToolResult = self
             .inner
             .peer()
-            .call_tool(CallToolRequestParams::new(tool.to_string()).with_arguments(arguments.unwrap_or_default()))
+            .call_tool(
+                CallToolRequestParams::new(tool.to_string())
+                    .with_arguments(arguments.unwrap_or_default()),
+            )
             .await
             .map_err(|e| {
                 let msg = format!("tool call failed: tool='{}': {}", tool, e);
