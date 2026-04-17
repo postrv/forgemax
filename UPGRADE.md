@@ -1,5 +1,21 @@
 # Upgrading Forgemax
 
+## v0.5.1 (Dependency Refresh + Reconnect Coordination Fix)
+
+No breaking changes. Drop-in upgrade from v0.5.0.
+
+### Dependency Updates
+
+- `deno_core` 0.391 → 0.398, `v8` 146.3 → 147.2
+- `oxc_parser` / `oxc_ast` / `oxc_span` / `oxc_allocator` 0.115 → 0.126
+- `sha2` 0.10 → 0.11 (major bump in the upstream crate; Forgemax's hashing API is unchanged, so callers are unaffected)
+
+### Reconnect Fix
+
+`ReconnectingClient` no longer uses a fixed 100ms sleep while a concurrent reconnection is in flight — waiters now block on `tokio::sync::Notify` (bounded at 30s) and retry with the fresh client. Behaviour under light load is unchanged; under heavy concurrent load this prevents transport-dead errors from leaking past the reconnection layer and tripping the circuit breaker.
+
+---
+
 ## v0.5.0 (Transport Resilience + Dependency Upgrades)
 
 ### Breaking: rmcp 0.17 → 1.2.0

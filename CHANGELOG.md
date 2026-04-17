@@ -2,6 +2,20 @@
 
 All notable changes to Forgemax will be documented in this file.
 
+## [0.5.1] - 2026-04-17
+
+### Fixed
+
+- **ReconnectingClient coordination:** Concurrent callers that detect a dead transport now wait on a `tokio::sync::Notify` for the in-flight reconnection to finish, then retry with the fresh client. Previously a fixed 100ms sleep was used — too short under heavy load, causing waiting callers to give up and surface transport errors that could then trip the circuit breaker. A 30s bounded wait prevents hangs if the reconnector is stuck.
+
+### Changed (Dependencies)
+
+- **deno_core:** 0.391 → 0.398
+- **v8:** 146.3 → 147.2
+- **serde_v8:** 0.300 → 0.307
+- **oxc_parser / oxc_ast / oxc_span / oxc_allocator:** 0.115 → 0.126
+- **sha2:** 0.10 → 0.11 (major bump; internal hashing API unchanged)
+
 ## [0.5.0] - 2026-03-17
 
 ### Added

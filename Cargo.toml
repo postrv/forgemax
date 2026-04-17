@@ -14,7 +14,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 license = "FSL-1.1-ALv2"
 rust-version = "1.91.1"
@@ -36,7 +36,7 @@ strip = true
 
 [workspace.dependencies]
 # Core runtime
-deno_core = "0.391"
+deno_core = "0.398"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
@@ -60,10 +60,10 @@ rmcp = { version = "1.2", features = ["server", "macros", "transport-io"] }
 schemars = "1.0"
 
 # AST validation (oxc)
-oxc_parser = "0.115"
-oxc_ast = "0.115"
-oxc_span = "0.115"
-oxc_allocator = "0.115"
+oxc_parser = "0.126"
+oxc_ast = "0.126"
+oxc_span = "0.126"
+oxc_allocator = "0.126"
 
 # Fuzzy matching
 strsim = "0.11"
@@ -78,15 +78,15 @@ arc-swap = "1"
 notify = "7"
 
 # Security / audit
-sha2 = "0.10"
+sha2 = "0.11"
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 
 # Internal crates
-forge-sandbox = { path = "crates/forge-sandbox", version = "0.5.0" }
-forge-manifest = { path = "crates/forge-manifest", version = "0.5.0" }
-forge-server = { path = "crates/forge-server", version = "0.5.0" }
-forge-client = { path = "crates/forge-client", version = "0.5.0" }
-forge-config = { path = "crates/forge-config", version = "0.5.0" }
-forge-error = { path = "crates/forge-error", version = "0.5.0" }
-forge-audit = { path = "crates/forge-audit", version = "0.5.0" }
+forge-sandbox = { path = "crates/forge-sandbox", version = "0.5.1" }
+forge-manifest = { path = "crates/forge-manifest", version = "0.5.1" }
+forge-server = { path = "crates/forge-server", version = "0.5.1" }
+forge-client = { path = "crates/forge-client", version = "0.5.1" }
+forge-config = { path = "crates/forge-config", version = "0.5.1" }
+forge-error = { path = "crates/forge-error", version = "0.5.1" }
+forge-audit = { path = "crates/forge-audit", version = "0.5.1" }

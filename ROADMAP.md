@@ -9,13 +9,14 @@
 - SHA256 installer verification, doctor enhancements, structure-aware truncation
 - Concurrent server startup via JoinSet + Semaphore
 
-## v0.5.0 — Transport Resilience (current)
+## v0.5.x — Transport Resilience (current)
 
 - `TransportDead` error variant distinguishing permanent transport failures from transient errors
 - `ReconnectingClient` decorator with exponential backoff auto-reconnection
 - Per-server `reconnect` and `max_reconnect_backoff_secs` configuration
 - rmcp 1.2.0 migration (`#[non_exhaustive]` structs, builder API)
-- deno_core 0.391, V8 146.8
+- deno_core 0.398, V8 147.2, oxc 0.126, sha2 0.11 (v0.5.1)
+- `Notify`-coordinated reconnection (v0.5.1)
 
 ## v0.6.0 — Observability
 
