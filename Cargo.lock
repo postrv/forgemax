@@ -823,6 +823,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "v8",
 ]
 
 [[package]]

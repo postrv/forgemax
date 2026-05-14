@@ -9,6 +9,10 @@ repository.workspace = true
 
 [dependencies]
 deno_core.workspace = true
+# Explicit v8 dep with the `simdutf` feature enabled (see workspace Cargo.toml
+# for rationale). Without this, deno_core 0.400's references to simdutf__*
+# symbols cannot be resolved against the standard rusty_v8 prebuilt.
+v8.workspace = true
 deno_error = "=0.7.1"
 tokio.workspace = true
 serde.workspace = true

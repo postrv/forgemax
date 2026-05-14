@@ -37,6 +37,11 @@ strip = true
 [workspace.dependencies]
 # Core runtime
 deno_core = "0.400"
+# v8 is a transitive dependency of deno_core, but we declare it here so we
+# can enable the `simdutf` feature, which deno_core 0.400 references at
+# link time without enabling itself. Without this feature the link fails
+# with undefined symdutf__* symbols against the standard prebuilt archive.
+v8 = { version = "147.4", features = ["simdutf"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
