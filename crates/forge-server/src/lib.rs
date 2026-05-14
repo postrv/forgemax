@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use forge_manifest::{LiveManifest, Manifest};
 use forge_sandbox::groups::{
-    GroupEnforcingDispatcher, GroupEnforcingResourceDispatcher, GroupPolicy,
+    GroupEnforcingDispatcher, GroupEnforcingResourceDispatcher, GroupPolicy, SharedGroupLock,
 };
 use forge_sandbox::stash::{SessionStash, StashConfig};
 use forge_sandbox::{
@@ -66,7 +66,7 @@ fn truncate_result_if_needed(json: String) -> String {
 /// cutting at a newline boundary means we always end on a complete line.
 /// Falls back to the last comma, then to a character boundary.
 fn find_safe_cut_point(json: &str, max_pos: usize) -> usize {
-    let limit = max_pos.min(json.len());
+    let limit = floor_char_boundary(json, max_pos);
     let search_region = &json[..limit];
 
     // For pretty-printed JSON, cut at the last newline
@@ -89,6 +89,14 @@ fn find_safe_cut_point(json: &str, max_pos: usize) -> usize {
         .last()
         .map(|(i, c)| i + c.len_utf8())
         .unwrap_or(0)
+}
+
+fn floor_char_boundary(s: &str, max: usize) -> usize {
+    let mut end = max.min(s.len());
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
 }
 
 /// Format a sandbox execution result for the LLM.
@@ -126,13 +134,28 @@ pub struct ForgeServer {
     tool_router: ToolRouter<Self>,
 }
 
+struct ExecutionDispatchers {
+    dispatcher: Arc<dyn ToolDispatcher>,
+    resource_dispatcher: Option<Arc<dyn ResourceDispatcher>>,
+    group_lock: Option<SharedGroupLock>,
+}
+
 /// Stash dispatcher that wraps a shared [`SessionStash`] behind a Mutex.
 ///
 /// Created per-execution by `ForgeServer::execute()` to provide the stash API
 /// to sandbox code. The `current_group` is set from the server group context.
 struct ServerStashDispatcher {
     stash: Arc<tokio::sync::Mutex<SessionStash>>,
-    current_group: Option<String>,
+    group_lock: Option<SharedGroupLock>,
+}
+
+impl ServerStashDispatcher {
+    async fn current_group(&self, op_group: Option<String>) -> Option<String> {
+        if let Some(lock) = &self.group_lock {
+            return lock.lock().await.clone();
+        }
+        op_group
+    }
 }
 
 #[async_trait::async_trait]
@@ -142,14 +165,15 @@ impl StashDispatcher for ServerStashDispatcher {
         key: &str,
         value: serde_json::Value,
         ttl_secs: Option<u32>,
-        _current_group: Option<String>,
+        current_group: Option<String>,
     ) -> Result<serde_json::Value, forge_error::DispatchError> {
         let ttl = ttl_secs
             .filter(|&s| s > 0)
             .map(|s| Duration::from_secs(s as u64));
+        let current_group = self.current_group(current_group).await;
         let mut stash = self.stash.lock().await;
         stash
-            .put(key, value, ttl, self.current_group.as_deref())
+            .put(key, value, ttl, current_group.as_deref())
             .map_err(|e| forge_error::DispatchError::Internal(e.into()))?;
         Ok(serde_json::json!({"ok": true}))
     }
@@ -157,11 +181,12 @@ impl StashDispatcher for ServerStashDispatcher {
     async fn get(
         &self,
         key: &str,
-        _current_group: Option<String>,
+        current_group: Option<String>,
     ) -> Result<serde_json::Value, forge_error::DispatchError> {
+        let current_group = self.current_group(current_group).await;
         let stash = self.stash.lock().await;
         match stash
-            .get(key, self.current_group.as_deref())
+            .get(key, current_group.as_deref())
             .map_err(|e| forge_error::DispatchError::Internal(e.into()))?
         {
             Some(v) => Ok(v.clone()),
@@ -172,21 +197,23 @@ impl StashDispatcher for ServerStashDispatcher {
     async fn delete(
         &self,
         key: &str,
-        _current_group: Option<String>,
+        current_group: Option<String>,
     ) -> Result<serde_json::Value, forge_error::DispatchError> {
+        let current_group = self.current_group(current_group).await;
         let mut stash = self.stash.lock().await;
         let deleted = stash
-            .delete(key, self.current_group.as_deref())
+            .delete(key, current_group.as_deref())
             .map_err(|e| forge_error::DispatchError::Internal(e.into()))?;
         Ok(serde_json::json!({"deleted": deleted}))
     }
 
     async fn keys(
         &self,
-        _current_group: Option<String>,
+        current_group: Option<String>,
     ) -> Result<serde_json::Value, forge_error::DispatchError> {
+        let current_group = self.current_group(current_group).await;
         let stash = self.stash.lock().await;
-        let keys: Vec<&str> = stash.keys(self.current_group.as_deref());
+        let keys: Vec<&str> = stash.keys(current_group.as_deref());
         Ok(serde_json::json!(keys))
     }
 }
@@ -340,10 +367,7 @@ impl ForgeServer {
         // A fresh pair of GroupEnforcingDispatcher/GroupEnforcingResourceDispatcher
         // is created per-execution so that group locking state doesn't leak
         // between executions. Both share the same lock for consistent enforcement.
-        let (dispatcher, resource_dispatcher): (
-            Arc<dyn ToolDispatcher>,
-            Option<Arc<dyn ResourceDispatcher>>,
-        ) = match &self.group_policy {
+        let dispatchers = match &self.group_policy {
             Some(policy) => {
                 let tool_enforcer =
                     GroupEnforcingDispatcher::new(self.dispatcher.clone(), policy.clone());
@@ -353,13 +377,21 @@ impl ForgeServer {
                     Arc::new(GroupEnforcingResourceDispatcher::new(
                         rd.clone(),
                         policy.clone(),
-                        shared_lock,
+                        shared_lock.clone(),
                     )) as Arc<dyn ResourceDispatcher>
                 });
 
-                (Arc::new(tool_enforcer), resource)
+                ExecutionDispatchers {
+                    dispatcher: Arc::new(tool_enforcer),
+                    resource_dispatcher: resource,
+                    group_lock: Some(shared_lock),
+                }
             }
-            None => (self.dispatcher.clone(), self.resource_dispatcher.clone()),
+            None => ExecutionDispatchers {
+                dispatcher: self.dispatcher.clone(),
+                resource_dispatcher: self.resource_dispatcher.clone(),
+                group_lock: None,
+            },
         };
 
         // Create stash dispatcher if session stash is configured
@@ -367,7 +399,7 @@ impl ForgeServer {
             self.session_stash.as_ref().map(|stash| {
                 Arc::new(ServerStashDispatcher {
                     stash: stash.clone(),
-                    current_group: None, // Group tracking done at ForgeServer level
+                    group_lock: dispatchers.group_lock.clone(),
                 }) as Arc<dyn StashDispatcher>
             });
 
@@ -393,8 +425,8 @@ impl ForgeServer {
             .executor
             .execute_code_with_options(
                 &input.code,
-                dispatcher,
-                resource_dispatcher,
+                dispatchers.dispatcher,
+                dispatchers.resource_dispatcher,
                 stash_dispatcher,
                 Some(known_servers),
                 Some(known_tools),
@@ -503,6 +535,39 @@ mod tests {
             .build();
         let dispatcher: Arc<dyn ToolDispatcher> = Arc::new(TestDispatcher);
         ForgeServer::new(SandboxConfig::default(), manifest, dispatcher, None)
+    }
+
+    #[tokio::test]
+    async fn stash_dispatcher_uses_group_lock_for_writes_and_reads() {
+        let stash = Arc::new(tokio::sync::Mutex::new(SessionStash::new(
+            StashConfig::default(),
+        )));
+        let internal_lock: SharedGroupLock =
+            Arc::new(tokio::sync::Mutex::new(Some("internal".to_string())));
+        let external_lock: SharedGroupLock =
+            Arc::new(tokio::sync::Mutex::new(Some("external".to_string())));
+
+        let internal = ServerStashDispatcher {
+            stash: stash.clone(),
+            group_lock: Some(internal_lock),
+        };
+        internal
+            .put("secret", serde_json::json!({"token": "red"}), None, None)
+            .await
+            .unwrap();
+
+        let same_group = internal.get("secret", None).await.unwrap();
+        assert_eq!(same_group["token"], "red");
+
+        let external = ServerStashDispatcher {
+            stash,
+            group_lock: Some(external_lock),
+        };
+        let err = external.get("secret", None).await.unwrap_err();
+        assert!(
+            err.to_string().contains("cross-group"),
+            "expected cross-group denial, got: {err}"
+        );
     }
 
     #[test]
@@ -741,6 +806,21 @@ mod tests {
         let parsed: serde_json::Value =
             serde_json::from_str(&result).expect("unicode truncation should produce valid JSON");
         assert_eq!(parsed["_truncated"], true);
+    }
+
+    #[test]
+    fn tr_06b_truncate_three_byte_unicode_safe() {
+        let cjk = "漢";
+        let mut long = String::new();
+        while long.len() < MAX_RESULT_CHARS + 500 {
+            long.push_str(cjk);
+        }
+
+        let result = truncate_result_if_needed(long);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&result).expect("unicode truncation should produce valid JSON");
+        assert_eq!(parsed["_truncated"], true);
+        assert!(parsed["data"].as_str().unwrap().chars().all(|c| c == '漢'));
     }
 
     #[test]

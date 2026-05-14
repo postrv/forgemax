@@ -29,7 +29,10 @@ pub struct ConnectResult {
 
 /// Build SandboxConfig from config overrides.
 pub fn build_sandbox_config(overrides: &forge_config::SandboxOverrides) -> SandboxConfig {
-    let mut config = SandboxConfig::default();
+    let mut config = SandboxConfig {
+        execution_mode: ExecutionMode::ChildProcess,
+        ..Default::default()
+    };
     if let Some(timeout) = overrides.timeout_secs {
         config.timeout = std::time::Duration::from_secs(timeout);
     }
@@ -42,10 +45,20 @@ pub fn build_sandbox_config(overrides: &forge_config::SandboxOverrides) -> Sandb
     if let Some(tool_calls) = overrides.max_tool_calls {
         config.max_tool_calls = tool_calls;
     }
+    if let Some(stash) = &overrides.stash {
+        config.max_stash_calls = stash.max_calls;
+    }
     if let Some(ref mode) = overrides.execution_mode {
         config.execution_mode = match mode.as_str() {
             "child_process" => ExecutionMode::ChildProcess,
-            _ => ExecutionMode::InProcess,
+            "in_process" => ExecutionMode::InProcess,
+            other => {
+                tracing::warn!(
+                    execution_mode = %other,
+                    "invalid sandbox execution mode reached runtime after validation; using child_process"
+                );
+                ExecutionMode::ChildProcess
+            }
         };
     }
     if let Some(size) = overrides.max_ipc_message_size_mb {
@@ -87,6 +100,7 @@ pub fn to_transport_config(server: &forge_config::ServerConfig) -> Result<Transp
         "stdio" => Ok(TransportConfig::Stdio {
             command: server.command.clone().unwrap_or_default(),
             args: server.args.clone(),
+            env: server.env.clone(),
         }),
         "sse" => Ok(TransportConfig::Http {
             url: server.url.clone().unwrap_or_default(),
@@ -455,6 +469,7 @@ mod tests {
             transport: transport.into(),
             command: Some("echo".into()),
             args: vec!["hello".into()],
+            env: Default::default(),
             url: Some("http://localhost:8080".into()),
             headers: Default::default(),
             description: None,
@@ -469,9 +484,15 @@ mod tests {
 
     #[test]
     fn to_transport_config_stdio() {
-        let server = make_server_config("stdio");
+        let mut server = make_server_config("stdio");
+        server.env.insert("TOKEN".into(), "secret".into());
         let config = to_transport_config(&server).unwrap();
-        assert!(matches!(config, TransportConfig::Stdio { .. }));
+        match config {
+            TransportConfig::Stdio { env, .. } => {
+                assert_eq!(env.get("TOKEN").map(String::as_str), Some("secret"));
+            }
+            other => panic!("expected stdio transport, got: {other:?}"),
+        }
     }
 
     #[test]
@@ -502,9 +523,32 @@ mod tests {
         assert_eq!(config.max_heap_size, default.max_heap_size);
         assert_eq!(config.max_concurrent, default.max_concurrent);
         assert_eq!(config.max_tool_calls, default.max_tool_calls);
-        assert_eq!(config.execution_mode, default.execution_mode);
+        assert_eq!(config.execution_mode, ExecutionMode::ChildProcess);
         assert_eq!(config.max_resource_size, default.max_resource_size);
         assert_eq!(config.max_parallel, default.max_parallel);
+    }
+
+    #[test]
+    fn build_sandbox_config_applies_explicit_in_process() {
+        let overrides = forge_config::SandboxOverrides {
+            execution_mode: Some("in_process".into()),
+            ..Default::default()
+        };
+        let config = build_sandbox_config(&overrides);
+        assert_eq!(config.execution_mode, ExecutionMode::InProcess);
+    }
+
+    #[test]
+    fn build_sandbox_config_applies_stash_call_limit() {
+        let overrides = forge_config::SandboxOverrides {
+            stash: Some(forge_config::StashOverrides {
+                max_calls: Some(3),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let config = build_sandbox_config(&overrides);
+        assert_eq!(config.max_stash_calls, Some(3));
     }
 
     #[test]

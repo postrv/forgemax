@@ -329,7 +329,7 @@ pub async fn op_forge_read_resource(
         let max_size = st
             .try_borrow::<MaxResourceSize>()
             .map(|m| m.0)
-            .unwrap_or(64 * 1024 * 1024); // 64 MB default
+            .unwrap_or(crate::ipc::DEFAULT_MAX_RESOURCE_SIZE);
         (d, max_size)
     };
 
@@ -358,18 +358,27 @@ pub async fn op_forge_read_resource(
         .map_err(|e| JsErrorBox::generic(format!("result serialization failed: {e}")))?;
 
     if json.len() > max_resource_size {
-        // Truncate to max_resource_size and ensure valid UTF-8 at boundary
-        let truncated = &json[..max_resource_size];
-        // Find the last valid UTF-8 char boundary
-        let end = truncated
-            .char_indices()
-            .last()
-            .map(|(i, c)| i + c.len_utf8())
-            .unwrap_or(0);
-        json = json[..end].to_string();
+        let original_size = json.len();
+        let end = floor_char_boundary(&json, max_resource_size);
+        json = serde_json::json!({
+            "_truncated": true,
+            "_data_is_fragment": true,
+            "_original_bytes": original_size,
+            "_shown_bytes": end,
+            "data": &json[..end],
+        })
+        .to_string();
     }
 
     Ok(json)
+}
+
+fn floor_char_boundary(s: &str, max: usize) -> usize {
+    let mut end = max.min(s.len());
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
 }
 
 /// Store a value in the session stash via the StashDispatcher.

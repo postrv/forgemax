@@ -22,7 +22,7 @@ use crate::audit::{
 use crate::error::SandboxError;
 use crate::ops::{
     forge_ext, CurrentGroup, ExecutionResult, KnownServers, KnownTools, MaxResourceSize,
-    ToolCallLimits,
+    StashCallLimits, ToolCallLimits,
 };
 use crate::validator::validate_code;
 use crate::{ResourceDispatcher, StashDispatcher, ToolDispatcher};
@@ -53,11 +53,13 @@ pub struct SandboxConfig {
     pub max_concurrent: usize,
     /// Maximum tool calls per execution.
     pub max_tool_calls: usize,
+    /// Maximum stash operations per execution.
+    pub max_stash_calls: Option<usize>,
     /// Maximum size of tool call arguments in bytes.
     pub max_tool_call_args_size: usize,
     /// Execution mode: in-process or child-process isolation.
     pub execution_mode: ExecutionMode,
-    /// Maximum resource content size in bytes (default: 64 MB).
+    /// Maximum resource content size in bytes (default: 7 MB).
     pub max_resource_size: usize,
     /// Maximum concurrent calls in forge.parallel() (default: 8).
     pub max_parallel: usize,
@@ -74,9 +76,10 @@ impl Default for SandboxConfig {
             max_heap_size: 64 * 1024 * 1024, // 64 MB
             max_concurrent: 8,
             max_tool_calls: 50,
+            max_stash_calls: None,
             max_tool_call_args_size: 1024 * 1024, // 1 MB
             execution_mode: ExecutionMode::default(),
-            max_resource_size: 64 * 1024 * 1024, // 64 MB
+            max_resource_size: crate::ipc::DEFAULT_MAX_RESOURCE_SIZE,
             max_parallel: 8,
             max_ipc_message_size: crate::ipc::DEFAULT_MAX_IPC_MESSAGE_SIZE,
         }
@@ -273,9 +276,13 @@ impl SandboxExecutor {
                                 .execute(
                                     code,
                                     &self.config,
-                                    auditing_dispatcher,
-                                    auditing_resource_dispatcher,
-                                    auditing_stash_dispatcher,
+                                    crate::pool::PooledExecutionContext {
+                                        dispatcher: auditing_dispatcher,
+                                        resource_dispatcher: auditing_resource_dispatcher,
+                                        stash_dispatcher: auditing_stash_dispatcher,
+                                        known_servers: known_servers.clone(),
+                                        known_tools: known_tools.clone(),
+                                    },
                                 )
                                 .await;
                             let outcome = if is_fatal_sandbox_error(&exec_result) {
@@ -460,6 +467,7 @@ pub async fn run_search(
         None,
         None,
         None,
+        None,
     )?;
 
     // Inject the manifest as a global
@@ -549,6 +557,10 @@ pub async fn run_execute_with_known_servers(
         max_args_size: config.max_tool_call_args_size,
         calls_made: 0,
     };
+    let stash_call_limits = config.max_stash_calls.map(|max_calls| StashCallLimits {
+        max_calls: Some(max_calls),
+        calls_made: 0,
+    });
     let mut runtime = create_runtime(
         Some(dispatcher),
         resource_dispatcher.clone(),
@@ -556,6 +568,7 @@ pub async fn run_execute_with_known_servers(
         Some(limits),
         Some(config.max_resource_size),
         stash_dispatcher.clone(),
+        stash_call_limits,
         known_servers,
         known_tools,
     )?;
@@ -774,6 +787,7 @@ pub(crate) fn create_runtime(
     tool_call_limits: Option<ToolCallLimits>,
     max_resource_size: Option<usize>,
     stash_dispatcher: Option<Arc<dyn StashDispatcher>>,
+    stash_call_limits: Option<StashCallLimits>,
     known_servers: Option<std::collections::HashSet<String>>,
     known_tools: Option<Vec<(String, String)>>,
 ) -> Result<JsRuntime, SandboxError> {
@@ -801,6 +815,9 @@ pub(crate) fn create_runtime(
         runtime.op_state().borrow_mut().put(sd);
         // CurrentGroup defaults to None; the ForgeServer level sets the actual group
         runtime.op_state().borrow_mut().put(CurrentGroup(None));
+    }
+    if let Some(limits) = stash_call_limits {
+        runtime.op_state().borrow_mut().put(limits);
     }
     if let Some(servers) = known_servers {
         runtime.op_state().borrow_mut().put(KnownServers(servers));
@@ -1531,21 +1548,27 @@ mod tests {
         let resource_dispatcher: Option<Arc<dyn ResourceDispatcher>> =
             Some(Arc::new(LargeResourceDispatcher { content_size: 500 }));
 
-        // Large resource truncated → JSON.parse fails in bootstrap
         let code = r#"async () => {
-            try {
-                await forge.readResource("s", "file:///big");
-                return "no truncation";
-            } catch(e) {
-                return "truncated";
-            }
+            const result = await forge.readResource("s", "file:///big");
+            return {
+                truncated: result._truncated,
+                fragment: result._data_is_fragment,
+                shown: result._shown_bytes,
+                original: result._original_bytes,
+            };
         }"#;
 
         let result = exec
             .execute_code(code, tool_dispatcher, resource_dispatcher, None)
             .await
             .unwrap();
-        assert_eq!(result, "truncated", "large resource should be truncated");
+        assert_eq!(
+            result["truncated"], true,
+            "large resource should be truncated"
+        );
+        assert_eq!(result["fragment"], true);
+        assert!(result["shown"].as_u64().unwrap() <= 100);
+        assert!(result["original"].as_u64().unwrap() > result["shown"].as_u64().unwrap());
     }
 
     // --- RS-U09: errors redacted through redact_error_for_llm ---
@@ -1771,12 +1794,11 @@ mod tests {
             }));
 
         let code = r#"async () => {
-            try {
-                const result = await forge.readResource("s", "file:///huge");
-                return "got result without truncation";
-            } catch(e) {
-                return "safely truncated";
-            }
+            const result = await forge.readResource("s", "file:///huge");
+            return {
+                truncated: result._truncated,
+                len: result.data.length,
+            };
         }"#;
 
         // Must complete without OOM
@@ -1784,7 +1806,51 @@ mod tests {
             .execute_code(code, tool_dispatcher, resource_dispatcher, None)
             .await;
         assert!(result.is_ok(), "should complete without OOM: {result:?}");
-        assert_eq!(result.unwrap(), "safely truncated");
+        let result = result.unwrap();
+        assert_eq!(result["truncated"], true);
+        assert!(result["len"].as_u64().unwrap() <= 1024);
+    }
+
+    #[tokio::test]
+    async fn rs_s07b_large_unicode_resource_truncates_without_panic() {
+        struct UnicodeResourceDispatcher;
+
+        #[async_trait::async_trait]
+        impl ResourceDispatcher for UnicodeResourceDispatcher {
+            async fn read_resource(
+                &self,
+                _server: &str,
+                _uri: &str,
+            ) -> Result<serde_json::Value, forge_error::DispatchError> {
+                Ok(serde_json::json!({
+                    "data": "漢".repeat(1000)
+                }))
+            }
+        }
+
+        let exec = SandboxExecutor::new(SandboxConfig {
+            max_resource_size: 101,
+            timeout: Duration::from_secs(10),
+            ..Default::default()
+        });
+        let tool_dispatcher: Arc<dyn ToolDispatcher> = Arc::new(TestDispatcher);
+        let resource_dispatcher: Option<Arc<dyn ResourceDispatcher>> =
+            Some(Arc::new(UnicodeResourceDispatcher));
+
+        let code = r#"async () => {
+            const result = await forge.readResource("s", "file:///unicode");
+            return {
+                truncated: result._truncated,
+                data: result.data,
+            };
+        }"#;
+
+        let result = exec
+            .execute_code(code, tool_dispatcher, resource_dispatcher, None)
+            .await
+            .unwrap();
+        assert_eq!(result["truncated"], true);
+        assert!(result["data"].as_str().unwrap().is_char_boundary(0));
     }
 
     // --- RS-S08: many resource reads hit rate limit ---
@@ -2088,6 +2154,35 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result, "hello");
+    }
+
+    #[tokio::test]
+    async fn st_i02b_stash_max_calls_is_enforced_per_execution() {
+        let exec = SandboxExecutor::new(SandboxConfig {
+            max_stash_calls: Some(1),
+            ..Default::default()
+        });
+        let stash = make_stash(crate::stash::StashConfig::default());
+        let sd = make_stash_dispatcher(stash, None);
+        let dispatcher: Arc<dyn ToolDispatcher> = Arc::new(TestDispatcher);
+
+        let code = r#"async () => {
+            try {
+                await forge.stash.put("key", "hello");
+                await forge.stash.get("key");
+                return "not limited";
+            } catch(e) {
+                return e.message;
+            }
+        }"#;
+        let result = exec
+            .execute_code(code, dispatcher, None, Some(sd))
+            .await
+            .unwrap();
+        assert!(
+            result.as_str().unwrap().contains("stash operation limit"),
+            "expected stash limit error, got: {result:?}"
+        );
     }
 
     // --- ST-I03: Stash group isolation (put with group A, get with group B fails) ---

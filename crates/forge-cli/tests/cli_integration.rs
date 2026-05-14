@@ -11,6 +11,11 @@ use std::process::Command;
 
 /// Locate a built binary in the target directory.
 fn binary_path(name: &str) -> PathBuf {
+    let env_name = format!("CARGO_BIN_EXE_{name}");
+    if let Ok(path) = std::env::var(&env_name) {
+        return PathBuf::from(path);
+    }
+
     // cargo test puts binaries in target/debug/
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     path.pop(); // crates/
@@ -18,6 +23,26 @@ fn binary_path(name: &str) -> PathBuf {
     path.push("target");
     path.push("debug");
     path.push(name);
+    if path.exists() {
+        return path;
+    }
+
+    if name == "forge-test-server" {
+        let status = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string()))
+            .args([
+                "build",
+                "-p",
+                "forge-test-server",
+                "--bin",
+                "forge-test-server",
+            ])
+            .status()
+            .expect("failed to run cargo build for forge-test-server");
+        if status.success() {
+            return path;
+        }
+    }
+
     path
 }
 

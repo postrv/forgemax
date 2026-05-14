@@ -25,6 +25,40 @@ function Get-LatestVersion {
     }
 }
 
+function Verify-Checksum {
+    param(
+        [string]$ArchivePath,
+        [string]$Version,
+        [string]$ArchiveName
+    )
+
+    $checksumUrl = "https://github.com/$Repo/releases/download/v$Version/SHA256SUMS.txt"
+    Write-Info "Verifying SHA256..."
+
+    try {
+        $checksumData = Invoke-WebRequest -Uri $checksumUrl -UseBasicParsing
+        $line = ($checksumData.Content -split "`n") | Where-Object { $_ -match [regex]::Escape($ArchiveName) } | Select-Object -First 1
+        if (-not $line) {
+            Write-Warn "Checksum not found for $ArchiveName — skipping verification"
+            return
+        }
+
+        $expected = (($line -split '\s+') | Where-Object { $_ } | Select-Object -First 1).ToLowerInvariant()
+        $actual = (Get-FileHash -Path $ArchivePath -Algorithm SHA256).Hash.ToLowerInvariant()
+
+        if ($expected -ne $actual) {
+            Write-Err "SHA256 mismatch! Expected: $expected, got: $actual"
+            Write-Err "The downloaded binary may be corrupted or tampered with."
+            exit 1
+        }
+
+        Write-Info "SHA256 verified"
+    }
+    catch {
+        Write-Warn "Could not verify checksum: $_"
+    }
+}
+
 function Install-Forgemax {
     Write-Info "Detecting platform..."
 
@@ -46,7 +80,8 @@ function Install-Forgemax {
         $v
     }
 
-    $archiveUrl = "https://github.com/$Repo/releases/download/v$version/forgemax-v$version-windows-$arch.zip"
+    $archiveName = "forgemax-v$version-windows-$arch.zip"
+    $archiveUrl = "https://github.com/$Repo/releases/download/v$version/$archiveName"
     $tempFile = Join-Path $env:TEMP "forgemax-$([guid]::NewGuid()).zip"
 
     Write-Info "Downloading $archiveUrl..."
@@ -58,6 +93,8 @@ function Install-Forgemax {
         Write-Err "Try: cargo install forgemax"
         exit 1
     }
+
+    Verify-Checksum -ArchivePath $tempFile -Version $version -ArchiveName $archiveName
 
     Write-Info "Installing to $InstallDir..."
     New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null

@@ -47,6 +47,7 @@ const DEFAULT_TEMPLATE: &str = r#"# Forge Configuration
 # args = ["run", "-i", "--rm", "-e", "GITHUB_PERSONAL_ACCESS_TOKEN", "ghcr.io/github/github-mcp-server"]
 # transport = "stdio"
 # timeout_secs = 30
+# env = { GITHUB_PERSONAL_ACCESS_TOKEN = "${GITHUB_TOKEN}" }
 
 # ─── Sandbox Settings ───────────────────────────────────────────────
 
@@ -56,6 +57,8 @@ max_heap_mb = 64
 max_concurrent = 8
 max_tool_calls = 50
 execution_mode = "child_process"
+# max_resource_size_mb = 7
+# max_ipc_message_size_mb = 8
 
 # ─── Worker Pool (optional) ─────────────────────────────────────────
 #
@@ -74,6 +77,7 @@ execution_mode = "child_process"
 # max_total_size_mb = 128
 # default_ttl_secs = 3600
 # max_ttl_secs = 86400
+# max_calls = 100
 "#;
 
 /// Execute the init command.

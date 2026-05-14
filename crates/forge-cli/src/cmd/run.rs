@@ -7,6 +7,9 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use clap::Args;
 use forge_sandbox::audit::TracingAuditLogger;
+use forge_sandbox::groups::{
+    GroupEnforcingDispatcher, GroupEnforcingResourceDispatcher, GroupPolicy,
+};
 use forge_sandbox::{ResourceDispatcher, ToolDispatcher};
 
 use crate::common;
@@ -74,9 +77,47 @@ pub async fn execute(args: &RunArgs, config_path: Option<PathBuf>) -> Result<()>
     // Connect and build manifest
     let connect_result = common::connect_and_build_manifest(&config).await?;
 
-    let dispatcher: Arc<dyn ToolDispatcher> = connect_result.dispatcher;
-    let resource_dispatcher: Option<Arc<dyn ResourceDispatcher>> =
-        connect_result.resource_dispatcher;
+    let known_servers: std::collections::HashSet<String> = connect_result
+        .manifest
+        .servers
+        .iter()
+        .map(|s| s.name.clone())
+        .collect();
+    let known_tools: Vec<(String, String)> = connect_result
+        .manifest
+        .servers
+        .iter()
+        .flat_map(|s| {
+            s.categories.values().flat_map(move |cat| {
+                cat.tools
+                    .iter()
+                    .map(move |t| (s.name.clone(), t.name.clone()))
+            })
+        })
+        .collect();
+
+    let (dispatcher, resource_dispatcher): (
+        Arc<dyn ToolDispatcher>,
+        Option<Arc<dyn ResourceDispatcher>>,
+    ) = if !config.groups.is_empty() {
+        let policy = Arc::new(GroupPolicy::from_config(&common::build_group_map(&config)));
+        let tool_enforcer =
+            GroupEnforcingDispatcher::new(connect_result.dispatcher, policy.clone());
+        let shared_lock = tool_enforcer.shared_lock();
+        let resource = connect_result.resource_dispatcher.map(|rd| {
+            Arc::new(GroupEnforcingResourceDispatcher::new(
+                rd,
+                policy,
+                shared_lock,
+            )) as Arc<dyn ResourceDispatcher>
+        });
+        (Arc::new(tool_enforcer), resource)
+    } else {
+        (
+            connect_result.dispatcher,
+            connect_result.resource_dispatcher,
+        )
+    };
 
     // Build executor
     let audit_logger = Arc::new(TracingAuditLogger);
@@ -85,7 +126,14 @@ pub async fn execute(args: &RunArgs, config_path: Option<PathBuf>) -> Result<()>
 
     // Execute code (stash is not available in run mode for simplicity)
     match executor
-        .execute_code(&code, dispatcher, resource_dispatcher, None)
+        .execute_code_with_options(
+            &code,
+            dispatcher,
+            resource_dispatcher,
+            None,
+            Some(known_servers),
+            Some(known_tools),
+        )
         .await
     {
         Ok(value) => {

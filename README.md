@@ -104,7 +104,7 @@ Audit event types for structured logging. Every sandbox execution is logged with
 
 ### forge-config
 
-TOML configuration with environment variable expansion (`${GITHUB_TOKEN}`). Configures downstream servers, transports, sandbox limits, and execution mode. Per-server `reconnect` and `max_reconnect_backoff_secs` fields control auto-reconnection on transport death (default: enabled for stdio). Optional config file watching via `notify` crate with debounced reload (requires `config-watch` feature). Startup concurrency is configurable (`startup_concurrency`, default 8) for parallel server connections.
+TOML configuration with environment variable expansion (`${GITHUB_TOKEN}`). Configures downstream servers, explicit stdio `env` entries, transports, sandbox limits, and execution mode. Per-server `reconnect` and `max_reconnect_backoff_secs` fields control auto-reconnection on transport death (default: enabled for stdio). Optional config file watching via `notify` crate with debounced reload (requires `config-watch` feature). Startup concurrency is configurable (`startup_concurrency`, default 8) for parallel server connections.
 
 ## Install
 

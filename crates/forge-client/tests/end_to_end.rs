@@ -14,6 +14,10 @@ use rmcp::handler::server::wrapper::Parameters;
 
 /// Path to the test server binary (built by cargo).
 fn test_server_bin() -> String {
+    if let Ok(path) = std::env::var("CARGO_BIN_EXE_forge-test-server") {
+        return path;
+    }
+
     // The binary is in target/debug/ when built with cargo test
     let mut path = std::env::current_exe()
         .unwrap()
@@ -23,6 +27,22 @@ fn test_server_bin() -> String {
         .unwrap()
         .to_path_buf();
     path.push("forge-test-server");
+    if path.exists() {
+        return path.to_str().unwrap().to_string();
+    }
+
+    let status =
+        std::process::Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string()))
+            .args([
+                "build",
+                "-p",
+                "forge-test-server",
+                "--bin",
+                "forge-test-server",
+            ])
+            .status()
+            .expect("failed to run cargo build for forge-test-server");
+    assert!(status.success(), "failed to build forge-test-server");
     path.to_str().unwrap().to_string()
 }
 

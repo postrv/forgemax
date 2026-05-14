@@ -12,12 +12,12 @@
 //! V8 worker processes competing on CI runners.
 
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use forge_sandbox::executor::ExecutionMode;
 use forge_sandbox::pool::{PoolConfig, WorkerPool};
-use forge_sandbox::{SandboxConfig, SandboxExecutor, ToolDispatcher};
+use forge_sandbox::{ResourceDispatcher, SandboxConfig, SandboxExecutor, ToolDispatcher};
 use serial_test::serial;
 
 /// Test dispatcher that echoes back server/tool/args.
@@ -40,6 +40,22 @@ impl ToolDispatcher for EchoDispatcher {
     }
 }
 
+struct EchoResourceDispatcher;
+
+#[async_trait::async_trait]
+impl ResourceDispatcher for EchoResourceDispatcher {
+    async fn read_resource(
+        &self,
+        server: &str,
+        uri: &str,
+    ) -> Result<serde_json::Value, forge_error::DispatchError> {
+        Ok(serde_json::json!({
+            "server": server,
+            "uri": uri,
+        }))
+    }
+}
+
 fn pool_config() -> PoolConfig {
     PoolConfig {
         min_workers: 1,
@@ -58,7 +74,44 @@ fn sandbox_config() -> SandboxConfig {
     }
 }
 
+fn ensure_worker_binary() -> &'static std::path::Path {
+    static WORKER_BIN: OnceLock<std::path::PathBuf> = OnceLock::new();
+    WORKER_BIN
+        .get_or_init(|| {
+            let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            path.pop(); // crates/
+            path.pop(); // workspace root
+            path.push("target");
+            path.push("debug");
+            path.push(if cfg!(windows) {
+                "forgemax-worker.exe"
+            } else {
+                "forgemax-worker"
+            });
+
+            if !path.exists() {
+                let status = std::process::Command::new(
+                    std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string()),
+                )
+                .args([
+                    "build",
+                    "-p",
+                    "forge-sandbox-worker",
+                    "--bin",
+                    "forgemax-worker",
+                ])
+                .status()
+                .expect("failed to run cargo build for forgemax-worker");
+                assert!(status.success(), "failed to build forgemax-worker");
+            }
+
+            path
+        })
+        .as_path()
+}
+
 fn make_executor(pool: Arc<WorkerPool>) -> SandboxExecutor {
+    std::env::set_var("FORGE_WORKER_BIN", ensure_worker_binary());
     SandboxExecutor::new(sandbox_config()).with_pool(pool)
 }
 
@@ -274,6 +327,47 @@ async fn wp_i05_context_isolation() {
         metrics.reused.load(Ordering::Relaxed),
         1,
         "second execution should have reused the worker (proving isolation is worker-level, not process-level)"
+    );
+
+    pool.shutdown().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn wp_i05b_known_servers_are_enforced_in_pooled_workers() {
+    let pool = Arc::new(WorkerPool::new(PoolConfig {
+        max_workers: 1,
+        ..pool_config()
+    }));
+    let exec = make_executor(pool.clone());
+    let dispatcher: Arc<dyn ToolDispatcher> = Arc::new(EchoDispatcher);
+    let resource_dispatcher: Option<Arc<dyn ResourceDispatcher>> =
+        Some(Arc::new(EchoResourceDispatcher));
+    let known_servers = std::collections::HashSet::from(["allowed".to_string()]);
+
+    let code = r#"async () => {
+        try {
+            await forge.readResource("blocked", "file:///x");
+            return "not blocked";
+        } catch (e) {
+            return e.message;
+        }
+    }"#;
+
+    let result = exec
+        .execute_code_with_options(
+            code,
+            dispatcher,
+            resource_dispatcher,
+            None,
+            Some(known_servers),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(
+        result.as_str().unwrap().contains("unknown server"),
+        "expected pooled worker to reject unknown server, got: {result:?}"
     );
 
     pool.shutdown().await;

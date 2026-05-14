@@ -76,6 +76,7 @@ max_value_size_mb = 16
 max_total_size_mb = 128
 default_ttl_secs = 3600
 max_ttl_secs = 86400
+max_calls = 100
 
 # ─── Server Groups ──────────────────────────────────────────────────
 #

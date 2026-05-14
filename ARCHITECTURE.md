@@ -200,7 +200,7 @@ Before connecting Forgemax to untrusted or external MCP servers:
 - [ ] Protect `forge.toml` with appropriate file permissions — env var expansion (`${VAR}`) means a writable config file could exfiltrate environment variables via server URLs
 
 - [ ] Configure `[sandbox.stash]` limits if the default (256 keys, 128 MB total) is too generous for your deployment
-- [ ] Set `max_resource_size_mb` to limit resource content sizes (default: 64 MB)
+- [ ] Set `max_resource_size_mb` to limit resource content sizes (default: 7 MB)
 - [ ] Set `max_parallel` to control bounded concurrency in `forge.parallel()` (default: 8)
 
 ### What's Built In (no action needed)
@@ -208,5 +208,5 @@ Before connecting Forgemax to untrusted or external MCP servers:
 - Error redaction: URLs, IPs, paths, credentials, and stack traces are automatically stripped before reaching the LLM
 - Header sanitization: Authorization, Cookie, Token, Key, Secret, Credential, and Password headers are stripped on plain HTTP
 - Code validation: Unicode homoglyph normalization, JS comment stripping, and whitespace-aware pattern matching catch evasion attempts
-- IPC message limits: Configurable per-deployment, defaults to 64 MB
+- IPC message limits: Configurable per-deployment, defaults to 8 MB
 - Manifest sanitization: Downstream tool metadata is cleaned of injection patterns before reaching LLM context

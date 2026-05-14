@@ -87,11 +87,11 @@ Forgemax does NOT protect against:
 2. **Fresh runtime per call**: Each `execute()` creates a fresh V8 isolate — no state leaks between executions
 3. **Pre-execution validation**: The oxc-powered AST validator catches banned patterns (import, require, eval, Function constructor, Deno.*, process.*) before code reaches V8, including multi-hop alias tracking
 4. **Credential isolation**: API tokens and connection details are never exposed to sandbox code — they exist only in the host process
-5. **Worker environment clearing**: Child process workers clear all environment variables on startup
+5. **Environment clearing**: Sandbox workers clear all environment variables on startup; downstream stdio servers receive only a small launch allowlist plus explicit per-server `env` entries
 
 ## Configuration Hardening Checklist
 
-- [ ] Set `execution_mode = "child_process"` for process-level isolation
+- [ ] Keep `execution_mode = "child_process"` for process-level isolation
 - [ ] Set `chmod 600 forge.toml` to protect secrets
 - [ ] Enable `circuit_breaker = true` on all servers
 - [ ] Configure server groups with `isolation = "strict"` for sensitive servers

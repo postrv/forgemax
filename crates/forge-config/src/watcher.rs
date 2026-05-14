@@ -8,7 +8,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::watch;
@@ -17,6 +17,8 @@ use crate::{ConfigError, ForgeConfig};
 
 /// Debounce interval for rapid file changes.
 const DEBOUNCE_MS: u64 = 200;
+
+type FileFingerprint = (Option<SystemTime>, u64);
 
 /// A config file watcher that reloads on changes.
 ///
@@ -68,16 +70,31 @@ impl ConfigWatcher {
     async fn watch_loop(&self) -> Result<(), ConfigError> {
         let (notify_tx, mut notify_rx) = tokio::sync::mpsc::channel::<()>(16);
 
+        // Canonicalize the watched path so callback comparisons match
+        // whatever notify reports (which is the canonical form on macOS).
+        let watched_path = std::fs::canonicalize(&self.path).unwrap_or_else(|_| self.path.clone());
+
         let mut watcher: RecommendedWatcher =
             notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
-                if let Ok(event) = res {
-                    if matches!(
-                        event.kind,
-                        EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_)
-                    ) {
-                        let _ = notify_tx.blocking_send(());
-                    }
+                let Ok(event) = res else { return };
+                if !matches!(
+                    event.kind,
+                    EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_)
+                ) {
+                    return;
                 }
+                // We watch the parent dir to catch atomic-rename saves, so
+                // filter events down to the specific config file. Without
+                // this, modifications to unrelated files in the same dir
+                // (e.g. other tempfiles in parallel tests) trigger reloads
+                // and can deadlock the bounded notify channel.
+                if !event.paths.iter().any(|p| p == &watched_path) {
+                    return;
+                }
+                // Hint only — coalescing is handled by debounce + polling.
+                // Drop the hint if the channel is full rather than blocking
+                // the notify thread (which would prevent runtime shutdown).
+                let _ = notify_tx.try_send(());
             })
             .map_err(|e| ConfigError::Invalid(format!("failed to create watcher: {}", e)))?;
 
@@ -88,32 +105,55 @@ impl ConfigWatcher {
             .map_err(|e| ConfigError::Invalid(format!("failed to watch directory: {}", e)))?;
 
         tracing::info!("Watching config file: {}", self.path.display());
+        let mut last_fingerprint = file_fingerprint(&self.path);
+        let mut poll = tokio::time::interval(Duration::from_millis(DEBOUNCE_MS));
+        poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
-            // Wait for a filesystem event
-            if notify_rx.recv().await.is_none() {
-                break; // Channel closed
-            }
+            tokio::select! {
+                event = notify_rx.recv() => {
+                    if event.is_none() {
+                        break;
+                    }
 
-            // Debounce: drain any rapid events within the window
-            tokio::time::sleep(Duration::from_millis(DEBOUNCE_MS)).await;
-            while notify_rx.try_recv().is_ok() {}
-
-            // Attempt reload
-            match ForgeConfig::from_file_with_env(&self.path) {
-                Ok(new_config) => {
-                    tracing::info!("Config reloaded from {}", self.path.display());
-                    let _ = self.tx.send(Arc::new(new_config));
+                    // Debounce: drain any rapid events within the window.
+                    tokio::time::sleep(Duration::from_millis(DEBOUNCE_MS)).await;
+                    while notify_rx.try_recv().is_ok() {}
+                    self.reload_if_changed(&mut last_fingerprint, true);
                 }
-                Err(e) => {
-                    // File might have been deleted or be invalid — preserve old config
-                    tracing::warn!("Config reload failed (keeping previous config): {}", e);
+                _ = poll.tick() => {
+                    self.reload_if_changed(&mut last_fingerprint, false);
                 }
             }
         }
 
         Ok(())
     }
+
+    fn reload_if_changed(&self, last_fingerprint: &mut Option<FileFingerprint>, force: bool) {
+        let current = file_fingerprint(&self.path);
+        if !force && current == *last_fingerprint {
+            return;
+        }
+        *last_fingerprint = current;
+
+        match ForgeConfig::from_file_with_env(&self.path) {
+            Ok(new_config) => {
+                tracing::info!("Config reloaded from {}", self.path.display());
+                let _ = self.tx.send(Arc::new(new_config));
+            }
+            Err(e) => {
+                // File might have been deleted or be invalid — preserve old config.
+                tracing::warn!("Config reload failed (keeping previous config): {}", e);
+            }
+        }
+    }
+}
+
+fn file_fingerprint(path: &Path) -> Option<FileFingerprint> {
+    let metadata = std::fs::metadata(path).ok()?;
+    let modified = metadata.modified().ok();
+    Some((modified, metadata.len()))
 }
 
 #[cfg(test)]

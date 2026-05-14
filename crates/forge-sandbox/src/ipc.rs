@@ -281,6 +281,9 @@ pub struct WorkerConfig {
     pub max_heap_size: usize,
     /// Maximum tool calls per execution.
     pub max_tool_calls: usize,
+    /// Maximum stash operations per execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_stash_calls: Option<usize>,
     /// Maximum size of tool call arguments in bytes.
     pub max_tool_call_args_size: usize,
     /// Maximum size of the JSON result in bytes.
@@ -310,7 +313,7 @@ fn default_max_ipc_message_size() -> usize {
 }
 
 fn default_max_resource_size() -> usize {
-    64 * 1024 * 1024 // 64 MB
+    DEFAULT_MAX_RESOURCE_SIZE
 }
 
 fn default_max_parallel() -> usize {
@@ -323,6 +326,7 @@ impl From<&crate::SandboxConfig> for WorkerConfig {
             timeout_ms: config.timeout.as_millis() as u64,
             max_heap_size: config.max_heap_size,
             max_tool_calls: config.max_tool_calls,
+            max_stash_calls: config.max_stash_calls,
             max_tool_call_args_size: config.max_tool_call_args_size,
             max_output_size: config.max_output_size,
             max_code_size: config.max_code_size,
@@ -345,6 +349,7 @@ impl WorkerConfig {
             max_heap_size: self.max_heap_size,
             max_concurrent: 1, // worker handles one execution
             max_tool_calls: self.max_tool_calls,
+            max_stash_calls: self.max_stash_calls,
             max_tool_call_args_size: self.max_tool_call_args_size,
             execution_mode: crate::executor::ExecutionMode::InProcess, // worker always runs in-process
             max_resource_size: self.max_resource_size,
@@ -444,6 +449,12 @@ pub async fn read_raw_message<R: AsyncRead + Unpin>(
 /// Configurable via `sandbox.max_ipc_message_size_mb` in config.
 pub const DEFAULT_MAX_IPC_MESSAGE_SIZE: usize = 8 * 1024 * 1024;
 
+/// Default maximum serialized resource size: 7 MB.
+///
+/// Kept below [`DEFAULT_MAX_IPC_MESSAGE_SIZE`] to leave room for IPC envelope
+/// overhead in child-process mode.
+pub const DEFAULT_MAX_RESOURCE_SIZE: usize = 7 * 1024 * 1024;
+
 /// Read a length-delimited JSON message from an async reader.
 ///
 /// Returns `None` if the reader has reached EOF (clean shutdown).
@@ -504,6 +515,7 @@ mod tests {
                 timeout_ms: 5000,
                 max_heap_size: 64 * 1024 * 1024,
                 max_tool_calls: 50,
+                max_stash_calls: None,
                 max_tool_call_args_size: 1024 * 1024,
                 max_output_size: 1024 * 1024,
                 max_code_size: 64 * 1024,
@@ -1113,6 +1125,7 @@ mod tests {
                 timeout_ms: 3000,
                 max_heap_size: 32 * 1024 * 1024,
                 max_tool_calls: 25,
+                max_stash_calls: None,
                 max_tool_call_args_size: 512 * 1024,
                 max_output_size: 512 * 1024,
                 max_code_size: 32 * 1024,
@@ -1161,6 +1174,7 @@ mod tests {
                 timeout_ms: 5000,
                 max_heap_size: 64 * 1024 * 1024,
                 max_tool_calls: 50,
+                max_stash_calls: None,
                 max_tool_call_args_size: 1024 * 1024,
                 max_output_size: 1024 * 1024,
                 max_code_size: 64 * 1024,
@@ -1178,6 +1192,7 @@ mod tests {
                 timeout_ms: 5000,
                 max_heap_size: 64 * 1024 * 1024,
                 max_tool_calls: 50,
+                max_stash_calls: None,
                 max_tool_call_args_size: 1024 * 1024,
                 max_output_size: 1024 * 1024,
                 max_code_size: 64 * 1024,

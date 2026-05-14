@@ -54,6 +54,7 @@ pub enum ConfigError {
 
 /// Top-level Forge configuration.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ForgeConfig {
     /// Downstream MCP server configurations, keyed by server name.
     #[serde(default)]
@@ -74,6 +75,7 @@ pub struct ForgeConfig {
 
 /// Configuration for manifest refresh behavior.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ManifestConfig {
     /// How often to re-discover tools from downstream servers (seconds).
     /// 0 or absent = disabled (manifest is static after startup).
@@ -83,6 +85,7 @@ pub struct ManifestConfig {
 
 /// Configuration for a server group.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GroupConfig {
     /// Server names belonging to this group.
     pub servers: Vec<String>,
@@ -98,6 +101,7 @@ fn default_isolation() -> String {
 
 /// Configuration for a single downstream MCP server.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     /// Transport type: "stdio" or "sse".
     pub transport: String,
@@ -109,6 +113,10 @@ pub struct ServerConfig {
     /// Command arguments (stdio transport).
     #[serde(default)]
     pub args: Vec<String>,
+
+    /// Explicit environment variables passed to stdio child processes.
+    #[serde(default)]
+    pub env: HashMap<String, String>,
 
     /// Server URL (sse transport).
     #[serde(default)]
@@ -149,6 +157,7 @@ pub struct ServerConfig {
 
 /// Sandbox configuration overrides.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SandboxOverrides {
     /// Execution timeout in seconds.
     #[serde(default)]
@@ -174,7 +183,7 @@ pub struct SandboxOverrides {
     #[serde(default)]
     pub max_ipc_message_size_mb: Option<usize>,
 
-    /// Maximum resource content size in megabytes (default: 64 MB).
+    /// Maximum resource content size in megabytes (default: 7 MB).
     #[serde(default)]
     pub max_resource_size_mb: Option<usize>,
 
@@ -201,6 +210,7 @@ pub struct SandboxOverrides {
 /// When enabled, warm worker processes are reused across executions
 /// instead of spawning a new process each time (~5-10ms vs ~50ms).
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PoolOverrides {
     /// Enable the worker pool (default: false).
     #[serde(default)]
@@ -225,6 +235,7 @@ pub struct PoolOverrides {
 
 /// Configuration overrides for the ephemeral stash.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StashOverrides {
     /// Maximum number of stash entries per session.
     #[serde(default)]
@@ -345,6 +356,57 @@ impl ForgeConfig {
     }
 
     fn validate_sandbox_v2(&self) -> Result<(), ConfigError> {
+        if let Some(mode) = self.sandbox.execution_mode.as_deref() {
+            match mode {
+                "child_process" | "in_process" => {}
+                other => {
+                    return Err(ConfigError::Invalid(format!(
+                        "sandbox.execution_mode must be 'child_process' or 'in_process' (got '{other}')"
+                    )));
+                }
+            }
+        }
+
+        if let Some(timeout) = self.sandbox.timeout_secs {
+            if timeout == 0 || timeout > 3600 {
+                return Err(ConfigError::Invalid(
+                    "sandbox.timeout_secs must be > 0 and <= 3600".into(),
+                ));
+            }
+        }
+
+        if let Some(heap) = self.sandbox.max_heap_mb {
+            if heap == 0 || heap > 4096 {
+                return Err(ConfigError::Invalid(
+                    "sandbox.max_heap_mb must be > 0 and <= 4096".into(),
+                ));
+            }
+        }
+
+        if let Some(concurrent) = self.sandbox.max_concurrent {
+            if concurrent == 0 || concurrent > 256 {
+                return Err(ConfigError::Invalid(
+                    "sandbox.max_concurrent must be > 0 and <= 256".into(),
+                ));
+            }
+        }
+
+        if let Some(tool_calls) = self.sandbox.max_tool_calls {
+            if tool_calls == 0 || tool_calls > 10000 {
+                return Err(ConfigError::Invalid(
+                    "sandbox.max_tool_calls must be > 0 and <= 10000".into(),
+                ));
+            }
+        }
+
+        if let Some(ipc_mb) = self.sandbox.max_ipc_message_size_mb {
+            if ipc_mb == 0 || ipc_mb > 512 {
+                return Err(ConfigError::Invalid(
+                    "sandbox.max_ipc_message_size_mb must be > 0 and <= 512".into(),
+                ));
+            }
+        }
+
         // CV-01: max_resource_size_mb must be > 0 and <= 512
         if let Some(size) = self.sandbox.max_resource_size_mb {
             if size == 0 || size > 512 {
@@ -406,6 +468,14 @@ impl ForgeConfig {
                 if max_ttl == 0 || max_ttl > 604800 {
                     return Err(ConfigError::Invalid(
                         "sandbox.stash.max_ttl_secs must be > 0 and <= 604800 (7 days)".into(),
+                    ));
+                }
+            }
+
+            if let Some(max_calls) = stash.max_calls {
+                if max_calls == 0 || max_calls > 10000 {
+                    return Err(ConfigError::Invalid(
+                        "sandbox.stash.max_calls must be > 0 and <= 10000".into(),
                     ));
                 }
             }
@@ -592,6 +662,25 @@ mod tests {
     }
 
     #[test]
+    fn config_parses_stdio_env_with_expansion() {
+        temp_env::with_var("FORGE_TEST_TOKEN", Some("secret123"), || {
+            let toml = r#"
+                [servers.github]
+                command = "github-mcp"
+                transport = "stdio"
+                env = { GITHUB_PERSONAL_ACCESS_TOKEN = "${FORGE_TEST_TOKEN}" }
+            "#;
+
+            let config = ForgeConfig::from_toml_with_env(toml).unwrap();
+            let github = &config.servers["github"];
+            assert_eq!(
+                github.env.get("GITHUB_PERSONAL_ACCESS_TOKEN").unwrap(),
+                "secret123"
+            );
+        });
+    }
+
+    #[test]
     fn config_rejects_invalid_transport() {
         let toml = r#"
             [servers.test]
@@ -743,6 +832,18 @@ mod tests {
             config.sandbox.execution_mode.as_deref(),
             Some("child_process")
         );
+    }
+
+    #[test]
+    fn config_rejects_invalid_execution_mode() {
+        let toml = r#"
+            [sandbox]
+            execution_mode = "child-proces"
+        "#;
+
+        let err = ForgeConfig::from_toml(toml).unwrap_err().to_string();
+        assert!(err.contains("execution_mode"), "got: {err}");
+        assert!(err.contains("child_process"), "got: {err}");
     }
 
     #[test]
@@ -1005,6 +1106,20 @@ mod tests {
     }
 
     #[test]
+    fn cv06b_stash_max_calls_range() {
+        let toml = "[sandbox.stash]\nmax_calls = 100";
+        assert!(ForgeConfig::from_toml(toml).is_ok());
+
+        let toml = "[sandbox.stash]\nmax_calls = 0";
+        let err = ForgeConfig::from_toml(toml).unwrap_err().to_string();
+        assert!(err.contains("max_calls"), "got: {err}");
+
+        let toml = "[sandbox.stash]\nmax_calls = 10001";
+        let err = ForgeConfig::from_toml(toml).unwrap_err().to_string();
+        assert!(err.contains("max_calls"), "got: {err}");
+    }
+
+    #[test]
     fn cv07_max_resource_size_fits_ipc() {
         // Valid: 7 MB + 1 MB overhead = 8 MB = fits default IPC limit
         let toml = "[sandbox]\nmax_resource_size_mb = 7";
@@ -1017,6 +1132,20 @@ mod tests {
 
         // Valid with explicit larger IPC limit
         let toml = "[sandbox]\nmax_resource_size_mb = 32\nmax_ipc_message_size_mb = 64";
+        assert!(ForgeConfig::from_toml(toml).is_ok());
+    }
+
+    #[test]
+    fn cv08_max_ipc_message_size_range() {
+        let toml = "[sandbox]\nmax_ipc_message_size_mb = 0";
+        let err = ForgeConfig::from_toml(toml).unwrap_err().to_string();
+        assert!(err.contains("max_ipc_message_size_mb"), "got: {err}");
+
+        let toml = "[sandbox]\nmax_ipc_message_size_mb = 513";
+        let err = ForgeConfig::from_toml(toml).unwrap_err().to_string();
+        assert!(err.contains("max_ipc_message_size_mb"), "got: {err}");
+
+        let toml = "[sandbox]\nmax_ipc_message_size_mb = 64";
         assert!(ForgeConfig::from_toml(toml).is_ok());
     }
 
@@ -1034,6 +1163,7 @@ mod tests {
             max_total_size_mb = 64
             default_ttl_secs = 1800
             max_ttl_secs = 43200
+            max_calls = 20
         "#;
 
         let config = ForgeConfig::from_toml(toml).unwrap();
@@ -1047,6 +1177,7 @@ mod tests {
         assert_eq!(stash.max_total_size_mb, Some(64));
         assert_eq!(stash.default_ttl_secs, Some(1800));
         assert_eq!(stash.max_ttl_secs, Some(43200));
+        assert_eq!(stash.max_calls, Some(20));
     }
 
     // --- Pool config tests (CV-08 to CV-11) ---
@@ -1170,6 +1301,13 @@ mod tests {
     #[test]
     fn cfg_p01_production_example_parses() {
         let config = load_production_example();
+        assert!(!config.servers.is_empty(), "should have servers");
+    }
+
+    #[test]
+    fn cfg_default_example_parses() {
+        let toml_str = include_str!("../../../forge.toml.example");
+        let config = ForgeConfig::from_toml(toml_str).expect("default example must parse");
         assert!(!config.servers.is_empty(), "should have servers");
     }
 

@@ -8,7 +8,7 @@
 //! **Security invariant**: Every execution gets a completely fresh V8 Isolate +
 //! Context. There is no state leakage between executions.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -89,6 +89,20 @@ pub struct AcquiredWorker {
     worker: Option<PoolWorker>,
 }
 
+/// Context needed to route a single pooled worker execution.
+pub struct PooledExecutionContext {
+    /// Tool calls made by the worker.
+    pub dispatcher: Arc<dyn ToolDispatcher>,
+    /// Optional resource reads made by the worker.
+    pub resource_dispatcher: Option<Arc<dyn ResourceDispatcher>>,
+    /// Optional stash calls made by the worker.
+    pub stash_dispatcher: Option<Arc<dyn StashDispatcher>>,
+    /// Known server names for validation and fuzzy matching.
+    pub known_servers: Option<HashSet<String>>,
+    /// Known tool names for validation and fuzzy matching.
+    pub known_tools: Option<Vec<(String, String)>>,
+}
+
 impl AcquiredWorker {
     /// Execute code on this worker, routing IPC through the given dispatchers.
     ///
@@ -98,14 +112,14 @@ impl AcquiredWorker {
         &mut self,
         code: &str,
         config: &crate::SandboxConfig,
-        dispatcher: Arc<dyn ToolDispatcher>,
-        resource_dispatcher: Option<Arc<dyn ResourceDispatcher>>,
-        stash_dispatcher: Option<Arc<dyn StashDispatcher>>,
+        context: PooledExecutionContext,
     ) -> Result<serde_json::Value, SandboxError> {
         let w = self.worker.as_mut().expect("worker already consumed");
 
         // Send Execute message
-        let worker_config = WorkerConfig::from(config);
+        let mut worker_config = WorkerConfig::from(config);
+        worker_config.known_servers = context.known_servers;
+        worker_config.known_tools = context.known_tools;
         let execute_msg = ParentMessage::Execute {
             code: code.to_string(),
             manifest: None,
@@ -129,9 +143,9 @@ impl AcquiredWorker {
             ipc_event_loop(
                 &mut w.stdin,
                 &mut w.stdout,
-                dispatcher,
-                resource_dispatcher,
-                stash_dispatcher,
+                context.dispatcher,
+                context.resource_dispatcher,
+                context.stash_dispatcher,
             ),
         )
         .await;

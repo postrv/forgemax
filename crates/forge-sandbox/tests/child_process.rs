@@ -10,7 +10,7 @@
 //! All tests are serialized to avoid resource contention from multiple
 //! V8 worker processes competing on CI runners.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use forge_sandbox::audit::JsonLinesAuditLogger;
@@ -56,6 +56,7 @@ impl ToolDispatcher for SlowDispatcher {
 }
 
 fn child_process_config() -> SandboxConfig {
+    std::env::set_var("FORGE_WORKER_BIN", ensure_worker_binary());
     SandboxConfig {
         execution_mode: ExecutionMode::ChildProcess,
         // Generous timeout for macOS CI runners where child process spawn + V8
@@ -63,6 +64,42 @@ fn child_process_config() -> SandboxConfig {
         timeout: Duration::from_secs(300),
         ..Default::default()
     }
+}
+
+fn ensure_worker_binary() -> &'static std::path::Path {
+    static WORKER_BIN: OnceLock<std::path::PathBuf> = OnceLock::new();
+    WORKER_BIN
+        .get_or_init(|| {
+            let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            path.pop();
+            path.pop();
+            path.push("target");
+            path.push("debug");
+            path.push(if cfg!(windows) {
+                "forgemax-worker.exe"
+            } else {
+                "forgemax-worker"
+            });
+
+            if !path.exists() {
+                let status = std::process::Command::new(
+                    std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string()),
+                )
+                .args([
+                    "build",
+                    "-p",
+                    "forge-sandbox-worker",
+                    "--bin",
+                    "forgemax-worker",
+                ])
+                .status()
+                .expect("failed to run cargo build for forgemax-worker");
+                assert!(status.success(), "failed to build forgemax-worker");
+            }
+
+            path
+        })
+        .as_path()
 }
 
 #[tokio::test]
@@ -167,6 +204,7 @@ async fn child_process_js_error_captured() {
 #[tokio::test]
 #[serial]
 async fn child_process_timeout() {
+    std::env::set_var("FORGE_WORKER_BIN", ensure_worker_binary());
     let config = SandboxConfig {
         execution_mode: ExecutionMode::ChildProcess,
         timeout: Duration::from_millis(500),

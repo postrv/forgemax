@@ -43,6 +43,8 @@ pub enum TransportConfig {
         command: String,
         /// Arguments to the command.
         args: Vec<String>,
+        /// Explicit environment variables for the child process.
+        env: HashMap<String, String>,
     },
     /// Connect via HTTP (Streamable HTTP / SSE).
     Http {
@@ -51,6 +53,98 @@ pub enum TransportConfig {
         /// Optional HTTP headers (e.g., Authorization).
         headers: HashMap<String, String>,
     },
+}
+
+const STDIO_ENV_PASSTHROUGH: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USERPROFILE",
+    "SYSTEMROOT",
+    "WINDIR",
+    "PATHEXT",
+    "TEMP",
+    "TMP",
+    "TMPDIR",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+];
+
+fn stdio_child_env(explicit: &HashMap<String, String>) -> HashMap<String, String> {
+    let mut env = HashMap::new();
+    for key in STDIO_ENV_PASSTHROUGH {
+        if let Ok(value) = std::env::var(key) {
+            env.insert((*key).to_string(), value);
+        }
+    }
+    for (key, value) in explicit {
+        env.insert(key.clone(), value.clone());
+    }
+    env
+}
+
+fn redact_stdio_args(args: &[String]) -> Vec<String> {
+    let mut redacted = Vec::with_capacity(args.len());
+    let mut redact_next = false;
+
+    for arg in args {
+        if redact_next {
+            redacted.push("[REDACTED]".to_string());
+            redact_next = false;
+            continue;
+        }
+
+        if let Some((name, _value)) = arg.split_once('=') {
+            if is_sensitive_arg_name(name) {
+                redacted.push(format!("{name}=[REDACTED]"));
+                continue;
+            }
+        }
+
+        if is_sensitive_arg_name(arg) {
+            redacted.push(arg.clone());
+            redact_next = true;
+        } else if looks_like_secret_value(arg) {
+            redacted.push("[REDACTED]".to_string());
+        } else {
+            redacted.push(arg.clone());
+        }
+    }
+
+    redacted
+}
+
+fn is_sensitive_arg_name(arg: &str) -> bool {
+    let name = arg
+        .trim_start_matches('-')
+        .to_ascii_lowercase()
+        .replace(['_', '-'], "");
+    name.contains("apikey")
+        || name.contains("accesstoken")
+        || name.contains("authtoken")
+        || name == "token"
+        || name.ends_with("token")
+        || name.contains("secret")
+        || name.contains("password")
+        || name.contains("credential")
+}
+
+fn looks_like_secret_value(arg: &str) -> bool {
+    let lower = arg.to_ascii_lowercase();
+    lower.starts_with("bearer ")
+        || lower.starts_with("sk-")
+        || lower.starts_with("ghp_")
+        || lower.starts_with("gho_")
+        || lower.starts_with("ghs_")
+        || lower.starts_with("ghr_")
+        || lower.starts_with("github_pat_")
+}
+
+fn redact_url_for_log(url: &str) -> Cow<'_, str> {
+    if let Some((base, _query)) = url.split_once('?') {
+        Cow::Owned(format!("{base}?[REDACTED]"))
+    } else {
+        Cow::Borrowed(url)
+    }
 }
 
 /// A client connection to a single downstream MCP server.
@@ -109,17 +203,44 @@ impl McpClient {
         command: &str,
         args: &[&str],
     ) -> Result<Self> {
+        Self::connect_stdio_with_env(name, command, args, HashMap::new()).await
+    }
+
+    /// Connect to a downstream MCP server over stdio with an explicit environment.
+    ///
+    /// The child process receives only a small launch environment plus `env`.
+    /// Arbitrary parent-process environment variables are not inherited.
+    pub async fn connect_stdio_with_env(
+        name: impl Into<String>,
+        command: &str,
+        args: &[&str],
+        env: HashMap<String, String>,
+    ) -> Result<Self> {
         let name = name.into();
         let args_owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        let child_env = stdio_child_env(&env);
+        let mut env_keys: Vec<&str> = child_env.keys().map(String::as_str).collect();
+        env_keys.sort_unstable();
 
         tracing::info!(
             server = %name,
             command = %command,
-            args = ?args_owned,
+            arg_count = args_owned.len(),
+            env_keys = ?env_keys,
             "connecting to downstream MCP server (stdio)"
+        );
+        tracing::debug!(
+            server = %name,
+            command = %command,
+            args = ?redact_stdio_args(&args_owned),
+            "stdio command arguments"
         );
 
         let transport = TokioChildProcess::new(Command::new(command).configure(|cmd| {
+            cmd.env_clear();
+            for (key, value) in &child_env {
+                cmd.env(key, value);
+            }
             for arg in &args_owned {
                 cmd.arg(arg);
             }
@@ -155,14 +276,14 @@ impl McpClient {
         if url.starts_with("http://") {
             tracing::warn!(
                 server = %name,
-                url = %url,
+                url = %redact_url_for_log(url),
                 "connecting over plain HTTP — consider using HTTPS for production"
             );
         }
 
         tracing::info!(
             server = %name,
-            url = %url,
+            url = %redact_url_for_log(url),
             "connecting to downstream MCP server (HTTP)"
         );
 
@@ -217,9 +338,9 @@ impl McpClient {
     pub async fn connect(name: impl Into<String>, config: &TransportConfig) -> Result<Self> {
         let name = name.into();
         match config {
-            TransportConfig::Stdio { command, args } => {
+            TransportConfig::Stdio { command, args, env } => {
                 let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-                Self::connect_stdio(name, command, &arg_refs).await
+                Self::connect_stdio_with_env(name, command, &arg_refs, env.clone()).await
             }
             TransportConfig::Http { url, headers } => {
                 let hdrs = if headers.is_empty() {
@@ -507,6 +628,14 @@ const MAX_BINARY_CONTENT_SIZE: usize = 1_048_576; // 1 MB
 /// Prevents OOM from enormous text responses from compromised downstream servers.
 const MAX_TEXT_CONTENT_SIZE: usize = 10_485_760; // 10 MB
 
+fn floor_char_boundary(s: &str, max: usize) -> usize {
+    let mut end = max.min(s.len());
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
+}
+
 /// Convert a single Content item to a JSON Value.
 ///
 /// Binary content (images, audio) larger than [`MAX_BINARY_CONTENT_SIZE`] is
@@ -515,11 +644,12 @@ fn content_to_value(content: &Content) -> Result<Value> {
     match &content.raw {
         RawContent::Text(t) => {
             if t.text.len() > MAX_TEXT_CONTENT_SIZE {
+                let preview_end = floor_char_boundary(&t.text, 1024);
                 Ok(serde_json::json!({
                     "type": "text",
                     "truncated": true,
                     "original_size": t.text.len(),
-                    "preview": &t.text[..1024.min(t.text.len())],
+                    "preview": &t.text[..preview_end],
                 }))
             } else {
                 serde_json::from_str(&t.text).or_else(|_| Ok(Value::String(t.text.clone())))
@@ -706,6 +836,16 @@ mod tests {
     }
 
     #[test]
+    fn content_to_value_oversized_text_truncates_on_char_boundary() {
+        let large_text = "€".repeat((MAX_TEXT_CONTENT_SIZE / 3) + 100);
+        let content = Content::text(large_text);
+        let val = content_to_value(&content).unwrap();
+        assert_eq!(val["type"], "text");
+        assert_eq!(val["truncated"], true);
+        assert!(val["preview"].as_str().unwrap().is_char_boundary(0));
+    }
+
+    #[test]
     fn content_to_value_normal_text_not_truncated() {
         let normal_text = "x".repeat(1024); // 1KB — well under limit
         let content = Content::text(normal_text.clone());
@@ -816,6 +956,58 @@ mod tests {
         assert!(!is_sensitive_header("User-Agent"));
     }
 
+    #[test]
+    fn stdio_child_env_only_preserves_launch_allowlist_and_explicit_env() {
+        let mut explicit = HashMap::new();
+        explicit.insert("GITHUB_TOKEN".to_string(), "secret123".to_string());
+
+        let env = stdio_child_env(&explicit);
+
+        assert_eq!(
+            env.get("GITHUB_TOKEN").map(String::as_str),
+            Some("secret123")
+        );
+        for key in env.keys() {
+            assert!(
+                STDIO_ENV_PASSTHROUGH.contains(&key.as_str()) || key == "GITHUB_TOKEN",
+                "unexpected inherited env var: {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn redact_stdio_args_removes_sensitive_values() {
+        let args = vec![
+            "--repos".to_string(),
+            ".".to_string(),
+            "--access-token".to_string(),
+            "secret-token".to_string(),
+            "--api-key=sk-live-123".to_string(),
+            "ghp_abcdefghijklmnopqrstuvwxyz".to_string(),
+        ];
+
+        let redacted = redact_stdio_args(&args);
+
+        assert_eq!(redacted[0], "--repos");
+        assert_eq!(redacted[1], ".");
+        assert_eq!(redacted[2], "--access-token");
+        assert_eq!(redacted[3], "[REDACTED]");
+        assert_eq!(redacted[4], "--api-key=[REDACTED]");
+        assert_eq!(redacted[5], "[REDACTED]");
+    }
+
+    #[test]
+    fn redact_url_for_log_removes_query_string() {
+        assert_eq!(
+            redact_url_for_log("https://example.com/mcp?token=secret").as_ref(),
+            "https://example.com/mcp?[REDACTED]"
+        );
+        assert_eq!(
+            redact_url_for_log("https://example.com/mcp").as_ref(),
+            "https://example.com/mcp"
+        );
+    }
+
     // --- isError classification tests ---
 
     #[test]
@@ -875,6 +1067,7 @@ mod tests {
         let config = TransportConfig::Stdio {
             command: "test".into(),
             args: vec![],
+            env: HashMap::new(),
         };
         match config {
             TransportConfig::Stdio { .. } | TransportConfig::Http { .. } => {}
