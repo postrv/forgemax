@@ -1,22 +1,22 @@
 class Forgemax < Formula
   desc "Code Mode MCP Gateway — collapses N servers x M tools into 2 tools"
   homepage "https://github.com/postrv/forgemax"
-  version "0.5.1"
+  version "0.6.0"
   license "FSL-1.1-ALv2"
 
   on_macos do
     if Hardware::CPU.arm?
       url "https://github.com/postrv/forgemax/releases/download/v#{version}/forgemax-v#{version}-macos-aarch64.tar.gz"
-      sha256 "9960b0996be10748e6ac3bb54f092d0f9672ec02866f84a4b6607e4bba04983f"
+      sha256 "7136464d73ddf1938d12858854b258fd0881e4baeb6a8db609450c29243b3125"
     else
       url "https://github.com/postrv/forgemax/releases/download/v#{version}/forgemax-v#{version}-macos-x86_64.tar.gz"
-      sha256 "bac2dd73402dbc6942f510ab7b5c00efc9433823b534ee11c9c2d30ed91c3691"
+      sha256 "7cd650d63e5ca072509411cf54d3dd4454126b68b7cac106cd2eab04a7ed5849"
     end
   end
 
   on_linux do
     url "https://github.com/postrv/forgemax/releases/download/v#{version}/forgemax-v#{version}-linux-x86_64.tar.gz"
-    sha256 "f94afc5bf618c62d8dc0203a4f8298d55d183a36a1dd8f7c52a9869088fb21a3"
+    sha256 "70f7d32ac9e1e7a5d9ed0f12cca8f8b642a8417fbb3d92c418c0ee36fbcb23cb"
   end
 
   def install
