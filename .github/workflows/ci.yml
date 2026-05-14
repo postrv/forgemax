@@ -13,6 +13,11 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
+  # v8 147.4+ prebuilts are compiled for macOS 12.0+; we pick 13.0 so the
+  # macOS link target outranks the v8 object file deployment target and the
+  # binary itself ships a modern macOS minimum (Ventura / Oct 2022). Ignored
+  # on Linux and Windows jobs.
+  MACOSX_DEPLOYMENT_TARGET: "13.0"
 
 jobs:
   lint:

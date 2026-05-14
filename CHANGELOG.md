@@ -35,6 +35,12 @@ All notable changes to Forgemax will be documented in this file.
 - **serde_v8:** 0.307 to 0.309 (transitive via deno_core)
 - **v8:** 147.2 to 147.4 (transitive via deno_core)
 - **deno_error:** =0.7.1 (unchanged; still pinned to match deno_core)
+- **oxc_parser / oxc_ast / oxc_span / oxc_allocator:** 0.126 to 0.130
+- **notify:** 7 to 8 (8.2.0)
+
+### Changed (Platform)
+
+- **macOS deployment target:** raised to 13.0 (Ventura, Oct 2022). v8 147.4 prebuilts are compiled with a macOS 12.0+ deployment target; the CI/release workflows now set `MACOSX_DEPLOYMENT_TARGET=13.0` so released macOS binaries declare a modern minimum and link cleanly. Users on macOS 11 / 12 should pin to v0.5.1.
 
 ### Fixed
 

@@ -1126,8 +1126,7 @@ mod tests {
         assert!(ForgeConfig::from_toml(toml).is_ok());
 
         // Invalid: explicit resource size exceeds the explicit IPC limit
-        let toml =
-            "[sandbox]\nmax_resource_size_mb = 64\nmax_ipc_message_size_mb = 32";
+        let toml = "[sandbox]\nmax_resource_size_mb = 64\nmax_ipc_message_size_mb = 32";
         let err = ForgeConfig::from_toml(toml).unwrap_err().to_string();
         assert!(err.contains("IPC"), "got: {err}");
 

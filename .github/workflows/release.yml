@@ -11,6 +11,8 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
+  # See ci.yml — v8 147.4+ prebuilts need macOS 12.0+ deployment target.
+  MACOSX_DEPLOYMENT_TARGET: "13.0"
 
 jobs:
   lint:

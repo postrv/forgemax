@@ -60,10 +60,10 @@ rmcp = { version = "1.2", features = ["server", "macros", "transport-io"] }
 schemars = "1.0"
 
 # AST validation (oxc)
-oxc_parser = "0.126"
-oxc_ast = "0.126"
-oxc_span = "0.126"
-oxc_allocator = "0.126"
+oxc_parser = "0.130"
+oxc_ast = "0.130"
+oxc_span = "0.130"
+oxc_allocator = "0.130"
 
 # Fuzzy matching
 strsim = "0.11"
@@ -75,7 +75,7 @@ regex = "1"
 arc-swap = "1"
 
 # File watching
-notify = "7"
+notify = "8"
 
 # Security / audit
 sha2 = "0.11"
