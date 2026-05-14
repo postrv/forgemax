@@ -179,11 +179,11 @@ pub struct SandboxOverrides {
     #[serde(default)]
     pub execution_mode: Option<String>,
 
-    /// Maximum IPC message size in megabytes (default: 8 MB).
+    /// Maximum IPC message size in megabytes (default: 65 MB).
     #[serde(default)]
     pub max_ipc_message_size_mb: Option<usize>,
 
-    /// Maximum resource content size in megabytes (default: 7 MB).
+    /// Maximum resource content size in megabytes (default: 64 MB).
     #[serde(default)]
     pub max_resource_size_mb: Option<usize>,
 
@@ -484,7 +484,7 @@ impl ForgeConfig {
         // CV-07: max_resource_size_mb + 1 must fit within IPC message size
         // In child_process mode, resource content flows over IPC
         if let Some(resource_mb) = self.sandbox.max_resource_size_mb {
-            let ipc_limit_mb = self.sandbox.max_ipc_message_size_mb.unwrap_or(8); // default 8 MB
+            let ipc_limit_mb = self.sandbox.max_ipc_message_size_mb.unwrap_or(65); // default 65 MB
             if resource_mb + 1 > ipc_limit_mb {
                 return Err(ConfigError::Invalid(format!(
                     "sandbox.max_resource_size_mb ({}) + 1 MB overhead exceeds IPC message limit ({} MB)",
@@ -1010,8 +1010,8 @@ mod tests {
 
     #[test]
     fn cv01_max_resource_size_mb_range() {
-        // Valid (must fit within IPC limit — default 8 MB)
-        let toml = "[sandbox]\nmax_resource_size_mb = 7";
+        // Valid (must fit within IPC limit — default 65 MB)
+        let toml = "[sandbox]\nmax_resource_size_mb = 64";
         assert!(ForgeConfig::from_toml(toml).is_ok());
 
         // Zero is invalid
@@ -1121,17 +1121,23 @@ mod tests {
 
     #[test]
     fn cv07_max_resource_size_fits_ipc() {
-        // Valid: 7 MB + 1 MB overhead = 8 MB = fits default IPC limit
-        let toml = "[sandbox]\nmax_resource_size_mb = 7";
+        // Valid: 64 MB + 1 MB overhead = 65 MB = fits default IPC limit
+        let toml = "[sandbox]\nmax_resource_size_mb = 64";
         assert!(ForgeConfig::from_toml(toml).is_ok());
 
-        // Invalid: 8 MB + 1 MB overhead = 9 MB > 8 MB default IPC limit
-        let toml = "[sandbox]\nmax_resource_size_mb = 8";
+        // Invalid: explicit resource size exceeds the explicit IPC limit
+        let toml =
+            "[sandbox]\nmax_resource_size_mb = 64\nmax_ipc_message_size_mb = 32";
+        let err = ForgeConfig::from_toml(toml).unwrap_err().to_string();
+        assert!(err.contains("IPC"), "got: {err}");
+
+        // Invalid: resource size exceeds default IPC limit
+        let toml = "[sandbox]\nmax_resource_size_mb = 65";
         let err = ForgeConfig::from_toml(toml).unwrap_err().to_string();
         assert!(err.contains("IPC"), "got: {err}");
 
         // Valid with explicit larger IPC limit
-        let toml = "[sandbox]\nmax_resource_size_mb = 32\nmax_ipc_message_size_mb = 64";
+        let toml = "[sandbox]\nmax_resource_size_mb = 128\nmax_ipc_message_size_mb = 129";
         assert!(ForgeConfig::from_toml(toml).is_ok());
     }
 

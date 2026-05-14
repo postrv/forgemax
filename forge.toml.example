@@ -125,8 +125,8 @@ max_heap_mb = 64
 max_concurrent = 8
 max_tool_calls = 50
 execution_mode = "child_process"
-max_resource_size_mb = 7    # Max size of a single resource read (default: 7 MB)
-max_ipc_message_size_mb = 8 # Must exceed max_resource_size_mb for child-process resource reads
+max_resource_size_mb = 64   # Max size of a single resource read (default: 64 MB)
+max_ipc_message_size_mb = 65 # Must exceed max_resource_size_mb for child-process resource reads (default: 65 MB)
 max_parallel = 8            # Max concurrent calls in forge.parallel() (default: 8)
 # startup_concurrency = 8  # Max concurrent server connections at startup (default: 8)
 

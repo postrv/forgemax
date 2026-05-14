@@ -145,10 +145,11 @@ async fn sec_e2e_05_ipc_message_size_limit() {
         "error should mention size: {err}"
     );
 
-    // Verify the default limit is 8 MB (not 64 MB)
+    // Verify the default limit matches the documented default (65 MB = 64 MB
+    // resource payload + 1 MB envelope overhead).
     assert_eq!(
         forge_sandbox::ipc::DEFAULT_MAX_IPC_MESSAGE_SIZE,
-        8 * 1024 * 1024,
-        "default IPC limit should be 8 MB"
+        65 * 1024 * 1024,
+        "default IPC limit should be 65 MB"
     );
 }

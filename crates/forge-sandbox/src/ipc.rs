@@ -443,17 +443,21 @@ pub async fn read_raw_message<R: AsyncRead + Unpin>(
     Ok(Some(raw))
 }
 
-/// Default maximum IPC message size: 8 MB.
+/// Default maximum IPC message size: 65 MB.
 ///
-/// Reduced from 64 MB to prevent single messages from causing memory pressure.
-/// Configurable via `sandbox.max_ipc_message_size_mb` in config.
-pub const DEFAULT_MAX_IPC_MESSAGE_SIZE: usize = 8 * 1024 * 1024;
+/// Sized to fit a [`DEFAULT_MAX_RESOURCE_SIZE`] payload plus 1 MB of IPC
+/// envelope overhead. Configurable via `sandbox.max_ipc_message_size_mb`
+/// in config — tighten for memory-constrained deployments, raise for
+/// large-payload workflows.
+pub const DEFAULT_MAX_IPC_MESSAGE_SIZE: usize = 65 * 1024 * 1024;
 
-/// Default maximum serialized resource size: 7 MB.
+/// Default maximum serialized resource size: 64 MB.
 ///
-/// Kept below [`DEFAULT_MAX_IPC_MESSAGE_SIZE`] to leave room for IPC envelope
-/// overhead in child-process mode.
-pub const DEFAULT_MAX_RESOURCE_SIZE: usize = 7 * 1024 * 1024;
+/// Permissive by default to support large-payload use cases out of the box;
+/// callers in memory-constrained deployments should tighten via
+/// `sandbox.max_resource_size_mb`. Kept below [`DEFAULT_MAX_IPC_MESSAGE_SIZE`]
+/// to leave room for IPC envelope overhead in child-process mode.
+pub const DEFAULT_MAX_RESOURCE_SIZE: usize = 64 * 1024 * 1024;
 
 /// Read a length-delimited JSON message from an async reader.
 ///
@@ -794,7 +798,7 @@ mod tests {
         assert_eq!(sandbox.max_tool_calls, back.max_tool_calls);
         assert_eq!(sandbox.max_output_size, back.max_output_size);
         assert_eq!(worker.max_ipc_message_size, DEFAULT_MAX_IPC_MESSAGE_SIZE);
-        assert_eq!(worker.max_ipc_message_size, 8 * 1024 * 1024); // 8 MB default
+        assert_eq!(worker.max_ipc_message_size, 65 * 1024 * 1024); // 65 MB default
     }
 
     #[tokio::test]

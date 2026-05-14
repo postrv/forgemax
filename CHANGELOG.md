@@ -2,6 +2,50 @@
 
 All notable changes to Forgemax will be documented in this file.
 
+## [0.6.0] - 2026-05-14
+
+### Security
+
+- **Stdio child env isolation:** Downstream stdio MCP servers no longer inherit the parent process environment. `forge-client` now calls `env_clear()` on every stdio launch and passes only a small allowlist (`PATH`, `HOME`, `USERPROFILE`, `SYSTEMROOT`, `WINDIR`, `PATHEXT`, `TEMP`, `TMP`, `TMPDIR`, `SSL_CERT_FILE`, `SSL_CERT_DIR`) plus an explicit per-server `env` map from config.
+- **Stash group isolation enforced:** `ServerStashDispatcher` now consults the live `SharedGroupLock` for every put/get/delete/keys call. Previously the dispatcher always passed `current_group = None`, so cross-group reads of stash entries were not actually blocked.
+- **`forge run` enforces groups:** The `forge run script.js` subcommand now wraps the dispatcher in `GroupEnforcingDispatcher` when `[groups]` are configured. Previously the CLI bypassed group enforcement entirely.
+- **Argv/URL redaction in transport logs:** stdio command arguments are scanned for sensitive names (`*token`, `*api*key*`, `*secret*`, `*password*`, `*credential*`) and known secret prefixes (`sk-`, `ghp_`, `gho_`, `ghs_`, `ghr_`, `github_pat_`, `bearer `) and redacted before logging. HTTP URLs have their query string redacted.
+- **Safer default execution mode:** When `[sandbox]` does not specify `execution_mode`, `forge serve`/`run` now default to `child_process` (was `in_process`). An unknown `execution_mode` value at runtime now warns and falls back to `child_process` instead of silently falling back to `in_process`.
+- **Pool worker structured-error fix:** Pooled workers now receive `known_servers` and `known_tools`. Previously the worker pool path didn't propagate these, regressing structured-error fuzzy matching introduced in v0.3.1 (the fix only applied in non-pooled child-process mode).
+- **install.ps1 SHA256 verification:** The PowerShell installer now downloads `SHA256SUMS.txt` and verifies the archive hash before extraction, matching the existing `install.sh` and `npm/install.js` behaviour.
+
+### Added
+
+- **`[servers.*].env` config field:** Map of explicit environment variables passed to stdio child processes. Supports `${VAR}` env expansion. Required for downstream servers that need credentials (e.g., `GITHUB_PERSONAL_ACCESS_TOKEN`) now that the parent environment is no longer inherited.
+- **`[sandbox.stash].max_calls`:** Per-execution cap on stash operations (default unlimited). Plumbed through `StashCallLimits` and validated against an upper bound of 10,000.
+- **Range validation for sandbox limits:** `timeout_secs` (1-3600), `max_heap_mb` (1-4096), `max_concurrent` (1-256), `max_tool_calls` (1-10000), `max_ipc_message_size_mb` (1-512), `stash.max_calls` (1-10000), and `execution_mode` (must be `child_process` or `in_process`) are now rejected at config parse time with explicit error messages.
+- **`deny_unknown_fields` on all config structs:** Typos and stale config keys are now rejected at parse time instead of being silently ignored.
+- **Structured resource truncation:** When a resource exceeds `max_resource_size`, the host now returns a structured object `{_truncated, _data_is_fragment, _shown_bytes, _original_bytes, data}` instead of truncated raw JSON (which JS would fail to parse).
+
+### Changed
+
+- **`TransportConfig::Stdio` gains an `env: HashMap<String, String>` field.** External consumers constructing this enum directly must add the field; downstream of `to_transport_config()` (the CLI path) this is transparent.
+- **`max_resource_size` default: 64 MB (unchanged); `max_ipc_message_size` default: 8 MB to 65 MB.** The IPC default is now sized to fit a full-size resource payload (64 MB) plus 1 MB envelope overhead. Previously the two defaults were internally inconsistent: a 64 MB resource could not actually flow through the 8 MB IPC envelope in `child_process` mode. Tighten both for memory-constrained deployments.
+- **`SandboxExecutor::run_execute_with_known_servers`:** New `StashCallLimits` parameter (additive; callers that don't pass it get unlimited stash operations as before).
+- **`PooledExecutionContext`:** New struct bundles `dispatcher`, `resource_dispatcher`, `stash_dispatcher`, `known_servers`, `known_tools` for pooled worker execution (refactor, not a breaking change for external callers).
+
+### Changed (Dependencies)
+
+- **deno_core:** 0.398 to 0.400
+- **serde_v8:** 0.307 to 0.309 (transitive via deno_core)
+- **v8:** 147.2 to 147.4 (transitive via deno_core)
+- **deno_error:** =0.7.1 (unchanged; still pinned to match deno_core)
+
+### Fixed
+
+- **UTF-8 boundary panics in truncation:** Added `floor_char_boundary` helper in three sites (`forge-client`, `forge-server`, `forge-sandbox/ops`) where multi-byte UTF-8 strings could trigger panics when sliced at exact byte limits.
+- **Config watcher hang under parallel test execution / cross-file events:** `notify::recommended_watcher` watches the parent directory of the config file (to catch atomic-rename saves), which previously fired the FSEvents callback for *any* file in that directory. Multiple watchers on the same parent dir (e.g., parallel `tempfile`-based tests on macOS) filled the bounded mpsc channel until `blocking_send` deadlocked the FSEvents thread, then runtime shutdown could not drain it. The callback now (a) filters `event.paths` to match the watched file via canonicalized path comparison, and (b) uses `try_send` instead of `blocking_send` (the 200 ms polling tick will catch any dropped hint).
+
+### Verification
+
+- `cargo test --workspace --no-fail-fast` -- 803 passed, 0 failed, 1 ignored.
+- `cargo clippy --workspace --all-targets -- -D warnings` -- clean.
+
 ## [0.5.1] - 2026-04-17
 
 ### Fixed

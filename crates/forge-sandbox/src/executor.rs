@@ -59,11 +59,11 @@ pub struct SandboxConfig {
     pub max_tool_call_args_size: usize,
     /// Execution mode: in-process or child-process isolation.
     pub execution_mode: ExecutionMode,
-    /// Maximum resource content size in bytes (default: 7 MB).
+    /// Maximum resource content size in bytes (default: 64 MB).
     pub max_resource_size: usize,
     /// Maximum concurrent calls in forge.parallel() (default: 8).
     pub max_parallel: usize,
-    /// Maximum IPC message size in bytes (default: 8 MB).
+    /// Maximum IPC message size in bytes (default: 65 MB).
     pub max_ipc_message_size: usize,
 }
 

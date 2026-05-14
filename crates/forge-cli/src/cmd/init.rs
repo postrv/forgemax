@@ -57,8 +57,8 @@ max_heap_mb = 64
 max_concurrent = 8
 max_tool_calls = 50
 execution_mode = "child_process"
-# max_resource_size_mb = 7
-# max_ipc_message_size_mb = 8
+# max_resource_size_mb = 64
+# max_ipc_message_size_mb = 65
 
 # ─── Worker Pool (optional) ─────────────────────────────────────────
 #

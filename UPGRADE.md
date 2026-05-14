@@ -1,5 +1,64 @@
 # Upgrading Forgemax
 
+## v0.6.0 (Security Hardening + Group Enforcement Fixes)
+
+This release tightens process and group isolation, adds explicit env plumbing for stdio servers, and includes one important behaviour change for users running in `child_process` mode.
+
+### Action required: stdio servers no longer inherit the parent environment
+
+Downstream stdio MCP servers are now spawned with `env_clear()` plus a small launch-allowlist (`PATH`, `HOME`, `USERPROFILE`, `SYSTEMROOT`, `WINDIR`, `PATHEXT`, `TEMP`, `TMP`, `TMPDIR`, `SSL_CERT_FILE`, `SSL_CERT_DIR`).
+
+If any downstream server expected to read credentials or other settings from the parent process environment (for example, a GitHub server reading `GITHUB_PERSONAL_ACCESS_TOKEN`), declare them explicitly on `[servers.*].env`:
+
+```toml
+[servers.github]
+command = "github-mcp"
+transport = "stdio"
+env = { GITHUB_PERSONAL_ACCESS_TOKEN = "${GITHUB_TOKEN}" }
+```
+
+`${VAR}` expansion in config still references the parent process env at load time.
+
+### Action required for typos: config now rejects unknown fields
+
+All config structs now have `deny_unknown_fields`. Any stale or misspelled keys that previously parsed silently will now produce a parse error at startup. Run `forgemax doctor` (or `forgemax serve --check`) once before upgrading and fix any errors reported.
+
+### Behaviour change: `forge run` enforces groups
+
+The `forge run script.js` subcommand previously bypassed group isolation. If you used `forge run` with `[groups]` configured and relied on cross-group access, you will now see "cross-group" errors. The fix matches how `forge serve` already behaved.
+
+### Behaviour change: default execution_mode is now child_process
+
+If your config omits `execution_mode` entirely, sandbox executions now run in `child_process` (previously `in_process`). Set `execution_mode = "in_process"` explicitly to keep the old behaviour. An invalid value at runtime now logs a warning and falls back to `child_process` rather than silently to `in_process`.
+
+### Behaviour change: max_ipc_message_size default raised to 65 MB
+
+The default IPC envelope size is now 65 MB, sized to fit a full-size 64 MB resource payload plus 1 MB overhead. Previously the IPC default was 8 MB while the resource default was 64 MB -- internally inconsistent for `child_process` mode. Tighten both for memory-constrained deployments via `[sandbox]`:
+
+```toml
+[sandbox]
+max_resource_size_mb = 8
+max_ipc_message_size_mb = 9
+```
+
+### Breaking: `TransportConfig::Stdio` gains an `env` field
+
+If you construct `TransportConfig::Stdio` directly (rather than via `to_transport_config`), add the new field:
+
+```rust
+// Before
+TransportConfig::Stdio { command, args }
+
+// After
+TransportConfig::Stdio { command, args, env: HashMap::new() }
+```
+
+### Other notable changes
+
+See `CHANGELOG.md` for the full list. Highlights: stash group isolation is now actually enforced cross-group; the worker pool now propagates `known_servers`/`known_tools` so structured-error fuzzy matching works in pooled mode; resource truncation returns a structured object instead of invalid raw JSON; the `install.ps1` Windows installer now verifies SHA256.
+
+---
+
 ## v0.5.1 (Dependency Refresh + Reconnect Coordination Fix)
 
 No breaking changes. Drop-in upgrade from v0.5.0.
