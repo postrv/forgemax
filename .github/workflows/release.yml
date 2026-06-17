@@ -54,6 +54,19 @@ jobs:
             echo "::error::--version output ($VERSION_OUTPUT) does not match expected ($EXPECTED)"
             exit 1
           fi
+      - name: Security gate - AST validator compiled into release binary
+        # The oxc AST validator (forge-sandbox `ast-validator` default feature) is
+        # the primary tool-poisoning / indirect-prompt-injection defense for the
+        # agent-submitted JS this gateway executes. A --no-default-features build
+        # (or dropping the forge-sandbox default) would silently downgrade it to
+        # regex-only. Fail the release if the validator's parser crate is absent
+        # from forgemax's dependency graph.
+        run: |
+          if ! cargo tree -p forgemax | grep -q oxc_parser; then
+            echo "::error::forgemax release build is missing the oxc AST validator (ast-validator feature) - tool-poisoning/IPI defense would be regex-only. Do not ship --no-default-features or disable forge-sandbox defaults."
+            exit 1
+          fi
+          echo "AST validator (oxc_parser) confirmed in forgemax dependency graph."
 
   security:
     name: Security audit
