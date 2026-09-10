@@ -12,8 +12,9 @@
 //! `cargo install forgemax` also builds this worker (via the `forgemax`
 //! package's second bin target) so both binaries land on PATH together.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use forge_sandbox::error::SandboxError;
@@ -25,20 +26,57 @@ use forge_sandbox::{ResourceDispatcher, StashDispatcher, ToolDispatcher};
 use tokio::io::{self, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, oneshot};
 
+type IpcWaiter = oneshot::Sender<Result<serde_json::Value, IpcDispatchError>>;
+type IpcWaiterMap = Arc<Mutex<HashMap<u64, IpcWaiter>>>;
+
+/// Shared IPC channels used by the tool / resource / stash bridges.
+///
+/// Waiters are inserted into a mutex map *before* the request is queued.
+/// Registering via an async channel raced the parent: a fast `StashResult`
+/// (or tool/resource result) could be read before the waiter was inserted,
+/// so the oneshot never fired and the host sat in the 300s sandbox timeout.
+#[derive(Clone)]
+struct IpcChannels {
+    tx: mpsc::UnboundedSender<ChildMessage>,
+    waiters: IpcWaiterMap,
+    next_id: Arc<AtomicU64>,
+}
+
+impl IpcChannels {
+    fn next_request_id(&self) -> u64 {
+        self.next_id.fetch_add(1, Ordering::SeqCst)
+    }
+
+    fn lock_waiters(&self) -> std::sync::MutexGuard<'_, HashMap<u64, IpcWaiter>> {
+        self.waiters.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    async fn roundtrip(
+        &self,
+        request_id: u64,
+        message: ChildMessage,
+    ) -> Result<serde_json::Value, forge_error::DispatchError> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.lock_waiters().insert(request_id, resp_tx);
+
+        if self.tx.send(message).is_err() {
+            self.lock_waiters().remove(&request_id);
+            return Err(anyhow::anyhow!("IPC send channel closed").into());
+        }
+
+        let result = resp_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("IPC response channel closed"))?;
+        result.map_err(|e| e.to_dispatch_error())
+    }
+}
+
 /// Tool dispatcher that proxies tool calls through IPC to the parent process.
 ///
 /// When sandbox code calls `forge.callTool()`, this sends a `ToolCallRequest`
 /// to the parent and waits for the `ToolCallResult` response.
 struct IpcToolBridge {
-    /// Sender for outgoing child messages (tool requests, logs).
-    tx: mpsc::UnboundedSender<ChildMessage>,
-    /// Sender for registering response waiters, keyed by request_id.
-    waiter_tx: mpsc::UnboundedSender<(
-        u64,
-        oneshot::Sender<Result<serde_json::Value, IpcDispatchError>>,
-    )>,
-    /// Atomic counter for generating unique request IDs (shared with other bridges).
-    next_id: Arc<AtomicU64>,
+    ipc: IpcChannels,
 }
 
 #[async_trait::async_trait]
@@ -49,30 +87,18 @@ impl ToolDispatcher for IpcToolBridge {
         tool: &str,
         args: serde_json::Value,
     ) -> Result<serde_json::Value, forge_error::DispatchError> {
-        let request_id = self.next_id.fetch_add(1, Ordering::SeqCst);
-
-        // Register a waiter for the response
-        let (resp_tx, resp_rx) = oneshot::channel();
-        self.waiter_tx
-            .send((request_id, resp_tx))
-            .map_err(|_| anyhow::anyhow!("IPC waiter channel closed"))?;
-
-        // Send the tool call request to the parent
-        self.tx
-            .send(ChildMessage::ToolCallRequest {
+        let request_id = self.ipc.next_request_id();
+        self.ipc
+            .roundtrip(
                 request_id,
-                server: server.to_string(),
-                tool: tool.to_string(),
-                args,
-            })
-            .map_err(|_| anyhow::anyhow!("IPC send channel closed"))?;
-
-        // Wait for the parent's response
-        let result = resp_rx
+                ChildMessage::ToolCallRequest {
+                    request_id,
+                    server: server.to_string(),
+                    tool: tool.to_string(),
+                    args,
+                },
+            )
             .await
-            .map_err(|_| anyhow::anyhow!("IPC response channel closed"))?;
-
-        result.map_err(|e| e.to_dispatch_error())
     }
 }
 
@@ -81,15 +107,7 @@ impl ToolDispatcher for IpcToolBridge {
 /// When sandbox code calls `forge.readResource()`, this sends a `ResourceReadRequest`
 /// to the parent and waits for the `ResourceReadResult` response.
 struct IpcResourceBridge {
-    /// Sender for outgoing child messages.
-    tx: mpsc::UnboundedSender<ChildMessage>,
-    /// Sender for registering response waiters, keyed by request_id.
-    waiter_tx: mpsc::UnboundedSender<(
-        u64,
-        oneshot::Sender<Result<serde_json::Value, IpcDispatchError>>,
-    )>,
-    /// Atomic counter for generating unique request IDs.
-    next_id: Arc<AtomicU64>,
+    ipc: IpcChannels,
 }
 
 #[async_trait::async_trait]
@@ -99,26 +117,17 @@ impl ResourceDispatcher for IpcResourceBridge {
         server: &str,
         uri: &str,
     ) -> Result<serde_json::Value, forge_error::DispatchError> {
-        let request_id = self.next_id.fetch_add(1, Ordering::SeqCst);
-
-        let (resp_tx, resp_rx) = oneshot::channel();
-        self.waiter_tx
-            .send((request_id, resp_tx))
-            .map_err(|_| anyhow::anyhow!("IPC waiter channel closed"))?;
-
-        self.tx
-            .send(ChildMessage::ResourceReadRequest {
+        let request_id = self.ipc.next_request_id();
+        self.ipc
+            .roundtrip(
                 request_id,
-                server: server.to_string(),
-                uri: uri.to_string(),
-            })
-            .map_err(|_| anyhow::anyhow!("IPC send channel closed"))?;
-
-        let result = resp_rx
+                ChildMessage::ResourceReadRequest {
+                    request_id,
+                    server: server.to_string(),
+                    uri: uri.to_string(),
+                },
+            )
             .await
-            .map_err(|_| anyhow::anyhow!("IPC response channel closed"))?;
-
-        result.map_err(|e| e.to_dispatch_error())
     }
 }
 
@@ -127,15 +136,7 @@ impl ResourceDispatcher for IpcResourceBridge {
 /// When sandbox code calls `forge.stash.put/get/delete/keys()`, this sends the
 /// corresponding stash message to the parent and waits for the `StashResult` response.
 struct IpcStashBridge {
-    /// Sender for outgoing child messages.
-    tx: mpsc::UnboundedSender<ChildMessage>,
-    /// Sender for registering response waiters, keyed by request_id.
-    waiter_tx: mpsc::UnboundedSender<(
-        u64,
-        oneshot::Sender<Result<serde_json::Value, IpcDispatchError>>,
-    )>,
-    /// Atomic counter for generating unique request IDs.
-    next_id: Arc<AtomicU64>,
+    ipc: IpcChannels,
 }
 
 #[async_trait::async_trait]
@@ -147,28 +148,19 @@ impl StashDispatcher for IpcStashBridge {
         ttl_secs: Option<u32>,
         current_group: Option<String>,
     ) -> Result<serde_json::Value, forge_error::DispatchError> {
-        let request_id = self.next_id.fetch_add(1, Ordering::SeqCst);
-
-        let (resp_tx, resp_rx) = oneshot::channel();
-        self.waiter_tx
-            .send((request_id, resp_tx))
-            .map_err(|_| anyhow::anyhow!("IPC waiter channel closed"))?;
-
-        self.tx
-            .send(ChildMessage::StashPut {
+        let request_id = self.ipc.next_request_id();
+        self.ipc
+            .roundtrip(
                 request_id,
-                key: key.to_string(),
-                value,
-                ttl_secs,
-                group: current_group,
-            })
-            .map_err(|_| anyhow::anyhow!("IPC send channel closed"))?;
-
-        let result = resp_rx
+                ChildMessage::StashPut {
+                    request_id,
+                    key: key.to_string(),
+                    value,
+                    ttl_secs,
+                    group: current_group,
+                },
+            )
             .await
-            .map_err(|_| anyhow::anyhow!("IPC response channel closed"))?;
-
-        result.map_err(|e| e.to_dispatch_error())
     }
 
     async fn get(
@@ -176,26 +168,17 @@ impl StashDispatcher for IpcStashBridge {
         key: &str,
         current_group: Option<String>,
     ) -> Result<serde_json::Value, forge_error::DispatchError> {
-        let request_id = self.next_id.fetch_add(1, Ordering::SeqCst);
-
-        let (resp_tx, resp_rx) = oneshot::channel();
-        self.waiter_tx
-            .send((request_id, resp_tx))
-            .map_err(|_| anyhow::anyhow!("IPC waiter channel closed"))?;
-
-        self.tx
-            .send(ChildMessage::StashGet {
+        let request_id = self.ipc.next_request_id();
+        self.ipc
+            .roundtrip(
                 request_id,
-                key: key.to_string(),
-                group: current_group,
-            })
-            .map_err(|_| anyhow::anyhow!("IPC send channel closed"))?;
-
-        let result = resp_rx
+                ChildMessage::StashGet {
+                    request_id,
+                    key: key.to_string(),
+                    group: current_group,
+                },
+            )
             .await
-            .map_err(|_| anyhow::anyhow!("IPC response channel closed"))?;
-
-        result.map_err(|e| e.to_dispatch_error())
     }
 
     async fn delete(
@@ -203,51 +186,33 @@ impl StashDispatcher for IpcStashBridge {
         key: &str,
         current_group: Option<String>,
     ) -> Result<serde_json::Value, forge_error::DispatchError> {
-        let request_id = self.next_id.fetch_add(1, Ordering::SeqCst);
-
-        let (resp_tx, resp_rx) = oneshot::channel();
-        self.waiter_tx
-            .send((request_id, resp_tx))
-            .map_err(|_| anyhow::anyhow!("IPC waiter channel closed"))?;
-
-        self.tx
-            .send(ChildMessage::StashDelete {
+        let request_id = self.ipc.next_request_id();
+        self.ipc
+            .roundtrip(
                 request_id,
-                key: key.to_string(),
-                group: current_group,
-            })
-            .map_err(|_| anyhow::anyhow!("IPC send channel closed"))?;
-
-        let result = resp_rx
+                ChildMessage::StashDelete {
+                    request_id,
+                    key: key.to_string(),
+                    group: current_group,
+                },
+            )
             .await
-            .map_err(|_| anyhow::anyhow!("IPC response channel closed"))?;
-
-        result.map_err(|e| e.to_dispatch_error())
     }
 
     async fn keys(
         &self,
         current_group: Option<String>,
     ) -> Result<serde_json::Value, forge_error::DispatchError> {
-        let request_id = self.next_id.fetch_add(1, Ordering::SeqCst);
-
-        let (resp_tx, resp_rx) = oneshot::channel();
-        self.waiter_tx
-            .send((request_id, resp_tx))
-            .map_err(|_| anyhow::anyhow!("IPC waiter channel closed"))?;
-
-        self.tx
-            .send(ChildMessage::StashKeys {
+        let request_id = self.ipc.next_request_id();
+        self.ipc
+            .roundtrip(
                 request_id,
-                group: current_group,
-            })
-            .map_err(|_| anyhow::anyhow!("IPC send channel closed"))?;
-
-        let result = resp_rx
+                ChildMessage::StashKeys {
+                    request_id,
+                    group: current_group,
+                },
+            )
             .await
-            .map_err(|_| anyhow::anyhow!("IPC response channel closed"))?;
-
-        result.map_err(|e| e.to_dispatch_error())
     }
 }
 
@@ -323,33 +288,22 @@ async fn run_single_execution(
     let known_tools = config.known_tools;
     let known_servers = config.known_servers;
 
-    // Set up IPC channels
+    // Set up IPC channels. Waiters live in a mutex so they are visible
+    // to the event loop before the corresponding request is written.
     let (tx, mut rx) = mpsc::unbounded_channel::<ChildMessage>();
-    let (waiter_tx, mut waiter_rx) = mpsc::unbounded_channel::<(
-        u64,
-        oneshot::Sender<Result<serde_json::Value, IpcDispatchError>>,
-    )>();
-
-    let shared_next_id = Arc::new(AtomicU64::new(1));
-
-    let dispatcher: Arc<dyn ToolDispatcher> = Arc::new(IpcToolBridge {
+    let ipc = IpcChannels {
         tx: tx.clone(),
-        waiter_tx: waiter_tx.clone(),
-        next_id: shared_next_id.clone(),
-    });
+        waiters: Arc::new(Mutex::new(HashMap::new())),
+        next_id: Arc::new(AtomicU64::new(1)),
+    };
+
+    let dispatcher: Arc<dyn ToolDispatcher> = Arc::new(IpcToolBridge { ipc: ipc.clone() });
 
     let resource_dispatcher: Option<Arc<dyn ResourceDispatcher>> =
-        Some(Arc::new(IpcResourceBridge {
-            tx: tx.clone(),
-            waiter_tx: waiter_tx.clone(),
-            next_id: shared_next_id.clone(),
-        }));
+        Some(Arc::new(IpcResourceBridge { ipc: ipc.clone() }));
 
-    let stash_dispatcher: Option<Arc<dyn StashDispatcher>> = Some(Arc::new(IpcStashBridge {
-        tx: tx.clone(),
-        waiter_tx,
-        next_id: shared_next_id,
-    }));
+    let stash_dispatcher: Option<Arc<dyn StashDispatcher>> =
+        Some(Arc::new(IpcStashBridge { ipc: ipc.clone() }));
 
     // Spawn the V8 execution on a dedicated thread (V8 isolates are !Send)
     let code_owned = code.to_string();
@@ -405,10 +359,6 @@ async fn run_single_execution(
     });
 
     // IPC event loop
-    let mut pending_waiters: std::collections::HashMap<
-        u64,
-        oneshot::Sender<Result<serde_json::Value, IpcDispatchError>>,
-    > = std::collections::HashMap::new();
     let mut execution_done = false;
 
     loop {
@@ -422,7 +372,7 @@ async fn run_single_execution(
                         stdout.flush().await?;
                         if is_complete {
                             execution_done = true;
-                            if pending_waiters.is_empty() {
+                            if ipc.lock_waiters().is_empty() {
                                 break;
                             }
                         }
@@ -443,27 +393,15 @@ async fn run_single_execution(
 
             result = read_message_with_limit::<ParentMessage, _>(stdin, max_ipc_size) => {
                 match result {
-                    Ok(Some(ParentMessage::ToolCallResult { request_id, result })) => {
-                        if let Some(waiter) = pending_waiters.remove(&request_id) {
+                    Ok(Some(ParentMessage::ToolCallResult { request_id, result }))
+                    | Ok(Some(ParentMessage::ResourceReadResult { request_id, result }))
+                    | Ok(Some(ParentMessage::StashResult { request_id, result })) => {
+                        if let Some(waiter) = ipc.lock_waiters().remove(&request_id) {
                             let _ = waiter.send(result);
+                        } else {
+                            tracing::warn!(request_id, "IPC result for unknown request");
                         }
-                        if execution_done && pending_waiters.is_empty() {
-                            break;
-                        }
-                    }
-                    Ok(Some(ParentMessage::ResourceReadResult { request_id, result })) => {
-                        if let Some(waiter) = pending_waiters.remove(&request_id) {
-                            let _ = waiter.send(result);
-                        }
-                        if execution_done && pending_waiters.is_empty() {
-                            break;
-                        }
-                    }
-                    Ok(Some(ParentMessage::StashResult { request_id, result })) => {
-                        if let Some(waiter) = pending_waiters.remove(&request_id) {
-                            let _ = waiter.send(result);
-                        }
-                        if execution_done && pending_waiters.is_empty() {
+                        if execution_done && ipc.lock_waiters().is_empty() {
                             break;
                         }
                     }
@@ -477,12 +415,6 @@ async fn run_single_execution(
                         tracing::error!(error = %e, "failed to read from parent");
                         break;
                     }
-                }
-            }
-
-            waiter = waiter_rx.recv() => {
-                if let Some((id, sender)) = waiter {
-                    pending_waiters.insert(id, sender);
                 }
             }
         }

@@ -10,6 +10,10 @@
 //!
 //! All tests are serialized to avoid resource contention from multiple
 //! V8 worker processes competing on CI runners.
+//!
+//! `#[serial]` must sit *above* `#[tokio::test]`. The other order wraps the
+//! async fn itself: the lock is acquired, a Future is returned, and the lock
+//! is released before tokio runs the body — so tests still overlap on CI.
 
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, OnceLock};
@@ -118,8 +122,8 @@ fn make_executor(pool: Arc<WorkerPool>) -> SandboxExecutor {
 // --- WP-I01: Sequential reuse ---
 // Execute twice sequentially through the pool. Verify the second execution
 // reuses the worker (spawned=1, reused=1).
-#[tokio::test]
 #[serial]
+#[tokio::test]
 async fn wp_i01_sequential_reuse() {
     let pool = Arc::new(WorkerPool::new(pool_config()));
     let exec = make_executor(pool.clone());
@@ -158,8 +162,8 @@ async fn wp_i01_sequential_reuse() {
 
 // --- WP-I02: Concurrent burst ---
 // Execute multiple tasks concurrently. All should succeed. Workers spawned <= max_workers.
-#[tokio::test]
 #[serial]
+#[tokio::test]
 async fn wp_i02_concurrent_burst() {
     let pool = Arc::new(WorkerPool::new(PoolConfig {
         max_workers: 4,
@@ -198,8 +202,8 @@ async fn wp_i02_concurrent_burst() {
 // --- WP-I03: Crash recovery ---
 // Execute code that causes the worker to fail fatally, then verify the pool
 // recovers and can serve a subsequent healthy execution.
-#[tokio::test]
 #[serial]
+#[tokio::test]
 async fn wp_i03_crash_recovery() {
     let pool = Arc::new(WorkerPool::new(pool_config()));
     let exec = make_executor(pool.clone());
@@ -242,8 +246,8 @@ async fn wp_i03_crash_recovery() {
 
 // --- WP-I04: Graceful shutdown ---
 // After shutdown, acquire should fail. Existing workers should be killed.
-#[tokio::test]
 #[serial]
+#[tokio::test]
 async fn wp_i04_graceful_shutdown() {
     let pool = Arc::new(WorkerPool::new(pool_config()));
     let exec = make_executor(pool.clone());
@@ -279,8 +283,8 @@ async fn wp_i04_graceful_shutdown() {
 // --- WP-I05: Context isolation ---
 // Execute code that sets a global variable, then verify the next execution
 // on the same worker cannot see it. This is the most critical security test.
-#[tokio::test]
 #[serial]
+#[tokio::test]
 async fn wp_i05_context_isolation() {
     let pool = Arc::new(WorkerPool::new(PoolConfig {
         max_workers: 1, // Force reuse of the same worker
@@ -332,8 +336,8 @@ async fn wp_i05_context_isolation() {
     pool.shutdown().await;
 }
 
-#[tokio::test]
 #[serial]
+#[tokio::test]
 async fn wp_i05b_known_servers_are_enforced_in_pooled_workers() {
     let pool = Arc::new(WorkerPool::new(PoolConfig {
         max_workers: 1,
@@ -376,8 +380,8 @@ async fn wp_i05b_known_servers_are_enforced_in_pooled_workers() {
 // --- WP-I06: max_uses recycling ---
 // Set max_uses=2, execute 3 times. After the 2nd execution, the worker
 // should be recycled (killed_max_uses > 0). The 3rd should spawn a new one.
-#[tokio::test]
 #[serial]
+#[tokio::test]
 async fn wp_i06_max_uses_recycling() {
     let pool = Arc::new(WorkerPool::new(PoolConfig {
         max_workers: 1,
@@ -411,8 +415,8 @@ async fn wp_i06_max_uses_recycling() {
 
 // --- WP-I07: Tool calls work through pooled workers ---
 // Verify that tool calls route correctly through IPC when using pooled workers.
-#[tokio::test]
 #[serial]
+#[tokio::test]
 async fn wp_i07_tool_calls_through_pool() {
     let pool = Arc::new(WorkerPool::new(pool_config()));
     let exec = make_executor(pool.clone());

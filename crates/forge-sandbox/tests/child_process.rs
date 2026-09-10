@@ -9,6 +9,10 @@
 //!
 //! All tests are serialized to avoid resource contention from multiple
 //! V8 worker processes competing on CI runners.
+//!
+//! `#[serial]` must sit *above* `#[tokio::test]`. The other order wraps the
+//! async fn itself: the lock is acquired, a Future is returned, and the lock
+//! is released before tokio runs the body — so tests still overlap on CI.
 
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -102,8 +106,8 @@ fn ensure_worker_binary() -> &'static std::path::Path {
         .as_path()
 }
 
-#[tokio::test]
 #[serial]
+#[tokio::test]
 async fn child_process_simple_execution() {
     let exec = SandboxExecutor::new(child_process_config());
     let dispatcher: Arc<dyn ToolDispatcher> = Arc::new(EchoDispatcher);
@@ -119,8 +123,8 @@ async fn child_process_simple_execution() {
     assert_eq!(result["answer"], 42);
 }
 
-#[tokio::test]
 #[serial]
+#[tokio::test]
 async fn child_process_tool_call_through_ipc() {
     let exec = SandboxExecutor::new(child_process_config());
     let dispatcher: Arc<dyn ToolDispatcher> = Arc::new(EchoDispatcher);
@@ -140,8 +144,8 @@ async fn child_process_tool_call_through_ipc() {
     assert_eq!(result["status"], "ok");
 }
 
-#[tokio::test]
 #[serial]
+#[tokio::test]
 async fn child_process_multiple_tool_calls() {
     let exec = SandboxExecutor::new(child_process_config());
     let dispatcher: Arc<dyn ToolDispatcher> = Arc::new(EchoDispatcher);
@@ -164,8 +168,8 @@ async fn child_process_multiple_tool_calls() {
     assert_eq!(arr[2], "s3");
 }
 
-#[tokio::test]
 #[serial]
+#[tokio::test]
 async fn child_process_server_proxy_syntax() {
     let exec = SandboxExecutor::new(child_process_config());
     let dispatcher: Arc<dyn ToolDispatcher> = Arc::new(EchoDispatcher);
@@ -183,8 +187,8 @@ async fn child_process_server_proxy_syntax() {
     assert_eq!(result["tool"], "ast.parse");
 }
 
-#[tokio::test]
 #[serial]
+#[tokio::test]
 async fn child_process_js_error_captured() {
     let exec = SandboxExecutor::new(child_process_config());
     let dispatcher: Arc<dyn ToolDispatcher> = Arc::new(EchoDispatcher);
@@ -201,8 +205,8 @@ async fn child_process_js_error_captured() {
     assert!(msg.contains("intentional child error"), "got: {msg}");
 }
 
-#[tokio::test]
 #[serial]
+#[tokio::test]
 async fn child_process_timeout() {
     std::env::set_var("FORGE_WORKER_BIN", ensure_worker_binary());
     let config = SandboxConfig {
@@ -238,8 +242,8 @@ async fn child_process_timeout() {
     );
 }
 
-#[tokio::test]
 #[serial]
+#[tokio::test]
 async fn child_process_with_audit_logging() {
     let buf: Vec<u8> = Vec::new();
     let logger = Arc::new(JsonLinesAuditLogger::new(buf));
@@ -265,8 +269,8 @@ async fn child_process_with_audit_logging() {
     // we verify the execution worked correctly which means audit was invoked.
 }
 
-#[tokio::test]
 #[serial]
+#[tokio::test]
 async fn child_process_returns_complex_data() {
     let exec = SandboxExecutor::new(child_process_config());
     let dispatcher: Arc<dyn ToolDispatcher> = Arc::new(EchoDispatcher);
@@ -290,8 +294,8 @@ async fn child_process_returns_complex_data() {
     assert_eq!(result["count"], 42);
 }
 
-#[tokio::test]
 #[serial]
+#[tokio::test]
 async fn child_process_tool_call_with_slow_dispatcher() {
     let exec = SandboxExecutor::new(child_process_config());
     let dispatcher: Arc<dyn ToolDispatcher> = Arc::new(SlowDispatcher);
@@ -308,8 +312,8 @@ async fn child_process_tool_call_with_slow_dispatcher() {
     assert_eq!(result["status"], "slow_ok");
 }
 
-#[tokio::test]
 #[serial]
+#[tokio::test]
 async fn child_process_banned_code_rejected() {
     let exec = SandboxExecutor::new(child_process_config());
     let dispatcher: Arc<dyn ToolDispatcher> = Arc::new(EchoDispatcher);
@@ -398,8 +402,8 @@ fn make_stash_dispatcher(
 }
 
 // --- ST-I04: Stash put+get through IPC in child_process mode ---
-#[tokio::test]
 #[serial]
+#[tokio::test]
 async fn child_process_stash_put_get_through_ipc() {
     let config = child_process_config();
     let exec = SandboxExecutor::new(config);
@@ -433,9 +437,36 @@ async fn child_process_stash_put_get_through_ipc() {
     assert_eq!(r2["data"], "from_child");
 }
 
-// --- WI-3a: JS errors should not have double "javascript error:" prefix ---
-#[tokio::test]
+/// Many stash round-trips in one worker. A fast parent used to drop
+/// `StashResult` when the waiter was only queued on an async channel.
 #[serial]
+#[tokio::test]
+async fn child_process_stash_many_roundtrips_through_ipc() {
+    let exec = SandboxExecutor::new(child_process_config());
+    let dispatcher: Arc<dyn ToolDispatcher> = Arc::new(EchoDispatcher);
+    let stash = Arc::new(tokio::sync::Mutex::new(SessionStash::new(
+        StashConfig::default(),
+    )));
+    let sd = make_stash_dispatcher(stash, None);
+
+    let code = r#"async () => {
+        for (let i = 0; i < 32; i++) {
+            await forge.stash.put("k" + i, { n: i }, { ttl: 3600 });
+            const v = await forge.stash.get("k" + i);
+            if (v.n !== i) throw new Error("mismatch " + i);
+        }
+        return "ok";
+    }"#;
+    let result = exec
+        .execute_code(code, dispatcher, None, Some(sd))
+        .await
+        .unwrap();
+    assert_eq!(result, "ok");
+}
+
+// --- WI-3a: JS errors should not have double "javascript error:" prefix ---
+#[serial]
+#[tokio::test]
 async fn child_process_no_double_js_error_prefix() {
     let exec = SandboxExecutor::new(child_process_config());
     let dispatcher: Arc<dyn ToolDispatcher> = Arc::new(EchoDispatcher);

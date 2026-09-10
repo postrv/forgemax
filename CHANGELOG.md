@@ -6,6 +6,7 @@ All notable changes to Forgemax will be documented in this file.
 
 ### Fixed
 
+- **Child-process stash IPC hang:** Worker IPC waiters are now inserted into a mutex map before the request is written. Registering waiters on an async channel raced a fast parent `StashResult` (also tool/resource results), so the oneshot never fired and `child_process_stash_put_get_through_ipc` sat in the 300s sandbox timeout on Linux CI.
 - **npm global install PATH shims:** The published package now ships JS wrappers at `bin/forgemax.js` and `bin/forgemax-worker.js`. npm creates prefix `bin` symlinks at pack time (the previous layout downloaded native binaries into `bin/` only during `postinstall`, so no PATH entry was created). Native binaries extract to `vendor/`.
 - **`cargo install forgemax` ships the worker:** The `forgemax` crate now builds a second bin, `forgemax-worker`, so `child_process` mode works after a crates.io install. `forge-sandbox-worker` remains the slim release/worker crate.
 - **Windows worker discovery:** `find_worker_binary()` looks for `forgemax-worker.exe` as well as `forgemax-worker`.
