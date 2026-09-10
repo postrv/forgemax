@@ -2,6 +2,25 @@
 
 All notable changes to Forgemax will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+
+- **npm global install PATH shims:** The published package now ships JS wrappers at `bin/forgemax.js` and `bin/forgemax-worker.js`. npm creates prefix `bin` symlinks at pack time (the previous layout downloaded native binaries into `bin/` only during `postinstall`, so no PATH entry was created). Native binaries extract to `vendor/`.
+- **`cargo install forgemax` ships the worker:** The `forgemax` crate now builds a second bin, `forgemax-worker`, so `child_process` mode works after a crates.io install. `forge-sandbox-worker` remains the slim release/worker crate.
+- **Windows worker discovery:** `find_worker_binary()` looks for `forgemax-worker.exe` as well as `forgemax-worker`.
+
+### Added
+
+- **Opt-in observability HTTP:** `[observability] listen = "127.0.0.1:9090"` (or `FORGE_OBSERVABILITY_LISTEN`) serves `GET /health`, `GET /ready`, and `GET /metrics` on a localhost bind. Disabled by default — no port is opened unless configured.
+- **JSON logs:** `[observability] log_format = "json"`, `FORGE_LOG_FORMAT=json`, or `forgemax --log-format json`.
+- **Metrics wired into the executor:** `ForgeMetrics` now records search/execute counts, durations, and error kinds when the `metrics` feature is on and a listener is configured.
+- **Security contact:** `SECURITY.md` now names GitHub Private Vulnerability Reporting and a maintainer email.
+
+### Changed
+
+- **`ForgeConfig` gains `observability`:** Optional section with serde defaults. Existing TOML files are unchanged. Rust struct literals must add `observability: ObservabilityConfig::default()` (see UPGRADE.md).
+
 ## [0.6.0] - 2026-05-14
 
 ### Security

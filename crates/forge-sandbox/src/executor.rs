@@ -8,7 +8,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use deno_core::{v8, JsRuntime, PollEventLoopOptions, RuntimeOptions};
 use serde_json::Value;
@@ -97,6 +97,9 @@ pub struct SandboxExecutor {
     audit_logger: Arc<dyn AuditLogger>,
     /// Optional worker pool for reusing child processes.
     pool: Option<Arc<crate::pool::WorkerPool>>,
+    /// Optional Prometheus metrics (compiled only with the `metrics` feature).
+    #[cfg(feature = "metrics")]
+    metrics: Option<Arc<crate::metrics::ForgeMetrics>>,
 }
 
 impl SandboxExecutor {
@@ -108,6 +111,8 @@ impl SandboxExecutor {
             semaphore,
             audit_logger: Arc::new(NoopAuditLogger),
             pool: None,
+            #[cfg(feature = "metrics")]
+            metrics: None,
         }
     }
 
@@ -119,6 +124,8 @@ impl SandboxExecutor {
             semaphore,
             audit_logger: logger,
             pool: None,
+            #[cfg(feature = "metrics")]
+            metrics: None,
         }
     }
 
@@ -129,6 +136,40 @@ impl SandboxExecutor {
     pub fn with_pool(mut self, pool: Arc<crate::pool::WorkerPool>) -> Self {
         self.pool = Some(pool);
         self
+    }
+
+    /// Attach Prometheus metrics for execution counters and histograms.
+    ///
+    /// No-op when the `metrics` feature is disabled (the argument is accepted
+    /// so call sites can stay feature-flag free).
+    #[cfg(feature = "metrics")]
+    pub fn with_metrics(mut self, metrics: Arc<crate::metrics::ForgeMetrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
+    #[cfg(feature = "metrics")]
+    fn record_metrics(
+        &self,
+        operation: &str,
+        result: &Result<Value, SandboxError>,
+        duration_secs: f64,
+    ) {
+        if let Some(ref metrics) = self.metrics {
+            if let Err(e) = result {
+                metrics.record_error(metrics_error_kind(e));
+            }
+            metrics.record_execution(operation, duration_secs);
+        }
+    }
+
+    #[cfg(not(feature = "metrics"))]
+    fn record_metrics(
+        &self,
+        _operation: &str,
+        _result: &Result<Value, SandboxError>,
+        _duration_secs: f64,
+    ) {
     }
 
     /// Execute a `search()` call — runs code against the capability manifest.
@@ -143,6 +184,7 @@ impl SandboxExecutor {
         manifest: &Value,
     ) -> Result<Value, SandboxError> {
         tracing::info!("execute_search: starting");
+        let started = Instant::now();
 
         let audit_builder = AuditEntryBuilder::new(code, AuditOperation::Search);
 
@@ -186,6 +228,7 @@ impl SandboxExecutor {
         // Emit audit entry
         let entry = audit_builder.finish(&result);
         self.audit_logger.log(&entry).await;
+        self.record_metrics("search", &result, started.elapsed().as_secs_f64());
 
         match &result {
             Ok(_) => tracing::info!("execute_search: complete"),
@@ -235,6 +278,7 @@ impl SandboxExecutor {
         known_tools: Option<Vec<(String, String)>>,
     ) -> Result<Value, SandboxError> {
         tracing::info!("execute_code: starting");
+        let started = Instant::now();
 
         let mut audit_builder = AuditEntryBuilder::new(code, AuditOperation::Execute);
 
@@ -352,6 +396,7 @@ impl SandboxExecutor {
         // Emit audit entry
         let entry = audit_builder.finish(&result);
         self.audit_logger.log(&entry).await;
+        self.record_metrics("execute", &result, started.elapsed().as_secs_f64());
 
         match &result {
             Ok(_) => tracing::info!("execute_code: complete"),
@@ -413,6 +458,16 @@ impl SandboxExecutor {
 /// reused. With the `ErrorKind` field in `ExecutionComplete`, the host now
 /// reconstructs the correct typed `SandboxError` variant, so this function
 /// only needs to match the native types.
+#[cfg(feature = "metrics")]
+fn metrics_error_kind(error: &SandboxError) -> &'static str {
+    match error {
+        SandboxError::Timeout { .. } => "timeout",
+        SandboxError::HeapLimitExceeded => "heap_limit",
+        SandboxError::JsError { .. } => "js_error",
+        _ => "execution",
+    }
+}
+
 fn is_fatal_sandbox_error(result: &Result<Value, SandboxError>) -> bool {
     matches!(
         result,

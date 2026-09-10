@@ -5,8 +5,8 @@
 If you discover a security vulnerability, please report it responsibly:
 
 1. **Do NOT open a public GitHub issue**
-2. Email security concerns to the repository maintainers via the contact information in the repository
-3. Include: vulnerability description, reproduction steps, affected versions, potential impact
+2. Prefer [GitHub Private Vulnerability Reporting](https://github.com/postrv/forgemax/security/advisories/new) on this repository
+3. Or email **laurence.avent@gmail.com** with: vulnerability description, reproduction steps, affected versions, and potential impact
 4. We aim to acknowledge reports within 48 hours and provide a fix timeline within 7 days
 
 ## Threat Model

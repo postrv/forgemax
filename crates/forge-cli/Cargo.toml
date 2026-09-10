@@ -14,10 +14,15 @@ categories = ["command-line-utilities", "development-tools"]
 name = "forgemax"
 path = "src/main.rs"
 
+[[bin]]
+name = "forgemax-worker"
+path = "src/bin/forgemax-worker.rs"
+
 [dependencies]
 forge-server.workspace = true
 forge-manifest.workspace = true
 forge-sandbox.workspace = true
+forge-sandbox-worker.workspace = true
 forge-client.workspace = true
 forge-config.workspace = true
 forge-error.workspace = true
@@ -31,14 +36,16 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 async-trait.workspace = true
 strsim.workspace = true
+prometheus-client = { version = "0.22", optional = true }
 
 [features]
 default = ["worker-pool", "metrics", "config-watch"]
 worker-pool = ["forge-sandbox/worker-pool"]
-metrics = ["forge-sandbox/metrics"]
+metrics = ["forge-sandbox/metrics", "dep:prometheus-client"]
 config-watch = ["forge-config/config-watch"]
 
 [dev-dependencies]
 forge-error.workspace = true
 tempfile = "3"
 serde_json.workspace = true
+temp-env = "0.3"

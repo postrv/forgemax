@@ -157,7 +157,11 @@ fn check_worker_binary() -> DoctorCheck {
             name: "worker_binary".into(),
             status: CheckStatus::Fail,
             message: format!("worker binary not found: {}", e),
-            fix: Some("Set FORGE_WORKER_BIN or install forgemax-worker alongside forgemax".into()),
+            fix: Some(
+                "Install forgemax-worker next to forgemax (`cargo install forgemax` ships both), \
+                 or set FORGE_WORKER_BIN to an absolute path"
+                    .into(),
+            ),
         },
     }
 }

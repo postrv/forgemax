@@ -71,6 +71,14 @@ pub struct ForgeConfig {
     /// Manifest refresh behavior.
     #[serde(default)]
     pub manifest: ManifestConfig,
+
+    /// Optional observability (metrics/health HTTP bind, log format).
+    ///
+    /// Absent from existing configs — all fields default off / text logs.
+    /// Library consumers that construct [`ForgeConfig`] with a struct literal
+    /// must add this field (use `ObservabilityConfig::default()`).
+    #[serde(default)]
+    pub observability: ObservabilityConfig,
 }
 
 /// Configuration for manifest refresh behavior.
@@ -81,6 +89,26 @@ pub struct ManifestConfig {
     /// 0 or absent = disabled (manifest is static after startup).
     #[serde(default)]
     pub refresh_interval_secs: Option<u64>,
+}
+
+/// Optional observability settings.
+///
+/// All fields default to disabled / conservative values so existing
+/// `forge.toml` files continue to parse unchanged.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ObservabilityConfig {
+    /// Bind address for a localhost HTTP observer (`/health`, `/metrics`).
+    ///
+    /// Disabled when unset. Example: `"127.0.0.1:9090"`.
+    /// Overridable at runtime via `FORGE_OBSERVABILITY_LISTEN`.
+    #[serde(default)]
+    pub listen: Option<String>,
+
+    /// Tracing format: `"text"` (default) or `"json"`.
+    /// Overridable at runtime via `FORGE_LOG_FORMAT`.
+    #[serde(default)]
+    pub log_format: Option<String>,
 }
 
 /// Configuration for a server group.
@@ -351,6 +379,31 @@ impl ForgeConfig {
 
         // Validate sandbox v0.2 fields
         self.validate_sandbox_v2()?;
+
+        self.validate_observability()?;
+
+        Ok(())
+    }
+
+    fn validate_observability(&self) -> Result<(), ConfigError> {
+        if let Some(ref listen) = self.observability.listen {
+            if listen.parse::<std::net::SocketAddr>().is_err() {
+                return Err(ConfigError::Invalid(format!(
+                    "observability.listen must be a socket address like '127.0.0.1:9090' (got '{listen}')"
+                )));
+            }
+        }
+
+        if let Some(ref format) = self.observability.log_format {
+            match format.as_str() {
+                "text" | "json" => {}
+                other => {
+                    return Err(ConfigError::Invalid(format!(
+                        "observability.log_format must be 'text' or 'json' (got '{other}')"
+                    )));
+                }
+            }
+        }
 
         Ok(())
     }
@@ -1367,6 +1420,16 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cfg_p07_production_observability() {
+        let config = load_production_example();
+        assert_eq!(
+            config.observability.listen.as_deref(),
+            Some("127.0.0.1:9090")
+        );
+        assert_eq!(config.observability.log_format.as_deref(), Some("json"));
+    }
+
     /// Verify that `config-watch` feature is on by default (v0.4.0+).
     #[test]
     #[cfg(feature = "config-watch")]
@@ -1472,6 +1535,45 @@ mod tests {
         let toml = "[sandbox]\ntimeout_secs = 5";
         let config = ForgeConfig::from_toml(toml).unwrap();
         assert!(config.sandbox.startup_concurrency.is_none());
+    }
+
+    #[test]
+    fn obs_01_observability_defaults_absent() {
+        let config = ForgeConfig::from_toml("[sandbox]\ntimeout_secs = 5").unwrap();
+        assert_eq!(config.observability, ObservabilityConfig::default());
+        assert!(config.observability.listen.is_none());
+        assert!(config.observability.log_format.is_none());
+    }
+
+    #[test]
+    fn obs_02_observability_listen_and_json_logs() {
+        let toml = r#"
+            [observability]
+            listen = "127.0.0.1:9090"
+            log_format = "json"
+        "#;
+        let config = ForgeConfig::from_toml(toml).unwrap();
+        assert_eq!(
+            config.observability.listen.as_deref(),
+            Some("127.0.0.1:9090")
+        );
+        assert_eq!(config.observability.log_format.as_deref(), Some("json"));
+    }
+
+    #[test]
+    fn obs_03_invalid_listen_rejected() {
+        let err = ForgeConfig::from_toml("[observability]\nlisten = \"not-an-addr\"")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("observability.listen"), "got: {err}");
+    }
+
+    #[test]
+    fn obs_04_invalid_log_format_rejected() {
+        let err = ForgeConfig::from_toml("[observability]\nlog_format = \"xml\"")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("observability.log_format"), "got: {err}");
     }
 
     /// Compile-time guard: ConfigError is #[non_exhaustive].

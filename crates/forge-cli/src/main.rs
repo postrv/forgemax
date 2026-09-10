@@ -6,6 +6,7 @@
 
 mod cmd;
 pub mod common;
+mod observability;
 
 use std::path::PathBuf;
 
@@ -20,6 +21,12 @@ struct Cli {
     /// Path to config file (default: auto-detect).
     #[arg(long, short, global = true, env = "FORGE_CONFIG")]
     config: Option<PathBuf>,
+
+    /// Tracing format: `text` (default) or `json`.
+    ///
+    /// Overrides `FORGE_LOG_FORMAT` and `[observability].log_format`.
+    #[arg(long, global = true, env = "FORGE_LOG_FORMAT")]
+    log_format: Option<String>,
 
     /// Subcommand to execute.
     #[command(subcommand)]
@@ -45,12 +52,17 @@ enum Commands {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .with_writer(std::io::stderr)
-        .init();
+    let discovered_config = common::find_config_file();
+    let config_log_format = cli
+        .config
+        .as_ref()
+        .or(discovered_config.as_ref())
+        .and_then(|path| forge_config::ForgeConfig::from_file_with_env(path).ok())
+        .and_then(|cfg| cfg.observability.log_format);
+
+    let log_format =
+        observability::resolve_log_format(cli.log_format.as_deref(), config_log_format.as_deref());
+    init_tracing(log_format);
 
     tracing::info!("{}", common::feature_status_line());
 
@@ -60,6 +72,21 @@ async fn main() -> Result<()> {
         Some(Commands::Manifest(args)) => cmd::manifest::execute(&args, cli.config).await,
         Some(Commands::Run(args)) => cmd::run::execute(&args, cli.config).await,
         Some(Commands::Init(args)) => cmd::init::execute(&args).await,
+    }
+}
+
+fn init_tracing(format: observability::LogFormat) {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let builder = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr);
+    match format {
+        observability::LogFormat::Json => {
+            builder.json().init();
+        }
+        observability::LogFormat::Text => {
+            builder.init();
+        }
     }
 }
 
@@ -147,5 +174,27 @@ mod tests {
     #[test]
     fn ver_01_cargo_pkg_version() {
         assert_eq!(env!("CARGO_PKG_VERSION"), "0.6.0");
+    }
+
+    #[test]
+    fn ver_02_package_ships_worker_bin() {
+        let toml = include_str!("../Cargo.toml");
+        assert!(
+            toml.contains("name = \"forgemax-worker\""),
+            "forgemax crate must declare a forgemax-worker bin so cargo install ships both"
+        );
+    }
+
+    #[test]
+    fn cli_s12_log_format_flag() {
+        let cli = Cli::try_parse_from(["forgemax", "--log-format", "json"]).unwrap();
+        assert_eq!(cli.log_format.as_deref(), Some("json"));
+    }
+
+    #[test]
+    fn npm_01_package_declares_js_bin_shims() {
+        let pkg = include_str!("../../../npm/package.json");
+        assert!(pkg.contains("\"forgemax\": \"bin/forgemax.js\""));
+        assert!(pkg.contains("\"forgemax-worker\": \"bin/forgemax-worker.js\""));
     }
 }

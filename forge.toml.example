@@ -160,3 +160,13 @@ max_parallel = 8            # Max concurrent calls in forge.parallel() (default:
 # [groups.tools]
 # servers = ["narsil", "playwright", "github", "sentry"]
 # isolation = "open"
+
+# ─── Observability (optional) ────────────────────────────────────────
+#
+# Bind a localhost HTTP observer for liveness and Prometheus scrape.
+# Disabled when `listen` is unset. Override with FORGE_OBSERVABILITY_LISTEN
+# and FORGE_LOG_FORMAT. Do not bind this to a public interface.
+#
+# [observability]
+# listen = "127.0.0.1:9090"
+# log_format = "text"

@@ -95,3 +95,11 @@ isolation = "strict"
 
 [manifest]
 refresh_interval_secs = 300
+
+# ─── Observability ──────────────────────────────────────────────────
+#
+# Localhost-only. /health and /metrics. Do not expose this port publicly.
+
+[observability]
+listen = "127.0.0.1:9090"
+log_format = "json"
