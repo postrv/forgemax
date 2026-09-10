@@ -7,6 +7,7 @@
 //! Disabled unless `observability.listen` or `FORGE_OBSERVABILITY_LISTEN` is set.
 //! Binding is intentional: this is a side channel, not the MCP transport.
 
+#[cfg(feature = "metrics")]
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -162,25 +163,18 @@ async fn handle_connection(
         }
     };
 
-    let metrics_owned;
-    let metrics_body = {
-        #[cfg(feature = "metrics")]
-        {
-            let mut encoded = String::new();
-            if prometheus_client::encoding::text::encode(&mut encoded, registry.as_ref()).is_ok() {
-                metrics_owned = Some(encoded);
-            } else {
-                metrics_owned = None;
-            }
-            metrics_owned.as_deref()
-        }
-        #[cfg(not(feature = "metrics"))]
-        {
-            let _ = &health;
-            metrics_owned = None;
-            None
+    #[cfg(feature = "metrics")]
+    let metrics_owned = {
+        let mut encoded = String::new();
+        match prometheus_client::encoding::text::encode(&mut encoded, registry.as_ref()) {
+            Ok(()) => Some(encoded),
+            Err(_) => None,
         }
     };
+    #[cfg(feature = "metrics")]
+    let metrics_body = metrics_owned.as_deref();
+    #[cfg(not(feature = "metrics"))]
+    let metrics_body = None::<&str>;
 
     let response = handle_request(method, path, &health, metrics_body);
     write_response(&mut stream, &response).await
