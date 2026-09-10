@@ -497,7 +497,6 @@ mod tests {
     use super::*;
 
     #[test]
-    #[test]
     fn worker_file_names_include_platform_binary() {
         let names = worker_file_names();
         assert!(!names.is_empty());

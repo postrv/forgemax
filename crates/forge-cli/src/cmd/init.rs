@@ -281,7 +281,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn in_10b_default_template_documents_observability() {
         assert!(
             DEFAULT_TEMPLATE.contains("[observability]"),
