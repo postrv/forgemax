@@ -40,6 +40,11 @@ observability: forge_config::ObservabilityConfig::default(),
 
 Trait signatures (`ToolDispatcher`, `ResourceDispatcher`, `StashDispatcher`) and `DispatchError` variants are unchanged.
 
+### Dependency lockfile bumps (no source changes)
+
+- `anyhow` 1.0.102 → 1.0.104 (RUSTSEC-2026-0190).
+- `rmcp` 1.2.0 → 1.8.0 (RUSTSEC-2026-0189). Still within the existing `^1.2` requirement. If you pin `rmcp = "=1.2.0"` in a consumer crate, relax the pin before upgrading Forgemax.
+
 ## v0.6.0 (Security Hardening + Group Enforcement Fixes)
 
 This release tightens process and group isolation, adds explicit env plumbing for stdio servers, and includes one important behaviour change for users running in `child_process` mode.

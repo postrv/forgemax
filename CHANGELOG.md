@@ -21,6 +21,11 @@ All notable changes to Forgemax will be documented in this file.
 
 - **`ForgeConfig` gains `observability`:** Optional section with serde defaults. Existing TOML files are unchanged. Rust struct literals must add `observability: ObservabilityConfig::default()` (see UPGRADE.md).
 
+### Changed (Dependencies)
+
+- **anyhow:** 1.0.102 to 1.0.104 (RUSTSEC-2026-0190 `downcast_mut` unsoundness).
+- **rmcp / rmcp-macros:** 1.2.0 to 1.8.0 (RUSTSEC-2026-0189 Streamable HTTP server Host allowlist). Manifest still requires `rmcp = "1.2"` (`^1.2`); no caller source changes. Forgemax itself serves MCP over stdio — the patched transport is the HTTP server we do not expose.
+
 ## [0.6.0] - 2026-05-14
 
 ### Security
