@@ -213,6 +213,11 @@ jobs:
           draft: false
           prerelease: ${{ contains(github.ref_name, '-') }}
 
+      # The Homebrew tap (postrv/homebrew-forgemax) is a separate repo.
+      # After tagging, copy homebrew/forgemax.rb (already versioned + hashed
+      # in the post-release commit) into that tap so `brew install` matches
+      # this release. This workflow cannot push to the tap.
+
   npm-publish:
     name: Publish to npm
     needs: [release]

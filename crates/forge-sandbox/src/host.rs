@@ -370,6 +370,29 @@ where
     }
 }
 
+/// Candidate filenames for the isolated worker binary.
+///
+/// Windows release archives ship `forgemax-worker.exe`; Unix ships
+/// `forgemax-worker`. Search both on Windows so a misplaced extensionless
+/// copy still works.
+pub fn worker_file_names() -> &'static [&'static str] {
+    if cfg!(windows) {
+        &["forgemax-worker.exe", "forgemax-worker"]
+    } else {
+        &["forgemax-worker"]
+    }
+}
+
+fn worker_in_dir(dir: &std::path::Path) -> Option<PathBuf> {
+    for name in worker_file_names() {
+        let candidate = dir.join(name);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 /// Find the `forgemax-worker` binary.
 ///
 /// Search order:
@@ -397,15 +420,13 @@ pub fn find_worker_binary() -> Result<PathBuf, SandboxError> {
     // 2. Same directory as current executable (or parent, for test binaries in deps/)
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            let worker = dir.join("forgemax-worker");
-            if worker.exists() {
+            if let Some(worker) = worker_in_dir(dir) {
                 validate_binary_permissions(&worker)?;
                 return Ok(worker);
             }
             // Test binaries are in target/debug/deps/ but worker is in target/debug/
             if let Some(parent) = dir.parent() {
-                let worker = parent.join("forgemax-worker");
-                if worker.exists() {
+                if let Some(worker) = worker_in_dir(parent) {
                     validate_binary_permissions(&worker)?;
                     return Ok(worker);
                 }
@@ -414,7 +435,8 @@ pub fn find_worker_binary() -> Result<PathBuf, SandboxError> {
     }
 
     Err(SandboxError::Execution(anyhow::anyhow!(
-        "forgemax-worker binary not found. Set FORGE_WORKER_BIN or install alongside forgemax"
+        "forgemax-worker binary not found. Set FORGE_WORKER_BIN or install alongside forgemax \
+         (cargo install forgemax installs both binaries)"
     )))
 }
 
@@ -473,6 +495,17 @@ fn validate_binary_permissions(_path: &std::path::Path) -> Result<(), SandboxErr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worker_file_names_include_platform_binary() {
+        let names = worker_file_names();
+        assert!(!names.is_empty());
+        if cfg!(windows) {
+            assert!(names.contains(&"forgemax-worker.exe"));
+        } else {
+            assert_eq!(names, &["forgemax-worker"]);
+        }
+    }
 
     #[test]
     fn find_worker_binary_from_exe_dir() {

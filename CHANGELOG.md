@@ -2,6 +2,31 @@
 
 All notable changes to Forgemax will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+
+- **Child-process stash IPC hang:** Worker IPC waiters are now inserted into a mutex map before the request is written. Registering waiters on an async channel raced a fast parent `StashResult` (also tool/resource results), so the oneshot never fired and `child_process_stash_put_get_through_ipc` sat in the 300s sandbox timeout on Linux CI.
+- **npm global install PATH shims:** The published package now ships JS wrappers at `bin/forgemax.js` and `bin/forgemax-worker.js`. npm creates prefix `bin` symlinks at pack time (the previous layout downloaded native binaries into `bin/` only during `postinstall`, so no PATH entry was created). Native binaries extract to `vendor/`.
+- **`cargo install forgemax` ships the worker:** The `forgemax` crate now builds a second bin, `forgemax-worker`, so `child_process` mode works after a crates.io install. `forge-sandbox-worker` remains the slim release/worker crate.
+- **Windows worker discovery:** `find_worker_binary()` looks for `forgemax-worker.exe` as well as `forgemax-worker`.
+
+### Added
+
+- **Opt-in observability HTTP:** `[observability] listen = "127.0.0.1:9090"` (or `FORGE_OBSERVABILITY_LISTEN`) serves `GET /health`, `GET /ready`, and `GET /metrics` on a localhost bind. Disabled by default — no port is opened unless configured.
+- **JSON logs:** `[observability] log_format = "json"`, `FORGE_LOG_FORMAT=json`, or `forgemax --log-format json`.
+- **Metrics wired into the executor:** `ForgeMetrics` now records search/execute counts, durations, and error kinds when the `metrics` feature is on and a listener is configured.
+- **Security contact:** `SECURITY.md` now names GitHub Private Vulnerability Reporting and a maintainer email.
+
+### Changed
+
+- **`ForgeConfig` gains `observability`:** Optional section with serde defaults. Existing TOML files are unchanged. Rust struct literals must add `observability: ObservabilityConfig::default()` (see UPGRADE.md).
+
+### Changed (Dependencies)
+
+- **anyhow:** 1.0.102 to 1.0.104 (RUSTSEC-2026-0190 `downcast_mut` unsoundness).
+- **rmcp / rmcp-macros:** 1.2.0 to 1.8.0 (RUSTSEC-2026-0189 Streamable HTTP server Host allowlist). Manifest still requires `rmcp = "1.2"` (`^1.2`); no caller source changes. Forgemax itself serves MCP over stdio — the patched transport is the HTTP server we do not expose.
+
 ## [0.6.0] - 2026-05-14
 
 ### Security

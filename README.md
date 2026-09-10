@@ -104,19 +104,22 @@ Audit event types for structured logging. Every sandbox execution is logged with
 
 ### forge-config
 
-TOML configuration with environment variable expansion (`${GITHUB_TOKEN}`). Configures downstream servers, explicit stdio `env` entries, transports, sandbox limits, and execution mode. Per-server `reconnect` and `max_reconnect_backoff_secs` fields control auto-reconnection on transport death (default: enabled for stdio). Optional config file watching via `notify` crate with debounced reload (requires `config-watch` feature). Startup concurrency is configurable (`startup_concurrency`, default 8) for parallel server connections.
+TOML configuration with environment variable expansion (`${GITHUB_TOKEN}`). Configures downstream servers, explicit stdio `env` entries, transports, sandbox limits, and execution mode. Per-server `reconnect` and `max_reconnect_backoff_secs` fields control auto-reconnection on transport death (default: enabled for stdio). Optional config file watching via `notify` crate with debounced reload (requires `config-watch` feature). Startup concurrency is configurable (`startup_concurrency`, default 8) for parallel server connections. Optional `[observability]` binds a localhost HTTP observer (`/health`, `/metrics`) and selects `text` or `json` logs — disabled unless `listen` or `FORGE_OBSERVABILITY_LISTEN` is set.
 
 ## Install
 
 **npm** (recommended):
 ```bash
 npm install -g forgemax
+# installs `forgemax` and `forgemax-worker` onto PATH
 ```
 
 **Homebrew** (macOS/Linux):
 ```bash
 brew tap postrv/forgemax && brew install forgemax
 ```
+
+The Homebrew tap is a [separate repository](https://github.com/postrv/homebrew-forgemax) and can lag this repo. If `brew` installs an older version, use the npm, cargo, or `install.sh` paths, or copy `homebrew/forgemax.rb` into the tap.
 
 **Shell installer** (macOS/Linux):
 ```bash
@@ -137,6 +140,7 @@ scoop install forgemax
 **Cargo** (from source):
 ```bash
 cargo install forgemax
+# installs both `forgemax` and `forgemax-worker` (required for child_process mode)
 ```
 
 **From source**:
@@ -172,6 +176,8 @@ cargo test --workspace
 | `forgemax manifest` | Inspect the capability manifest |
 | `forgemax run <file>` | Execute a JavaScript file against servers |
 | `forgemax init` | Generate a starter config file |
+
+Global flags: `--config` / `FORGE_CONFIG`, `--log-format text|json` / `FORGE_LOG_FORMAT`.
 
 ### Configuration
 
@@ -243,6 +249,11 @@ isolation = "strict"
 [groups.tools]
 servers = ["narsil", "playwright", "github"]
 isolation = "open"
+
+# Optional localhost observer (off by default)
+# [observability]
+# listen = "127.0.0.1:9090"
+# log_format = "json"
 ```
 </details>
 

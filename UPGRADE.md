@@ -1,5 +1,50 @@
 # Upgrading Forgemax
 
+## Unreleased (Install fixes + opt-in observability)
+
+No required action for existing `forge.toml` files or for library consumers that load config via `ForgeConfig::from_file` / `from_toml`.
+
+### `cargo install forgemax` now installs the worker
+
+`cargo install forgemax` previously installed only the gateway binary. Production `execution_mode = "child_process"` then failed with "forgemax-worker binary not found". Both binaries are now part of the `forgemax` package. After upgrading, `forgemax doctor` should report `worker_binary` PASS without setting `FORGE_WORKER_BIN`.
+
+You can still `cargo install forge-sandbox-worker` for the slim worker crate.
+
+### npm global install creates PATH shims
+
+`npm install -g forgemax` now links `forgemax` and `forgemax-worker` into the npm prefix `bin` directory. Native binaries land in `node_modules/forgemax/vendor/`. Re-install once after this change.
+
+### Homebrew tap is a separate repository
+
+The formula in this repo (`homebrew/forgemax.rb`) is the source of truth for the latest version. `brew tap postrv/forgemax` reads [postrv/homebrew-forgemax](https://github.com/postrv/homebrew-forgemax), which can lag. If `brew install forgemax` gives an older version, use `install.sh` or `cargo install forgemax`, or update the tap formula from `homebrew/forgemax.rb`.
+
+### Optional observability (off by default)
+
+```toml
+[observability]
+listen = "127.0.0.1:9090"   # /health, /ready, /metrics — do not bind publicly
+log_format = "json"         # or "text"
+```
+
+Environment overrides: `FORGE_OBSERVABILITY_LISTEN`, `FORGE_LOG_FORMAT`. CLI: `forgemax --log-format json`.
+
+Existing configs omit this section and keep the previous behaviour (no HTTP listener, text logs).
+
+### Library: `ForgeConfig.observability`
+
+If you construct `ForgeConfig` with a struct literal (not via TOML), add the new field:
+
+```rust
+observability: forge_config::ObservabilityConfig::default(),
+```
+
+Trait signatures (`ToolDispatcher`, `ResourceDispatcher`, `StashDispatcher`) and `DispatchError` variants are unchanged.
+
+### Dependency lockfile bumps (no source changes)
+
+- `anyhow` 1.0.102 → 1.0.104 (RUSTSEC-2026-0190).
+- `rmcp` 1.2.0 → 1.8.0 (RUSTSEC-2026-0189). Still within the existing `^1.2` requirement. If you pin `rmcp = "=1.2.0"` in a consumer crate, relax the pin before upgrading Forgemax.
+
 ## v0.6.0 (Security Hardening + Group Enforcement Fixes)
 
 This release tightens process and group isolation, adds explicit env plumbing for stdio servers, and includes one important behaviour change for users running in `child_process` mode.

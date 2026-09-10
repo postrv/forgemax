@@ -17,7 +17,8 @@
     "url": "git+https://github.com/postrv/forgemax.git"
   },
   "bin": {
-    "forgemax": "bin/forgemax"
+    "forgemax": "bin/forgemax.js",
+    "forgemax-worker": "bin/forgemax-worker.js"
   },
   "scripts": {
     "postinstall": "node install.js"

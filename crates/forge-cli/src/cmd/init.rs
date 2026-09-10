@@ -78,6 +78,15 @@ execution_mode = "child_process"
 # default_ttl_secs = 3600
 # max_ttl_secs = 86400
 # max_calls = 100
+
+# ─── Observability (optional) ───────────────────────────────────────
+#
+# Localhost-only HTTP for /health and /metrics. Disabled when unset.
+# Override with FORGE_OBSERVABILITY_LISTEN / FORGE_LOG_FORMAT.
+#
+# [observability]
+# listen = "127.0.0.1:9090"
+# log_format = "text"
 "#;
 
 /// Execute the init command.
@@ -269,6 +278,14 @@ mod tests {
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "expected 0600, got {:o}", mode);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn in_10b_default_template_documents_observability() {
+        assert!(
+            DEFAULT_TEMPLATE.contains("[observability]"),
+            "template should document the optional observability section"
+        );
     }
 
     #[test]

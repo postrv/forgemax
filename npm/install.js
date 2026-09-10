@@ -14,7 +14,7 @@ const zlib = require("zlib");
 const PACKAGE = require("./package.json");
 const VERSION = PACKAGE.version;
 const REPO = "postrv/forgemax";
-const BIN_DIR = path.join(__dirname, "bin");
+const VENDOR_DIR = path.join(__dirname, "vendor");
 
 // Platform → release archive mapping
 const PLATFORM_MAP = {
@@ -72,6 +72,29 @@ function extractTarGz(buffer, destDir) {
     execSync(`tar xzf "${tmpFile}" -C "${destDir}"`, { stdio: "pipe" });
   } finally {
     fs.unlinkSync(tmpFile);
+  }
+}
+
+function flattenExtractedVendor(destDir, isWindows) {
+  const expected = isWindows ? "forgemax.exe" : "forgemax";
+  if (fs.existsSync(path.join(destDir, expected))) {
+    return;
+  }
+  const entries = fs.readdirSync(destDir, { withFileTypes: true });
+  for (const entry of entries) {
+    if (!entry.isDirectory()) {
+      continue;
+    }
+    const nested = path.join(destDir, entry.name, expected);
+    if (!fs.existsSync(nested)) {
+      continue;
+    }
+    for (const file of fs.readdirSync(path.join(destDir, entry.name))) {
+      const from = path.join(destDir, entry.name, file);
+      const to = path.join(destDir, file);
+      fs.renameSync(from, to);
+    }
+    return;
   }
 }
 
@@ -133,30 +156,29 @@ async function install() {
 
   await verifyChecksum(buffer, platformKey);
 
-  // Ensure bin directory exists
-  fs.mkdirSync(BIN_DIR, { recursive: true });
+  // Native binaries live in vendor/ so npm `bin` JS shims in bin/ are never overwritten.
+  fs.mkdirSync(VENDOR_DIR, { recursive: true });
 
-  // Extract archive
   if (isWindows) {
-    extractZip(buffer, BIN_DIR);
+    extractZip(buffer, VENDOR_DIR);
   } else {
-    extractTarGz(buffer, BIN_DIR);
+    extractTarGz(buffer, VENDOR_DIR);
   }
 
-  // Set executable permissions on Unix
+  flattenExtractedVendor(VENDOR_DIR, isWindows);
+
   if (!isWindows) {
     const binaries = ["forgemax", "forgemax-worker"];
     for (const bin of binaries) {
-      const binPath = path.join(BIN_DIR, bin);
+      const binPath = path.join(VENDOR_DIR, bin);
       if (fs.existsSync(binPath)) {
         fs.chmodSync(binPath, 0o755);
       }
     }
   }
 
-  // Verify installation
   const binaryName = isWindows ? "forgemax.exe" : "forgemax";
-  const binaryPath = path.join(BIN_DIR, binaryName);
+  const binaryPath = path.join(VENDOR_DIR, binaryName);
 
   if (!fs.existsSync(binaryPath)) {
     throw new Error(`Binary not found after extraction: ${binaryPath}`);
@@ -172,9 +194,8 @@ async function install() {
     console.log("Installed forgemax (version check skipped)");
   }
 
-  // Verify worker binary
   const workerName = isWindows ? "forgemax-worker.exe" : "forgemax-worker";
-  const workerPath = path.join(BIN_DIR, workerName);
+  const workerPath = path.join(VENDOR_DIR, workerName);
   if (fs.existsSync(workerPath)) {
     console.log(`Worker binary: ${workerPath}`);
   } else {

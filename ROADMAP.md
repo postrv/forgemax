@@ -18,13 +18,18 @@
 - deno_core 0.398, V8 147.2, oxc 0.126, sha2 0.11 (v0.5.1)
 - `Notify`-coordinated reconnection (v0.5.1)
 
-## v0.6.0 — Observability
+## v0.6.1 — Install reliability + first observability slice
 
-- Prometheus metrics endpoint (HTTP)
+- npm PATH shims (`bin/*.js` wrappers, native binaries in `vendor/`)
+- `cargo install forgemax` ships `forgemax-worker`
+- Windows `forgemax-worker.exe` discovery
+- Opt-in localhost `/health` + `/metrics` + JSON logs
+
+## v0.6.x — Observability (remaining)
+
 - OpenTelemetry tracing integration
-- Structured audit log output (JSON)
-- Health check endpoint
 - Dashboard templates (Grafana)
+- Stream `/metrics` pool gauges from the live worker pool
 
 ## v0.7.0 — Ecosystem
 

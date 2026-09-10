@@ -7,6 +7,10 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[lib]
+name = "forge_sandbox_worker"
+path = "src/lib.rs"
+
 [[bin]]
 name = "forgemax-worker"
 path = "src/main.rs"

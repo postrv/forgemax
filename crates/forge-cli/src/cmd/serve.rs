@@ -118,12 +118,37 @@ pub async fn execute(config_path: Option<PathBuf>) -> Result<()> {
         None
     };
 
+    let listen = crate::observability::resolve_listen(config.observability.listen.as_deref());
+
+    #[cfg(feature = "metrics")]
+    let (metrics, registry) = {
+        let mut registry = prometheus_client::registry::Registry::default();
+        let metrics = Arc::new(forge_sandbox::metrics::ForgeMetrics::new(&mut registry));
+        (metrics, Arc::new(registry))
+    };
+
     let audit_logger = Arc::new(TracingAuditLogger);
-    let executor = if let Some(ref pool) = pool {
-        forge_sandbox::executor::SandboxExecutor::with_audit_logger(sandbox_config, audit_logger)
+    let executor = {
+        let exec = if let Some(ref pool) = pool {
+            forge_sandbox::executor::SandboxExecutor::with_audit_logger(
+                sandbox_config,
+                audit_logger,
+            )
             .with_pool(pool.clone())
-    } else {
-        forge_sandbox::executor::SandboxExecutor::with_audit_logger(sandbox_config, audit_logger)
+        } else {
+            forge_sandbox::executor::SandboxExecutor::with_audit_logger(
+                sandbox_config,
+                audit_logger,
+            )
+        };
+        #[cfg(feature = "metrics")]
+        {
+            exec.with_metrics(metrics)
+        }
+        #[cfg(not(feature = "metrics"))]
+        {
+            exec
+        }
     };
 
     let server = ForgeServer::new_with_executor(
@@ -141,6 +166,24 @@ pub async fn execute(config_path: Option<PathBuf>) -> Result<()> {
 
     // Clone the live manifest reference for background refresh
     let live_manifest = server.live_manifest().clone();
+
+    let obs_handle = listen.map(|addr| {
+        let health = crate::observability::HealthState {
+            manifest: live_manifest.clone(),
+        };
+        tokio::spawn(async move {
+            if let Err(e) = crate::observability::serve(
+                addr,
+                health,
+                #[cfg(feature = "metrics")]
+                registry,
+            )
+            .await
+            {
+                tracing::warn!(error = %e, "observability HTTP server exited");
+            }
+        })
+    });
 
     // Serve over stdio (standard MCP transport)
     let service = server.serve(rmcp::transport::io::stdio()).await?;
@@ -200,6 +243,10 @@ pub async fn execute(config_path: Option<PathBuf>) -> Result<()> {
 
     // Cancel periodic refresh task
     if let Some(handle) = refresh_handle {
+        handle.abort();
+    }
+
+    if let Some(handle) = obs_handle {
         handle.abort();
     }
 

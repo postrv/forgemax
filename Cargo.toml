@@ -58,7 +58,7 @@ async-trait = "0.1"
 
 # Logging
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # MCP protocol
 rmcp = { version = "1.2", features = ["server", "macros", "transport-io"] }
@@ -95,3 +95,4 @@ forge-client = { path = "crates/forge-client", version = "0.6.0" }
 forge-config = { path = "crates/forge-config", version = "0.6.0" }
 forge-error = { path = "crates/forge-error", version = "0.6.0" }
 forge-audit = { path = "crates/forge-audit", version = "0.6.0" }
+forge-sandbox-worker = { path = "crates/forge-sandbox-worker", version = "0.6.0" }
