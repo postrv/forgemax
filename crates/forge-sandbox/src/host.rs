@@ -400,16 +400,17 @@ pub fn find_worker_binary() -> Result<PathBuf, SandboxError> {
     }
 
     // 2. Same directory as current executable (or parent, for test binaries in deps/)
+    let worker_name = format!("forgemax-worker{}", std::env::consts::EXE_SUFFIX);
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            let worker = dir.join("forgemax-worker");
+            let worker = dir.join(&worker_name);
             if worker.exists() {
                 validate_binary_permissions(&worker)?;
                 return Ok(worker);
             }
             // Test binaries are in target/debug/deps/ but worker is in target/debug/
             if let Some(parent) = dir.parent() {
-                let worker = parent.join("forgemax-worker");
+                let worker = parent.join(&worker_name);
                 if worker.exists() {
                     validate_binary_permissions(&worker)?;
                     return Ok(worker);

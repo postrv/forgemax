@@ -22,6 +22,7 @@ All notable changes to Forgemax will be documented in this file.
 
 - Release builds retain the AST validator and use the committed dependency lockfile. Installer checks and dependency policy checks gate publication.
 - Ship a tracked npm launcher so npm creates the command link before downloading native binaries. Preserve arguments and exit status across the launcher.
+- Discover the sibling `forgemax-worker.exe` on Windows using the platform executable suffix. Native release builds must pass a real gateway/worker execution smoke test before upload.
 - The minimum Rust version is corrected to 1.93.0, matching the existing oxc 0.130 requirement. See `UPGRADE.md` for endpoint, configuration expansion, and installer behavior changes.
 - The dependency audit retains one upstream maintenance warning: V8 depends on the archived `paste` crate (RUSTSEC-2024-0436). No advisory is suppressed.
 

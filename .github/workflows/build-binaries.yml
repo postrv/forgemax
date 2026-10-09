@@ -89,6 +89,16 @@ jobs:
           copy target\${{ matrix.target }}\release\forgemax-worker.exe staging\
           copy forge.toml.example staging\
 
+      - name: Smoke test native release binaries
+        shell: bash
+        run: |
+          HOST_TARGET=$(rustc -vV | sed -n 's/^host: //p')
+          if [ "${{ matrix.target }}" = "$HOST_TARGET" ]; then
+            python tests/release_binary_smoke.py --bin-dir staging
+          else
+            echo "Skipping native execution: target ${{ matrix.target }} differs from host $HOST_TARGET"
+          fi
+
       - name: Upload artifact
         if: inputs.upload-artifacts
         uses: actions/upload-artifact@v4
