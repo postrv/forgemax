@@ -1,0 +1,165 @@
+name: Recover Registry Publication
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Published stable release tag (vX.Y.Z)
+        required: true
+        type: string
+      registry:
+        description: Registry to publish
+        required: true
+        default: npm
+        type: choice
+        options: [npm, crates, both]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: registry-recovery-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  verify-release:
+    name: Verify published release source
+    runs-on: ubuntu-latest
+    outputs:
+      commit: ${{ steps.source.outputs.commit }}
+      version: ${{ steps.source.outputs.version }}
+    steps:
+      - name: Require a published stable release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          [[ "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || {
+            echo '::error::Tag must be a stable vX.Y.Z release'; exit 1;
+          }
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" > "$RUNNER_TEMP/release.json"
+          jq -e --arg tag "$RELEASE_TAG" \
+            '.tag_name == $tag and .draft == false and .prerelease == false and .published_at != null' \
+            "$RUNNER_TEMP/release.json" >/dev/null
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+          persist-credentials: false
+      - name: Validate package versions and pin the source commit
+        id: source
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          python3 - <<'PY'
+          import json, os, tomllib
+          from pathlib import Path
+          expected = os.environ['RELEASE_TAG'][1:]
+          cargo = tomllib.loads(Path('Cargo.toml').read_text())['workspace']['package']['version']
+          npm = json.loads(Path('npm/package.json').read_text())['version']
+          if cargo != expected or npm != expected:
+              raise SystemExit(f'Version mismatch: tag={expected}, Cargo={cargo}, npm={npm}')
+          PY
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "version=${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
+
+  npm:
+    name: Publish npm package
+    needs: verify-release
+    if: inputs.registry == 'npm' || inputs.registry == 'both'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.verify-release.outputs.commit }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: https://registry.npmjs.org
+      - name: Publish the immutable package version
+        working-directory: npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          VERSION: ${{ needs.verify-release.outputs.version }}
+        run: |
+          log="$RUNNER_TEMP/npm-publication.log"
+          if existing=$(npm view "forgemax@$VERSION" version --json 2>"$log"); then
+            jq -e --arg version "$VERSION" '. == $version' <<< "$existing" >/dev/null
+            echo "forgemax $VERSION is already published"
+            exit 0
+          fi
+          if ! grep -q 'E404' "$log"; then cat "$log" >&2; exit 1; fi
+          test -n "$NODE_AUTH_TOKEN" || { echo '::error::NPM_TOKEN is not configured'; exit 1; }
+          for attempt in 1 2 3; do
+            if npm publish --access public >"$log" 2>&1; then cat "$log"; exit 0; fi
+            cat "$log" >&2
+            if grep -qi 'cannot publish over the previously published versions' "$log"; then
+              npm view "forgemax@$VERSION" version --json |
+                jq -e --arg version "$VERSION" '. == $version' >/dev/null
+              echo "forgemax $VERSION is already published"
+              exit 0
+            fi
+            if grep -Eqi 'E401|E403|ENEEDAUTH|EOTP|unauthorized|forbidden|authentication' "$log"; then
+              echo '::error::npm authentication or authorization failed; no retry'
+              exit 1
+            fi
+            if [ "$attempt" -eq 3 ] || ! grep -Eqi 'E429|E50[0-9]|ETIMEDOUT|ECONNRESET|EAI_AGAIN|timed out' "$log"; then
+              exit 1
+            fi
+            sleep 20
+          done
+
+  crates:
+    name: Publish crates in dependency order
+    needs: verify-release
+    if: inputs.registry == 'crates' || inputs.registry == 'both'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      CARGO_TERM_COLOR: always
+      RUSTFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.verify-release.outputs.commit }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/fetch-v8
+      - name: Check the V8 release archive
+        run: |
+          test -s "$RUSTY_V8_ARCHIVE"
+          gzip -t "$RUSTY_V8_ARCHIVE"
+      - name: Publish verified crate packages
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          VERSION: ${{ needs.verify-release.outputs.version }}
+        run: |
+          test -n "$CARGO_REGISTRY_TOKEN" || { echo '::error::CARGO_REGISTRY_TOKEN is not configured'; exit 1; }
+          crates=(forge-error forge-audit forge-config forge-manifest forge-sandbox forge-sandbox-worker forge-server forge-client forgemax)
+          log="$RUNNER_TEMP/crate-publication.log"
+          for crate in "${crates[@]}"; do
+            echo "::group::Publishing $crate $VERSION"
+            for attempt in 1 2 3 4 5; do
+              if cargo publish --locked --registry crates-io -p "$crate" >"$log" 2>&1; then
+                cat "$log"
+                break
+              fi
+              cat "$log" >&2
+              if grep -Eqi '(status|HTTP response).*(401|403)|unauthorized|forbidden|invalid.*token|token.*invalid|authentication|requires a token|not authorized|not enough permissions' "$log"; then
+                echo '::error::crates.io authentication or authorization failed; no retry'
+                exit 1
+              fi
+              if grep -Eqi 'already uploaded|already been uploaded' "$log"; then
+                echo "$crate $VERSION is already published"
+                break
+              fi
+              if [ "$attempt" -eq 5 ] || ! grep -Eqi 'no matching package named|failed to select a version|failed to download|failed to get|failed to query|failed to fetch|timed out|timeout|could not resolve host|connection reset|429|50[0-9]|bad gateway|service unavailable' "$log"; then
+                exit 1
+              fi
+              echo "Retrying $crate after a transient registry or dependency-index error ($attempt/5)"
+              sleep 30
+            done
+            echo '::endgroup::'
+          done
