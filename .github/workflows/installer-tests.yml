@@ -1,0 +1,31 @@
+name: Installer Verification
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  installers:
+    name: Installers (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Check npm installer and launcher
+        run: node --test npm/install.test.js npm/pack.test.js
+      - name: Check Unix installer
+        if: runner.os != 'Windows'
+        run: |
+          bash -n install.sh
+          python3 tests/installers/test_shell.py
+      - name: Check PowerShell installer
+        shell: pwsh
+        run: ./tests/installers/test_powershell.ps1

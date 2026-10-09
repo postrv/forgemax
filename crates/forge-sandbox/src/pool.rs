@@ -15,11 +15,13 @@ use std::time::{Duration, Instant};
 
 use tokio::io::BufReader;
 use tokio::process::{Child, ChildStdin, ChildStdout};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
 use crate::error::SandboxError;
 use crate::host::{find_worker_binary, ipc_event_loop};
-use crate::ipc::{read_message, write_message, ChildMessage, ParentMessage, WorkerConfig};
+use crate::ipc::{
+    read_message_with_limit, write_message, ChildMessage, ParentMessage, WorkerConfig,
+};
 use crate::{ResourceDispatcher, StashDispatcher, ToolDispatcher};
 
 /// Configuration for the worker pool.
@@ -71,6 +73,8 @@ struct PoolWorker {
     stdout: BufReader<ChildStdout>,
     uses: u32,
     idle_since: Instant,
+    // Released on every drop path, including cancellation during health checks.
+    _slot: OwnedSemaphorePermit,
 }
 
 /// Outcome of using a worker, reported back to the pool on release.
@@ -125,29 +129,29 @@ impl AcquiredWorker {
             manifest: None,
             config: worker_config,
         };
-        write_message(&mut w.stdin, &execute_msg)
-            .await
-            .map_err(|e| {
-                SandboxError::Execution(anyhow::anyhow!(
-                    "failed to send Execute to pooled worker: {}",
-                    e
-                ))
-            })?;
-
         w.uses += 1;
 
-        // Run IPC event loop with timeout
+        // Bound the entire exchange, including a blocked initial write.
         let timeout = config.timeout + Duration::from_secs(2);
-        let result = tokio::time::timeout(
-            timeout,
+        let result = tokio::time::timeout(timeout, async {
+            write_message(&mut w.stdin, &execute_msg)
+                .await
+                .map_err(|e| {
+                    SandboxError::Execution(anyhow::anyhow!(
+                        "failed to send Execute to pooled worker: {}",
+                        e
+                    ))
+                })?;
             ipc_event_loop(
                 &mut w.stdin,
                 &mut w.stdout,
                 context.dispatcher,
                 context.resource_dispatcher,
                 context.stash_dispatcher,
-            ),
-        )
+                config.max_ipc_message_size,
+            )
+            .await
+        })
         .await;
 
         match result {
@@ -166,8 +170,8 @@ impl AcquiredWorker {
 pub struct WorkerPool {
     config: PoolConfig,
     idle_workers: Mutex<VecDeque<PoolWorker>>,
-    /// Total workers currently alive (idle + checked out).
-    alive_count: Mutex<usize>,
+    /// One owned permit per worker, including workers being initialized.
+    worker_slots: Arc<Semaphore>,
     metrics: Arc<PoolMetrics>,
     /// Flag to prevent new acquisitions during shutdown.
     shutting_down: Mutex<bool>,
@@ -176,10 +180,11 @@ pub struct WorkerPool {
 impl WorkerPool {
     /// Create a new worker pool with the given configuration.
     pub fn new(config: PoolConfig) -> Self {
+        let worker_slots = Arc::new(Semaphore::new(config.max_workers));
         Self {
             config,
             idle_workers: Mutex::new(VecDeque::new()),
-            alive_count: Mutex::new(0),
+            worker_slots,
             metrics: Arc::new(PoolMetrics::default()),
             shutting_down: Mutex::new(false),
         }
@@ -214,7 +219,7 @@ impl WorkerPool {
 
                 // Health check: send Reset and wait for ResetComplete
                 let healthy = self.health_check(&mut w, &worker_config).await;
-                if healthy {
+                if healthy && !self.worker_slots.is_closed() {
                     self.metrics.reused.fetch_add(1, Ordering::Relaxed);
                     return Ok(AcquiredWorker { worker: Some(w) });
                 } else {
@@ -230,22 +235,19 @@ impl WorkerPool {
         }
 
         // No idle workers — spawn a new one if under capacity
-        let mut alive = self.alive_count.lock().await;
-        if *alive >= self.config.max_workers {
-            return Err(SandboxError::Execution(anyhow::anyhow!(
+        let slot = self.worker_slots.clone().try_acquire_owned().map_err(|_| {
+            SandboxError::Execution(anyhow::anyhow!(
                 "worker pool at capacity ({} workers)",
                 self.config.max_workers
-            )));
-        }
+            ))
+        })?;
 
-        let worker = self.spawn_worker().await?;
-        *alive += 1;
-        drop(alive);
+        let worker = self.spawn_worker(slot).await?;
 
         // Send Reset to initialize for this execution's config
         let mut w = worker;
         let healthy = self.health_check(&mut w, &worker_config).await;
-        if !healthy {
+        if !healthy || self.worker_slots.is_closed() {
             self.kill_worker(w).await;
             return Err(SandboxError::Execution(anyhow::anyhow!(
                 "newly spawned worker failed health check"
@@ -278,7 +280,9 @@ impl WorkerPool {
             return;
         }
 
-        if *self.shutting_down.lock().await {
+        let shutting_down = self.shutting_down.lock().await;
+        if *shutting_down {
+            drop(shutting_down);
             self.kill_worker(worker).await;
             return;
         }
@@ -287,11 +291,13 @@ impl WorkerPool {
         let mut w = worker;
         w.idle_since = Instant::now();
         self.idle_workers.lock().await.push_back(w);
+        drop(shutting_down);
     }
 
     /// Shut down the pool, killing all idle workers.
     pub async fn shutdown(&self) {
         *self.shutting_down.lock().await = true;
+        self.worker_slots.close();
 
         let mut idle = self.idle_workers.lock().await;
         let workers: Vec<PoolWorker> = idle.drain(..).collect();
@@ -311,7 +317,7 @@ impl WorkerPool {
         let now = Instant::now();
         let mut to_kill = Vec::new();
         let mut kept = VecDeque::new();
-        let alive = *self.alive_count.lock().await;
+        let alive = self.config.max_workers - self.worker_slots.available_permits();
 
         while let Some(w) = idle.pop_front() {
             if now.duration_since(w.idle_since) > self.config.max_idle_time {
@@ -344,20 +350,27 @@ impl WorkerPool {
         let worker_config = WorkerConfig::from(config);
         let mut count = 0;
 
-        let alive = *self.alive_count.lock().await;
+        let alive = self.config.max_workers - self.worker_slots.available_permits();
         let to_spawn = self.config.min_workers.saturating_sub(alive);
 
         for _ in 0..to_spawn {
-            if *self.alive_count.lock().await >= self.config.max_workers {
-                break;
-            }
+            let slot = match self.worker_slots.clone().try_acquire_owned() {
+                Ok(slot) => slot,
+                Err(_) => break,
+            };
 
-            match self.spawn_worker().await {
+            match self.spawn_worker(slot).await {
                 Ok(mut w) => {
                     if self.health_check(&mut w, &worker_config).await {
+                        let shutting_down = self.shutting_down.lock().await;
+                        if *shutting_down {
+                            drop(shutting_down);
+                            self.kill_worker(w).await;
+                            break;
+                        }
                         w.idle_since = Instant::now();
                         self.idle_workers.lock().await.push_back(w);
-                        *self.alive_count.lock().await += 1;
+                        drop(shutting_down);
                         count += 1;
                     } else {
                         self.kill_worker(w).await;
@@ -390,7 +403,7 @@ impl WorkerPool {
     }
 
     /// Spawn a fresh worker process.
-    async fn spawn_worker(&self) -> Result<PoolWorker, SandboxError> {
+    async fn spawn_worker(&self, slot: OwnedSemaphorePermit) -> Result<PoolWorker, SandboxError> {
         let worker_bin = find_worker_binary()?;
 
         // stderr is always piped (debug) or null (non-debug) — never inherit.
@@ -437,6 +450,7 @@ impl WorkerPool {
             stdout: BufReader::new(stdout),
             uses: 0,
             idle_since: Instant::now(),
+            _slot: slot,
         })
     }
 
@@ -446,27 +460,24 @@ impl WorkerPool {
             config: config.clone(),
         };
 
-        // Send Reset
-        if write_message(&mut w.stdin, &reset_msg).await.is_err() {
-            return false;
-        }
-
-        // Wait for ResetComplete
+        // Both sending Reset and waiting for its response must meet the deadline.
         matches!(
-            tokio::time::timeout(
-                self.config.health_check_timeout,
-                read_message::<ChildMessage, _>(&mut w.stdout),
-            )
+            tokio::time::timeout(self.config.health_check_timeout, async {
+                write_message(&mut w.stdin, &reset_msg).await?;
+                read_message_with_limit::<ChildMessage, _>(
+                    &mut w.stdout,
+                    config.max_ipc_message_size,
+                )
+                .await
+            })
             .await,
             Ok(Ok(Some(ChildMessage::ResetComplete)))
         )
     }
 
-    /// Kill a worker process and decrement the alive counter.
+    /// Kill a worker process and release its capacity permit when dropped.
     async fn kill_worker(&self, mut w: PoolWorker) {
         let _ = w.child.kill().await;
-        let mut alive = self.alive_count.lock().await;
-        *alive = alive.saturating_sub(1);
     }
 }
 
@@ -516,7 +527,10 @@ mod tests {
         let pool = WorkerPool::new(PoolConfig::default());
         let idle = pool.idle_workers.lock().await;
         assert_eq!(idle.len(), 0);
-        assert_eq!(*pool.alive_count.lock().await, 0);
+        assert_eq!(
+            pool.worker_slots.available_permits(),
+            pool.config.max_workers
+        );
     }
 
     #[tokio::test]

@@ -6,7 +6,7 @@ on:
       - "v[0-9]+.*"
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -15,6 +15,20 @@ env:
   MACOSX_DEPLOYMENT_TARGET: "13.0"
 
 jobs:
+  installers:
+    name: Installer verification
+    uses: ./.github/workflows/installer-tests.yml
+
+  deny:
+    name: Dependency policy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          arguments: --all-features
+
   lint:
     name: Lint
     runs-on: ubuntu-latest
@@ -26,7 +40,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: ./.github/actions/fetch-v8
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --locked --all-targets -- -D warnings
 
   version-check:
     name: Version check
@@ -39,7 +53,12 @@ jobs:
       - name: Verify version matches tag
         run: |
           TAG_VERSION="${GITHUB_REF_NAME#v}"
-          CARGO_VERSION=$(cargo metadata --no-deps --format-version 1 | \
+          NPM_VERSION=$(jq -r .version npm/package.json)
+          if [ "$TAG_VERSION" != "$NPM_VERSION" ]; then
+            echo "::error::Tag version ($TAG_VERSION) does not match npm/package.json ($NPM_VERSION)"
+            exit 1
+          fi
+          CARGO_VERSION=$(cargo metadata --locked --no-deps --format-version 1 | \
             jq -r '.packages[] | select(.name == "forgemax") | .version')
           if [ "$TAG_VERSION" != "$CARGO_VERSION" ]; then
             echo "::error::Tag version ($TAG_VERSION) does not match Cargo.toml version ($CARGO_VERSION)"
@@ -47,7 +66,7 @@ jobs:
           fi
       - name: Verify --version output
         run: |
-          cargo build --release -p forgemax
+          cargo build --locked --release -p forgemax
           VERSION_OUTPUT=$(./target/release/forgemax --version)
           EXPECTED="forgemax ${GITHUB_REF_NAME#v}"
           if [ "$VERSION_OUTPUT" != "$EXPECTED" ]; then
@@ -56,14 +75,15 @@ jobs:
           fi
       - name: Security gate - AST validator compiled into release binary
         # The oxc AST validator (forge-sandbox `ast-validator` default feature) is
-        # the primary tool-poisoning / indirect-prompt-injection defense for the
-        # agent-submitted JS this gateway executes. A --no-default-features build
+        # a static JavaScript capability defense for submitted code, not a
+        # detector of prompt injection in tool results. A --no-default-features build
         # (or dropping the forge-sandbox default) would silently downgrade it to
         # regex-only. Fail the release if the validator's parser crate is absent
         # from forgemax's dependency graph.
         run: |
-          if ! cargo tree -p forgemax | grep -q oxc_parser; then
-            echo "::error::forgemax release build is missing the oxc AST validator (ast-validator feature) - tool-poisoning/IPI defense would be regex-only. Do not ship --no-default-features or disable forge-sandbox defaults."
+          cargo tree --locked -p forgemax --edges normal,build > release-dependencies.txt
+          if ! grep -F oxc_parser release-dependencies.txt >/dev/null; then
+            echo "::error::forgemax release build is missing the oxc AST validator (ast-validator feature) - static JavaScript validation would be regex-only. Do not ship --no-default-features or disable forge-sandbox defaults."
             exit 1
           fi
           echo "AST validator (oxc_parser) confirmed in forgemax dependency graph."
@@ -76,7 +96,7 @@ jobs:
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
       - name: Run security audit
-        run: cargo audit
+        run: cargo audit --deny unsound
 
   test:
     name: Test (${{ matrix.os }})
@@ -91,12 +111,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: ./.github/actions/fetch-v8
       - name: Build all binaries (needed for integration tests)
-        run: cargo build --workspace
-      - run: cargo test --workspace --verbose
+        run: cargo build --locked --workspace
+      - run: cargo test --locked --workspace --verbose
 
   publish-crates:
     name: Publish to crates.io
-    needs: [lint, version-check, security, test]
+    needs: [build-binaries]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -171,14 +191,16 @@ jobs:
 
   build-binaries:
     name: Build binaries
-    needs: [lint, version-check, security, test]
+    needs: [lint, version-check, security, deny, test, installers]
     uses: ./.github/workflows/build-binaries.yml
     with:
       upload-artifacts: true
 
   release:
     name: Create GitHub Release
-    needs: [build-binaries]
+    needs: [build-binaries, publish-crates]
+    permissions:
+      contents: write
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -195,17 +217,22 @@ jobs:
 
           # Unix targets → tar.gz
           for dir in forgemax-linux-x86_64 forgemax-macos-x86_64 forgemax-macos-aarch64; do
-            if [ -d "artifacts/$dir" ]; then
-              tar czf "release/forgemax-v${VERSION}-${dir#forgemax-}.tar.gz" \
-                -C "artifacts/$dir" .
-            fi
+            for file in forgemax forgemax-worker forge.toml.example; do
+              test -s "artifacts/$dir/$file" || { echo "::error::Missing $dir/$file"; exit 1; }
+            done
+            # Artifact download does not preserve executable permissions.
+            chmod 755 "artifacts/$dir/forgemax" "artifacts/$dir/forgemax-worker"
+            tar czf "release/forgemax-v${VERSION}-${dir#forgemax-}.tar.gz" \
+              -C "artifacts/$dir" forgemax forgemax-worker forge.toml.example
           done
 
           # Windows → zip
-          if [ -d "artifacts/forgemax-windows-x86_64" ]; then
-            (cd "artifacts/forgemax-windows-x86_64" && \
-              zip -r "../../release/forgemax-v${VERSION}-windows-x86_64.zip" .)
-          fi
+          for file in forgemax.exe forgemax-worker.exe forge.toml.example; do
+            test -s "artifacts/forgemax-windows-x86_64/$file" || { echo "::error::Missing Windows $file"; exit 1; }
+          done
+          (cd "artifacts/forgemax-windows-x86_64" && \
+            zip "../../release/forgemax-v${VERSION}-windows-x86_64.zip" \
+              forgemax.exe forgemax-worker.exe forge.toml.example)
 
       - name: Generate SBOM
         run: |
@@ -216,7 +243,8 @@ jobs:
       - name: Generate checksums
         run: |
           cd release
-          sha256sum * > SHA256SUMS.txt
+          sha256sum -- *.tar.gz *.zip forgemax-sbom.json > SHA256SUMS.txt
+          sha256sum --check --strict SHA256SUMS.txt
 
       - name: Create release
         uses: softprops/action-gh-release@v2
@@ -234,17 +262,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
           registry-url: "https://registry.npmjs.org"
-      - name: Update npm package version
-        run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          cd npm
-          node -e "
-            const pkg = require('./package.json');
-            pkg.version = '${VERSION}';
-            require('fs').writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
-          "
       - name: Publish to npm
         run: cd npm && npm publish --access public
         env:

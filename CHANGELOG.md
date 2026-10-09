@@ -2,6 +2,37 @@
 
 All notable changes to Forgemax will be documented in this file.
 
+## [0.6.1] - 2026-10-09
+
+### Security
+
+- Upgrade `rmcp` to 1.8.0, clearing RUSTSEC-2026-0189 / CVE-2026-42559. The advisory concerns the SDK's HTTP server transport; Forgemax's stdio server transport is not affected.
+- Refresh `deno_core` to 0.412.0 and V8 to 150.4.0. Update `anyhow`, `rand`, and the test dependency `serial_test` to remove the audited memory-safety warnings; the latter no longer depends on `scc`. The updated runtime also removes the unmaintained `bincode` dependency.
+- Validate HTTP endpoint URLs after parsing, reject embedded URL credentials, and disable redirects so configured credentials and MCP session headers stay on the configured endpoint. Enable Rustls certificate verification explicitly for HTTPS connections.
+- Remove credential values from custom-header logs and connection/config debug output; mark all configured HTTP header values sensitive. Redact URL userinfo, queries, and fragments in transport logs.
+- Expand environment placeholders only within parsed configuration string values. Quotes, backslashes, and newlines in environment values can no longer alter TOML structure, and parse errors do not contain expanded credentials.
+- Apply configured IPC frame limits to parent readers, preserve partial frames across asynchronous cancellation, reject truncated frames, and include initial worker communication within execution deadlines.
+- Keep reading worker replies while writes are pending, preventing bidirectional pipe stalls during ordinary parallel tool calls; register response waiters before requests are forwarded.
+- Return worker-pool capacity automatically on cancellation or failure, bound concurrent prewarming, and prevent workers being returned to a pool after shutdown.
+- Redact host details from MCP sandbox error responses and enforce output bounds after JSON escaping, including error responses.
+- Require a valid, unique SHA-256 checksum before any installer extracts binaries. Install only expected binary members from isolated staging directories.
+- Restore the previous gateway/worker pair if installation fails during replacement, and retain recovery backups if rollback itself fails.
+
+### Release and compatibility
+
+- Release builds retain the AST validator and use the committed dependency lockfile. Installer checks and dependency policy checks gate publication.
+- Ship a tracked npm launcher so npm creates the command link before downloading native binaries. Preserve arguments and exit status across the launcher.
+- The minimum Rust version is corrected to 1.93.0, matching the existing oxc 0.130 requirement. See `UPGRADE.md` for endpoint, configuration expansion, and installer behavior changes.
+- The dependency audit retains one upstream maintenance warning: V8 depends on the archived `paste` crate (RUSTSEC-2024-0436). No advisory is suppressed.
+
+### Verification
+
+- Full workspace and workspace no-default-features suites: 822 passed each, zero failures, one upstream doctest ignored.
+- Isolated minimal sandbox library: 358 passed, zero failures.
+- Strict Clippy across all targets/features, formatting, dependency policy, `cargo audit --deny unsound`, and Rust 1.93.0 workspace compilation pass.
+- Offline npm installer/package tests, Unix installer tests, PowerShell installer checks, and workflow linting pass.
+- Optimized release binaries pass CLI/doctor and MCP initialize/list/search/repeated-execute smoke tests in in-process, child-process, and pooled-worker modes.
+
 ## [0.6.0] - 2026-05-14
 
 ### Security

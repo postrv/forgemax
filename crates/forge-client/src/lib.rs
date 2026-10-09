@@ -34,7 +34,7 @@ pub use router::{RouterDispatcher, RouterResourceDispatcher};
 pub use timeout::{TimeoutDispatcher, TimeoutResourceDispatcher};
 
 /// Configuration for connecting to a downstream MCP server.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 #[non_exhaustive]
 pub enum TransportConfig {
     /// Connect via stdio to a child process.
@@ -53,6 +53,24 @@ pub enum TransportConfig {
         /// Optional HTTP headers (e.g., Authorization).
         headers: HashMap<String, String>,
     },
+}
+
+impl std::fmt::Debug for TransportConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Stdio { command, args, env } => f
+                .debug_struct("Stdio")
+                .field("command", command)
+                .field("arg_count", &args.len())
+                .field("env_keys", &env.keys().collect::<Vec<_>>())
+                .finish(),
+            Self::Http { url, headers } => f
+                .debug_struct("Http")
+                .field("url", &redact_url_for_log(url))
+                .field("header_names", &headers.keys().collect::<Vec<_>>())
+                .finish(),
+        }
+    }
 }
 
 const STDIO_ENV_PASSTHROUGH: &[&str] = &[
@@ -82,69 +100,56 @@ fn stdio_child_env(explicit: &HashMap<String, String>) -> HashMap<String, String
     env
 }
 
-fn redact_stdio_args(args: &[String]) -> Vec<String> {
-    let mut redacted = Vec::with_capacity(args.len());
-    let mut redact_next = false;
-
-    for arg in args {
-        if redact_next {
-            redacted.push("[REDACTED]".to_string());
-            redact_next = false;
-            continue;
-        }
-
-        if let Some((name, _value)) = arg.split_once('=') {
-            if is_sensitive_arg_name(name) {
-                redacted.push(format!("{name}=[REDACTED]"));
-                continue;
-            }
-        }
-
-        if is_sensitive_arg_name(arg) {
-            redacted.push(arg.clone());
-            redact_next = true;
-        } else if looks_like_secret_value(arg) {
-            redacted.push("[REDACTED]".to_string());
-        } else {
-            redacted.push(arg.clone());
-        }
-    }
-
-    redacted
+fn redact_url_for_log(url: &str) -> String {
+    let Ok(mut parsed) = reqwest::Url::parse(url) else {
+        return "[REDACTED URL]".into();
+    };
+    let _ = parsed.set_username("");
+    let _ = parsed.set_password(None);
+    parsed.set_query(None);
+    parsed.set_fragment(None);
+    parsed.to_string()
 }
 
-fn is_sensitive_arg_name(arg: &str) -> bool {
-    let name = arg
-        .trim_start_matches('-')
-        .to_ascii_lowercase()
-        .replace(['_', '-'], "");
-    name.contains("apikey")
-        || name.contains("accesstoken")
-        || name.contains("authtoken")
-        || name == "token"
-        || name.ends_with("token")
-        || name.contains("secret")
-        || name.contains("password")
-        || name.contains("credential")
+fn validate_http_url(url: &str) -> Result<reqwest::Url> {
+    let parsed = reqwest::Url::parse(url).context("invalid MCP server URL")?;
+    anyhow::ensure!(
+        matches!(parsed.scheme(), "http" | "https") && parsed.host_str().is_some(),
+        "MCP server URL must use HTTP or HTTPS and include a host"
+    );
+    anyhow::ensure!(
+        parsed.username().is_empty() && parsed.password().is_none(),
+        "MCP server URL must not contain credentials; use HTTPS headers instead"
+    );
+    Ok(parsed)
 }
 
-fn looks_like_secret_value(arg: &str) -> bool {
-    let lower = arg.to_ascii_lowercase();
-    lower.starts_with("bearer ")
-        || lower.starts_with("sk-")
-        || lower.starts_with("ghp_")
-        || lower.starts_with("gho_")
-        || lower.starts_with("ghs_")
-        || lower.starts_with("ghr_")
-        || lower.starts_with("github_pat_")
+fn http_client() -> Result<reqwest::Client> {
+    // MCP credentials and session headers belong only to the configured endpoint.
+    // Configure the final endpoint directly instead of following redirects, which
+    // could otherwise forward custom credentials or downgrade an HTTPS request.
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .context("failed to build MCP HTTP client")
 }
 
-fn redact_url_for_log(url: &str) -> Cow<'_, str> {
-    if let Some((base, _query)) = url.split_once('?') {
-        Cow::Owned(format!("{base}?[REDACTED]"))
-    } else {
-        Cow::Borrowed(url)
-    }
+fn http_headers(
+    headers: &HashMap<String, String>,
+) -> Result<HashMap<http::HeaderName, http::HeaderValue>> {
+    headers
+        .iter()
+        .map(|(key, value)| {
+            let header_name = http::HeaderName::from_bytes(key.as_bytes())
+                .with_context(|| format!("invalid header name: {key}"))?;
+            let mut header_value = http::HeaderValue::from_str(value)
+                .with_context(|| format!("invalid header value for {key}"))?;
+            // Custom header names can carry credentials too. Mark every
+            // configured value sensitive so dependency debug logs redact it.
+            header_value.set_sensitive(true);
+            Ok((header_name, header_value))
+        })
+        .collect()
 }
 
 /// A client connection to a single downstream MCP server.
@@ -229,12 +234,6 @@ impl McpClient {
             env_keys = ?env_keys,
             "connecting to downstream MCP server (stdio)"
         );
-        tracing::debug!(
-            server = %name,
-            command = %command,
-            args = ?redact_stdio_args(&args_owned),
-            "stdio command arguments"
-        );
 
         let transport = TokioChildProcess::new(Command::new(command).configure(|cmd| {
             cmd.env_clear();
@@ -273,7 +272,10 @@ impl McpClient {
     ) -> Result<Self> {
         let name = name.into();
 
-        if url.starts_with("http://") {
+        let parsed_url = validate_http_url(url)?;
+        let url = parsed_url.as_str();
+
+        if parsed_url.scheme() == "http" {
             tracing::warn!(
                 server = %name,
                 url = %redact_url_for_log(url),
@@ -301,26 +303,13 @@ impl McpClient {
         });
 
         if let Some(hdrs) = &headers {
-            for (key, value) in hdrs {
-                if key.to_lowercase() == "authorization" {
-                    tracing::debug!(server = %name, header = %key, "setting auth header (redacted)");
-                } else {
-                    tracing::debug!(server = %name, header = %key, value = %value, "setting header");
-                }
+            for key in hdrs.keys() {
+                tracing::debug!(server = %name, header = %key, "setting header (value redacted)");
             }
-
-            let mut header_map = HashMap::new();
-            for (key, value) in hdrs {
-                let header_name = http::HeaderName::from_bytes(key.as_bytes())
-                    .with_context(|| format!("invalid header name: {key}"))?;
-                let header_value = http::HeaderValue::from_str(value)
-                    .with_context(|| format!("invalid header value for {key}"))?;
-                header_map.insert(header_name, header_value);
-            }
-            config = config.custom_headers(header_map);
+            config = config.custom_headers(http_headers(hdrs)?);
         }
 
-        let transport = StreamableHttpClientTransport::from_config(config);
+        let transport = StreamableHttpClientTransport::with_client(http_client()?, config);
         let service: RunningService<RoleClient, ()> = ()
             .serve(transport)
             .await
@@ -725,7 +714,7 @@ fn check_http_credential_safety(
     url: &str,
     headers: &HashMap<String, String>,
 ) -> Result<(), anyhow::Error> {
-    if url.starts_with("http://") {
+    if validate_http_url(url)?.scheme() == "http" {
         let sensitive: Vec<&String> = headers.keys().filter(|k| is_sensitive_header(k)).collect();
         if !sensitive.is_empty() {
             return Err(anyhow::anyhow!(
@@ -749,7 +738,8 @@ fn check_http_credential_safety(
 /// "cookie", "credential", or "password" (case-insensitive) to prevent
 /// accidental credential leakage over unencrypted transports.
 fn sanitize_headers_for_transport(url: &str, headers: &mut HashMap<String, String>) {
-    if url.starts_with("http://") {
+    // Preserve credentials only for a successfully parsed HTTPS endpoint.
+    if !matches!(validate_http_url(url), Ok(url) if url.scheme() == "https") {
         let removed: Vec<String> = headers
             .keys()
             .filter(|k| is_sensitive_header(k))
@@ -760,7 +750,7 @@ fn sanitize_headers_for_transport(url: &str, headers: &mut HashMap<String, Strin
         }
         if !removed.is_empty() {
             tracing::warn!(
-                url = %url,
+                url = %redact_url_for_log(url),
                 removed_headers = ?removed,
                 "stripped sensitive headers from plain HTTP connection — use HTTPS to send credentials"
             );
@@ -976,36 +966,112 @@ mod tests {
     }
 
     #[test]
-    fn redact_stdio_args_removes_sensitive_values() {
-        let args = vec![
-            "--repos".to_string(),
-            ".".to_string(),
-            "--access-token".to_string(),
-            "secret-token".to_string(),
-            "--api-key=sk-live-123".to_string(),
-            "ghp_abcdefghijklmnopqrstuvwxyz".to_string(),
-        ];
-
-        let redacted = redact_stdio_args(&args);
-
-        assert_eq!(redacted[0], "--repos");
-        assert_eq!(redacted[1], ".");
-        assert_eq!(redacted[2], "--access-token");
-        assert_eq!(redacted[3], "[REDACTED]");
-        assert_eq!(redacted[4], "--api-key=[REDACTED]");
-        assert_eq!(redacted[5], "[REDACTED]");
+    fn redact_url_for_log_removes_credentials_query_and_fragment() {
+        assert_eq!(
+            redact_url_for_log(
+                "https://reader:example-password@example.com/mcp?token=example-token#private"
+            ),
+            "https://example.com/mcp"
+        );
+        assert_eq!(
+            redact_url_for_log("https://example.com/mcp"),
+            "https://example.com/mcp"
+        );
+        assert_eq!(redact_url_for_log("invalid-url"), "[REDACTED URL]");
     }
 
     #[test]
-    fn redact_url_for_log_removes_query_string() {
+    fn transport_debug_omits_credential_values() {
+        let http = TransportConfig::Http {
+            url: "https://example.com/mcp?token=example-token".into(),
+            headers: HashMap::from([("X-Api-Key".into(), "example-key".into())]),
+        };
+        let stdio = TransportConfig::Stdio {
+            command: "example-server".into(),
+            args: vec!["example-argument".into()],
+            env: HashMap::from([("TOKEN".into(), "example-env-value".into())]),
+        };
+        let debug = format!("{http:?} {stdio:?}");
+        for value in [
+            "example-token",
+            "example-key",
+            "example-argument",
+            "example-env-value",
+        ] {
+            assert!(!debug.contains(value));
+        }
+        assert!(debug.contains("X-Api-Key"));
+        assert!(debug.contains("TOKEN"));
+    }
+
+    #[test]
+    fn custom_header_values_are_sensitive_even_without_known_names() {
+        let configured = HashMap::from([
+            ("Authorization".into(), "Bearer example-token".into()),
+            ("X-Api-Key".into(), "example-key".into()),
+            ("Example".into(), "example-private-value".into()),
+        ]);
+        let headers = http_headers(&configured).unwrap();
+        assert!(headers.values().all(http::HeaderValue::is_sensitive));
+        let debug = format!("{headers:?}");
+        for value in configured.values() {
+            assert!(!debug.contains(value));
+        }
         assert_eq!(
-            redact_url_for_log("https://example.com/mcp?token=secret").as_ref(),
-            "https://example.com/mcp?[REDACTED]"
+            headers[&http::HeaderName::from_static("example")]
+                .to_str()
+                .unwrap(),
+            "example-private-value"
         );
+    }
+
+    #[test]
+    fn http_url_validation_accepts_http_and_https_only() {
         assert_eq!(
-            redact_url_for_log("https://example.com/mcp").as_ref(),
-            "https://example.com/mcp"
+            validate_http_url("HTTPS://example.com/mcp")
+                .unwrap()
+                .scheme(),
+            "https"
         );
+        for url in ["file:///example", "ftp://example.com/mcp", "not-a-url"] {
+            assert!(validate_http_url(url).is_err());
+        }
+        assert!(validate_http_url("https://reader:example-password@example.com/mcp").is_err());
+    }
+
+    #[test]
+    fn credential_policy_uses_normalized_url_scheme() {
+        let headers = HashMap::from([("X-Api-Key".into(), "example-key".into())]);
+        assert!(check_http_credential_safety("HTTP://example.com/mcp", &headers).is_err());
+        assert!(check_http_credential_safety("HTTPS://example.com/mcp", &headers).is_ok());
+        let mut sanitized = headers.clone();
+        sanitize_headers_for_transport("HTTP://example.com/mcp", &mut sanitized);
+        assert!(sanitized.is_empty());
+    }
+
+    #[tokio::test]
+    async fn http_client_returns_redirect_response_without_following() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            let bytes_read = socket.read(&mut request).await.unwrap();
+            assert!(bytes_read > 0);
+            socket.write_all(b"HTTP/1.1 307 Temporary Redirect\r\nLocation: /canonical\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+        });
+        let response = http_client()
+            .unwrap()
+            .get(format!("http://{address}/mcp"))
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(response.url().path(), "/mcp");
+        server.await.unwrap();
     }
 
     // --- isError classification tests ---

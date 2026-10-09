@@ -122,6 +122,7 @@ cargo test -p forge-sandbox --test example_validation
 ## Known Limitations
 
 - **V8 engine vulnerabilities**: Forgemax inherits any V8 security issues. Keep `deno_core` updated.
+- **Process isolation is not an OS sandbox**: Workers run as the invoking user. Environment clearing and separate processes reduce exposure, but a compromised V8 engine is not constrained by filesystem or network policies at the operating-system level. Use a restricted account or container when stronger host isolation is needed.
 - **Timing side channels**: No protection against timing-based information leakage between tool calls.
 - **Resource exhaustion**: While limits exist, a determined attacker with many concurrent sessions could still cause load. Rate limiting at the MCP client level is recommended.
 - **No sandboxing of downstream servers**: Forgemax trusts that downstream MCP servers behave correctly. A compromised server could return malicious data.

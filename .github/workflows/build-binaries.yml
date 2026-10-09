@@ -9,6 +9,9 @@ on:
         default: true
         type: boolean
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   # See ci.yml — v8 147.4+ prebuilts need macOS 12.0+ deployment target.
@@ -55,7 +58,7 @@ jobs:
           target: ${{ matrix.target }}
 
       - name: Build release binaries
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --locked --release --target ${{ matrix.target }}
 
       - name: Strip binaries (Linux)
         if: runner.os == 'Linux'
@@ -79,6 +82,7 @@ jobs:
 
       - name: Prepare artifact (Windows)
         if: runner.os == 'Windows'
+        shell: pwsh
         run: |
           mkdir staging
           copy target\${{ matrix.target }}\release\forgemax.exe staging\

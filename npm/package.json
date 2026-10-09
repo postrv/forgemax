@@ -1,6 +1,6 @@
 {
   "name": "forgemax",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "Code Mode MCP Gateway — collapses N servers x M tools into 2 tools",
   "keywords": [
     "mcp",
@@ -17,14 +17,14 @@
     "url": "git+https://github.com/postrv/forgemax.git"
   },
   "bin": {
-    "forgemax": "bin/forgemax"
+    "forgemax": "cli.js"
   },
   "scripts": {
     "postinstall": "node install.js"
   },
   "files": [
     "install.js",
-    "bin/",
+    "cli.js",
     "README.md"
   ],
   "engines": {

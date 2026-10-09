@@ -28,7 +28,7 @@ use rmcp::schemars::JsonSchema;
 use rmcp::{tool, tool_handler, tool_router, ServerHandler};
 use serde::Deserialize;
 
-/// Maximum result size in characters before truncation.
+/// Maximum serialized result size in bytes before truncation.
 ///
 /// Results exceeding this limit are wrapped in a JSON envelope with metadata
 /// about the truncation. This prevents oversized results from consuming the
@@ -48,16 +48,24 @@ fn truncate_result_if_needed(json: String) -> String {
         return json;
     }
     let budget = MAX_RESULT_CHARS.saturating_sub(300); // reserve for envelope
-    let cut_point = find_safe_cut_point(&json, budget);
-
-    serde_json::json!({
-        "_truncated": true,
-        "_data_is_fragment": true,
-        "_original_chars": json.len(),
-        "_shown_chars": cut_point,
-        "data": &json[..cut_point]
-    })
-    .to_string()
+    let mut cut_point = find_safe_cut_point(&json, budget);
+    loop {
+        let result = serde_json::json!({
+            "_truncated": true,
+            "_data_is_fragment": true,
+            "_original_chars": json.len(),
+            "_shown_chars": cut_point,
+            "data": &json[..cut_point]
+        })
+        .to_string();
+        if result.len() <= MAX_RESULT_CHARS {
+            return result;
+        }
+        // JSON escaping can expand the fragment. Apply the limit to the
+        // serialized envelope as well as the original UTF-8 text.
+        let next_limit = (cut_point as u64 * budget as u64 / result.len() as u64) as usize;
+        cut_point = find_safe_cut_point(&json, next_limit);
+    }
 }
 
 /// Find the best cut point that minimizes JSON breakage.
@@ -114,7 +122,10 @@ fn format_sandbox_result(
         Err(e) => {
             let msg = format!("{e}");
             let clean = msg.strip_prefix("javascript error: ").unwrap_or(&msg);
-            Ok(serde_json::json!({"error": clean}).to_string())
+            let clean = forge_sandbox::redact::redact_error_message(clean);
+            Ok(truncate_result_if_needed(
+                serde_json::json!({"error": clean}).to_string(),
+            ))
         }
     }
 }
@@ -841,6 +852,44 @@ mod tests {
         let json = result.unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["error"], "some problem");
+    }
+
+    #[test]
+    fn sandbox_errors_redact_host_details() {
+        let result = format_sandbox_result(Err::<serde_json::Value, _>(
+            "worker failed at /Users/example/forge/worker: token=example-secret",
+        ))
+        .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let error = parsed["error"].as_str().unwrap();
+        assert!(error.contains("worker failed"));
+        assert!(!error.contains("/Users/example"));
+        assert!(!error.contains("example-secret"));
+    }
+
+    #[test]
+    fn sandbox_errors_obey_output_truncation() {
+        let result = format_sandbox_result(Err::<serde_json::Value, _>(
+            "x".repeat(MAX_RESULT_CHARS + 1000),
+        ))
+        .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["_truncated"], true);
+        assert!(result.len() <= MAX_RESULT_CHARS);
+    }
+
+    #[test]
+    fn truncation_accounts_for_json_escaping() {
+        for text in ["\"", "\\", "\n", "漢\"", "\u{0001}"] {
+            let input = text.repeat(MAX_RESULT_CHARS + 1);
+            let result = truncate_result_if_needed(input.clone());
+            assert!(result.len() <= MAX_RESULT_CHARS);
+            let envelope: serde_json::Value = serde_json::from_str(&result).unwrap();
+            let data = envelope["data"].as_str().unwrap();
+            assert!(!data.is_empty());
+            assert!(input.starts_with(data));
+            assert_eq!(envelope["_shown_chars"], data.len());
+        }
     }
 
     // --- Phase R3: FORGE_DTS in instructions ---

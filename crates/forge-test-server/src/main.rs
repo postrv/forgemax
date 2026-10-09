@@ -91,7 +91,7 @@ impl TestServer {
                 serde_json::json!({
                     "name": format!("{}_{}", input.pattern, i),
                     "kind": "function",
-                    "file": format!("src/lib.rs"),
+                    "file": "src/lib.rs",
                     "line": i * 10 + 1,
                 })
             })

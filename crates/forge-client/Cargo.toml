@@ -9,7 +9,8 @@ repository.workspace = true
 
 [dependencies]
 forge-sandbox.workspace = true
-rmcp = { version = "1.2", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
+rmcp = { version = "1.8", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true

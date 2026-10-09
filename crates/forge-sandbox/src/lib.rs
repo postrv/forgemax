@@ -10,12 +10,12 @@
 //!
 //! ## Security model
 //!
-//! - **V8 isolate**: Same process-level isolation as Chrome tabs
+//! - **V8 isolate**: Separate JavaScript heap; optional worker process isolation
 //! - **No ambient capabilities**: No fs, net, env, or child_process access
 //! - **Fresh runtime per call**: No state leakage between executions
 //! - **Pre-execution validation**: Banned patterns caught before reaching V8
 //! - **Timeout enforcement**: Execution killed after configurable deadline
-//! - **Output size limits**: Prevents exfiltration of large data sets
+//! - **Output size limits**: Bounds response size and downstream context usage
 //! - **Opaque bindings**: Credentials never exposed to sandbox code
 
 #[cfg(feature = "ast-validator")]

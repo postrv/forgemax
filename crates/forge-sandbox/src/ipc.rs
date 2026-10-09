@@ -416,31 +416,7 @@ pub async fn read_raw_message<R: AsyncRead + Unpin>(
     reader: &mut R,
     max_size: usize,
 ) -> Result<Option<Box<RawValue>>, std::io::Error> {
-    let mut len_buf = [0u8; 4];
-    match reader.read_exact(&mut len_buf).await {
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e),
-    }
-
-    let len = u32::from_be_bytes(len_buf) as usize;
-
-    if len > max_size {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!(
-                "raw IPC message too large: {} bytes (limit: {} bytes)",
-                len, max_size
-            ),
-        ));
-    }
-
-    let mut payload = vec![0u8; len];
-    reader.read_exact(&mut payload).await?;
-
-    let raw: Box<RawValue> = serde_json::from_slice(&payload)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    Ok(Some(raw))
+    MessageReader::new(max_size).read(reader).await
 }
 
 /// Default maximum IPC message size: 65 MB.
@@ -473,42 +449,172 @@ pub async fn read_message<T: for<'de> Deserialize<'de>, R: AsyncRead + Unpin>(
 ///
 /// Returns `None` if the reader has reached EOF (clean shutdown).
 /// The `max_size` parameter controls the maximum allowed message size in bytes.
+/// For reads inside `tokio::select!`, retain a [`MessageReader`] across calls
+/// instead so cancellation preserves partially read frames.
 pub async fn read_message_with_limit<T: for<'de> Deserialize<'de>, R: AsyncRead + Unpin>(
     reader: &mut R,
     max_size: usize,
 ) -> Result<Option<T>, std::io::Error> {
-    let mut len_buf = [0u8; 4];
-    match reader.read_exact(&mut len_buf).await {
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e),
+    MessageReader::new(max_size).read(reader).await
+}
+
+/// A bounded IPC frame reader that preserves progress when a read is cancelled.
+///
+/// Keep one instance per stream when reading inside `tokio::select!`. The
+/// prefix and payload offsets live here, rather than in the cancelled future.
+/// An I/O or decoding error is terminal: discard the reader and its stream.
+pub struct MessageReader {
+    max_size: usize,
+    prefix: [u8; 4],
+    prefix_read: usize,
+    payload: Option<Vec<u8>>,
+    payload_read: usize,
+}
+
+impl MessageReader {
+    /// Create a frame reader with a maximum JSON payload size in bytes.
+    pub fn new(max_size: usize) -> Self {
+        Self {
+            max_size,
+            prefix: [0; 4],
+            prefix_read: 0,
+            payload: None,
+            payload_read: 0,
+        }
     }
 
-    let len = u32::from_be_bytes(len_buf) as usize;
+    /// Read the next message, returning `None` only for EOF between frames.
+    ///
+    /// Cancelling this future is safe if this instance is retained and reused
+    /// with the same stream. EOF partway through a frame is an error.
+    pub async fn read<T: for<'de> Deserialize<'de>, R: AsyncRead + Unpin>(
+        &mut self,
+        reader: &mut R,
+    ) -> Result<Option<T>, std::io::Error> {
+        while self.prefix_read < self.prefix.len() {
+            let read = reader.read(&mut self.prefix[self.prefix_read..]).await?;
+            if read == 0 {
+                return if self.prefix_read == 0 {
+                    Ok(None)
+                } else {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "truncated IPC length prefix",
+                    ))
+                };
+            }
+            self.prefix_read += read;
+        }
 
-    // Reject messages exceeding the configured limit
-    if len > max_size {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!(
-                "IPC message too large: {} bytes (limit: {} bytes)",
-                len, max_size
-            ),
-        ));
+        if self.payload.is_none() {
+            let len = u32::from_be_bytes(self.prefix) as usize;
+            // Validate before allocating the frame buffer.
+            if len > self.max_size {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "IPC message too large: {} bytes (limit: {} bytes)",
+                        len, self.max_size
+                    ),
+                ));
+            }
+            self.payload = Some(vec![0u8; len]);
+        }
+
+        let payload = self.payload.as_mut().expect("validated frame buffer");
+        while self.payload_read < payload.len() {
+            let read = reader.read(&mut payload[self.payload_read..]).await?;
+            if read == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "truncated IPC payload",
+                ));
+            }
+            self.payload_read += read;
+        }
+
+        let msg = serde_json::from_slice(payload)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        self.payload = None;
+        self.prefix_read = 0;
+        self.payload_read = 0;
+        Ok(Some(msg))
     }
-
-    let mut payload = vec![0u8; len];
-    reader.read_exact(&mut payload).await?;
-
-    let msg: T = serde_json::from_slice(&payload)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    Ok(Some(msg))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[tokio::test]
+    async fn cancelled_reads_preserve_every_frame_boundary() {
+        use std::future::{poll_fn, Future};
+        use std::task::Poll;
+
+        let mut frame = Vec::new();
+        write_message(&mut frame, &serde_json::json!({"message": "hello"}))
+            .await
+            .unwrap();
+
+        // Exercise partial prefixes and payloads with ordinary, valid data.
+        for split in 1..frame.len() {
+            let (mut sender, mut receiver) = tokio::io::duplex(1024);
+            let mut messages = MessageReader::new(1024);
+            sender.write_all(&frame[..split]).await.unwrap();
+            {
+                let read = messages.read::<Value, _>(&mut receiver);
+                tokio::pin!(read);
+                poll_fn(|cx| {
+                    assert!(read.as_mut().poll(cx).is_pending());
+                    Poll::Ready(())
+                })
+                .await;
+                // Drop the pending read exactly as tokio::select! does.
+            }
+            sender.write_all(&frame[split..]).await.unwrap();
+            sender.write_all(&frame).await.unwrap();
+            sender.shutdown().await.unwrap();
+
+            for _ in 0..2 {
+                let decoded: Value = messages.read(&mut receiver).await.unwrap().unwrap();
+                assert_eq!(decoded, serde_json::json!({"message": "hello"}));
+            }
+            assert!(messages
+                .read::<Value, _>(&mut receiver)
+                .await
+                .unwrap()
+                .is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn truncated_frame_is_not_clean_eof() {
+        let mut frame = Vec::new();
+        write_message(&mut frame, &serde_json::json!({"message": "hello"}))
+            .await
+            .unwrap();
+
+        for length in 1..frame.len() {
+            let err = read_message::<Value, _>(&mut Cursor::new(&frame[..length]))
+                .await
+                .unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+            let err = read_raw_message(&mut Cursor::new(&frame[..length]), 1024)
+                .await
+                .unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+        }
+    }
+
+    #[tokio::test]
+    async fn frame_limit_is_checked_before_payload_allocation() {
+        let mut messages = MessageReader::new(64);
+        let mut input = Cursor::new(65u32.to_be_bytes());
+        let err = messages.read::<Value, _>(&mut input).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(messages.payload.is_none());
+    }
 
     #[tokio::test]
     async fn roundtrip_parent_execute_message() {
