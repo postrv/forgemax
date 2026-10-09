@@ -146,6 +146,10 @@ mod tests {
 
     #[test]
     fn ver_01_cargo_pkg_version() {
-        assert_eq!(env!("CARGO_PKG_VERSION"), "0.6.0");
+        use clap::CommandFactory;
+        assert_eq!(
+            Cli::command().get_version(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
     }
 }

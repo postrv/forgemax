@@ -1,5 +1,17 @@
 # Upgrading Forgemax
 
+## v0.6.1 (Security Maintenance)
+
+Upgrade both `forgemax` and `forgemax-worker` together using the release archive or an installer.
+
+- **HTTP endpoints:** Configure the final MCP endpoint directly. Redirects are no longer followed. URLs containing a username or password are rejected; put credentials in configured headers on an HTTPS endpoint instead.
+- **Environment expansion:** `${VAR}` is expanded within parsed TOML string values, including command arguments, headers, and explicit server environment values. Environment values are literal data: quotes, backslashes, and newlines need no TOML escaping. Keys and unquoted numeric/boolean fields do not support environment expansion. Missing variables continue to retain their placeholder.
+- **Installers:** SHA-256 verification is required. A missing, malformed, ambiguous, or mismatched checksum stops installation. Old releases without `SHA256SUMS.txt` cannot be installed with these updated scripts.
+- **Source builds:** Use Rust 1.93.0 or newer and `cargo build --release --locked --workspace`. The previous manifest advertised Rust 1.91.1 even though oxc 0.130 already required 1.93.0.
+- **IPC limits:** Custom `max_ipc_message_size_mb` limits are now enforced by both sides of the worker channel. Keep the limit large enough for the configured resource size plus the JSON envelope.
+
+Run `forgemax doctor --config /path/to/forge.toml` after upgrading to validate local configuration.
+
 ## v0.6.0 (Security Hardening + Group Enforcement Fixes)
 
 This release tightens process and group isolation, adds explicit env plumbing for stdio servers, and includes one important behaviour change for users running in `child_process` mode.

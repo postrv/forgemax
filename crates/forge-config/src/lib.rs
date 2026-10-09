@@ -100,7 +100,7 @@ fn default_isolation() -> String {
 }
 
 /// Configuration for a single downstream MCP server.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     /// Transport type: "stdio" or "sse".
@@ -153,6 +153,24 @@ pub struct ServerConfig {
     /// Maximum reconnect backoff in seconds (default: 30).
     #[serde(default)]
     pub max_reconnect_backoff_secs: Option<u64>,
+}
+
+impl std::fmt::Debug for ServerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Connection values can contain credentials, regardless of their names.
+        // Retain enough structure for diagnostics without exposing those values.
+        f.debug_struct("ServerConfig")
+            .field("transport", &self.transport)
+            .field("command", &self.command)
+            .field("arg_count", &self.args.len())
+            .field("env_keys", &self.env.keys().collect::<Vec<_>>())
+            .field("url", &self.url.as_ref().map(|_| "[REDACTED]"))
+            .field("header_names", &self.headers.keys().collect::<Vec<_>>())
+            .field("timeout_secs", &self.timeout_secs)
+            .field("circuit_breaker", &self.circuit_breaker)
+            .field("reconnect", &self.reconnect)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Sandbox configuration overrides.
@@ -276,10 +294,43 @@ impl ForgeConfig {
         Self::from_toml(&content)
     }
 
-    /// Parse a config from a TOML string, expanding `${ENV_VAR}` references.
+    /// Parse a config from a TOML string, expanding `${ENV_VAR}` references
+    /// in string values after parsing. Environment values are treated as data,
+    /// so quotes, backslashes, and newlines never change the TOML structure.
     pub fn from_toml_with_env(toml_str: &str) -> Result<Self, ConfigError> {
-        let expanded = expand_env_vars(toml_str);
-        Self::from_toml(&expanded)
+        let mut config: ForgeConfig = toml::from_str(toml_str)?;
+        for server in config.servers.values_mut() {
+            server.transport = expand_env_vars(&server.transport);
+            for value in [
+                &mut server.command,
+                &mut server.url,
+                &mut server.description,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                *value = expand_env_vars(value);
+            }
+            for value in server
+                .args
+                .iter_mut()
+                .chain(server.env.values_mut())
+                .chain(server.headers.values_mut())
+            {
+                *value = expand_env_vars(value);
+            }
+        }
+        for group in config.groups.values_mut() {
+            group.isolation = expand_env_vars(&group.isolation);
+            for server in &mut group.servers {
+                *server = expand_env_vars(server);
+            }
+        }
+        if let Some(mode) = &mut config.sandbox.execution_mode {
+            *mode = expand_env_vars(mode);
+        }
+        config.validate()?;
+        Ok(config)
     }
 
     /// Load config from a file path, expanding environment variables.
@@ -565,30 +616,23 @@ pub fn default_startup_concurrency() -> usize {
 /// Expand `${ENV_VAR}` patterns in a string using environment variables.
 fn expand_env_vars(input: &str) -> String {
     let mut result = String::with_capacity(input.len());
-    let mut chars = input.chars().peekable();
+    let mut remaining = input;
 
-    while let Some(ch) = chars.next() {
-        if ch == '$' && chars.peek() == Some(&'{') {
-            chars.next(); // consume '{'
-            let mut var_name = String::new();
-            for c in chars.by_ref() {
-                if c == '}' {
-                    break;
-                }
-                var_name.push(c);
-            }
-            match std::env::var(&var_name) {
-                Ok(value) => result.push_str(&value),
-                Err(_) => {
-                    // Leave the placeholder if env var not found
-                    result.push_str(&format!("${{{}}}", var_name));
-                }
-            }
-        } else {
-            result.push(ch);
+    while let Some(start) = remaining.find("${") {
+        result.push_str(&remaining[..start]);
+        remaining = &remaining[start..];
+        let Some(end) = remaining.find('}') else {
+            // Preserve incomplete placeholders exactly as written.
+            break;
+        };
+        let placeholder = &remaining[..=end];
+        match std::env::var(&remaining[2..end]) {
+            Ok(value) => result.push_str(&value),
+            Err(_) => result.push_str(placeholder),
         }
+        remaining = &remaining[end + 1..];
     }
-
+    result.push_str(remaining);
     result
 }
 
@@ -678,6 +722,93 @@ mod tests {
                 "secret123"
             );
         });
+    }
+
+    #[test]
+    fn config_environment_values_preserve_quotes_backslashes_and_newlines() {
+        let value = "example \"quoted\" value\\directory\nsecond line";
+        temp_env::with_var("FORGE_TEST_LITERAL_VALUE", Some(value), || {
+            let config = ForgeConfig::from_toml_with_env(
+                r#"
+                [servers.example]
+                command = "example-server"
+                transport = "stdio"
+                args = ["${FORGE_TEST_LITERAL_VALUE}"]
+                env = { EXAMPLE_VALUE = "${FORGE_TEST_LITERAL_VALUE}" }
+                headers = { Example = '${FORGE_TEST_LITERAL_VALUE}' }
+                "#,
+            )
+            .unwrap();
+
+            assert_eq!(config.servers.len(), 1);
+            let server = &config.servers["example"];
+            assert_eq!(server.args, [value]);
+            assert_eq!(server.env["EXAMPLE_VALUE"], value);
+            assert_eq!(server.headers["Example"], value);
+        });
+    }
+
+    #[test]
+    fn config_expands_only_values_and_keeps_missing_placeholders() {
+        temp_env::with_var("FORGE_TEST_LITERAL_VALUE", Some("example-value"), || {
+            let config = ForgeConfig::from_toml_with_env(
+                r#"
+                [servers.example]
+                command = "example-server"
+                transport = "stdio"
+                env = { "${FORGE_TEST_LITERAL_VALUE}" = "${FORGE_TEST_LITERAL_VALUE}" }
+                "#,
+            )
+            .unwrap();
+            assert_eq!(
+                config.servers["example"].env["${FORGE_TEST_LITERAL_VALUE}"],
+                "example-value"
+            );
+        });
+        assert_eq!(
+            expand_env_vars("prefix ${INCOMPLETE"),
+            "prefix ${INCOMPLETE"
+        );
+    }
+
+    #[test]
+    fn config_parse_errors_do_not_include_expanded_environment_values() {
+        temp_env::with_var(
+            "FORGE_TEST_LITERAL_VALUE",
+            Some("example-private-value"),
+            || {
+                let error = ForgeConfig::from_toml_with_env(
+                    r#"
+                [servers.example]
+                command = "example-server"
+                transport = "stdio"
+                timeout_secs = "${FORGE_TEST_LITERAL_VALUE}"
+                "#,
+                )
+                .unwrap_err();
+                assert!(!format!("{error:?} {error}").contains("example-private-value"));
+            },
+        );
+    }
+
+    #[test]
+    fn config_debug_omits_connection_values() {
+        let config = ForgeConfig::from_toml(
+            r#"
+            [servers.example]
+            command = "example-server"
+            transport = "stdio"
+            args = ["example-private-argument"]
+            env = { TOKEN = "example-private-env" }
+            headers = { Example = "example-private-header" }
+            url = "https://example.com/mcp?token=example-private-query"
+            "#,
+        )
+        .unwrap();
+        let debug = format!("{config:?}");
+        assert!(!debug.contains("example-private-"));
+        assert!(debug.contains("TOKEN"));
+        assert!(debug.contains("Example"));
     }
 
     #[test]

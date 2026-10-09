@@ -4,7 +4,7 @@
 
 ### Prerequisites
 
-- Rust 1.91.1+ (see `rust-version` in `Cargo.toml`)
+- Rust 1.93.0+ (see `rust-version` in `Cargo.toml`)
 - The V8 prebuilt library is fetched automatically during build
 
 ### Building

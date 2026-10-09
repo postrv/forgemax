@@ -23,6 +23,7 @@ forge.toml
 
 # npm binary artifacts (downloaded during postinstall)
 npm/bin/
+npm/native/
 
 # Internal planning and commercial docs
 .archive/

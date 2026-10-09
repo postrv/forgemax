@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
@@ -20,6 +23,10 @@ env:
   MACOSX_DEPLOYMENT_TARGET: "13.0"
 
 jobs:
+  installers:
+    name: Installer verification
+    uses: ./.github/workflows/installer-tests.yml
+
   lint:
     name: Lint
     runs-on: ubuntu-latest
@@ -33,7 +40,7 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
 
   test:
     name: Test (${{ matrix.os }})
@@ -48,9 +55,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: ./.github/actions/fetch-v8
       - name: Build all binaries (needed for integration tests)
-        run: cargo build --workspace
+        run: cargo build --locked --workspace
       - name: Run tests
-        run: cargo test --workspace --verbose
+        run: cargo test --locked --workspace --verbose
 
   doc-consistency:
     name: Documentation consistency
@@ -94,7 +101,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: ./.github/actions/fetch-v8
       - name: Run example validation tests
-        run: cargo test -p forge-sandbox --test example_validation
+        run: cargo test --locked -p forge-sandbox --test example_validation
 
   minimal-build:
     name: Minimal build (no default features)
@@ -105,9 +112,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: ./.github/actions/fetch-v8
       - name: Build with no default features
-        run: cargo build --workspace --no-default-features
+        run: cargo build --locked --workspace --no-default-features
       - name: Test with no default features
-        run: cargo test --workspace --no-default-features
+        run: cargo test --locked --workspace --no-default-features
+      - name: Test minimal sandbox without workspace feature unification
+        run: cargo test --locked -p forge-sandbox --lib --no-default-features
 
   doctor-smoke:
     name: Doctor smoke test
@@ -119,7 +128,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: ./.github/actions/fetch-v8
       - name: Build release binary
-        run: cargo build --release -p forgemax
+        run: cargo build --locked --release -p forgemax
       - name: Create minimal test config
         run: |
           cat > /tmp/forge-doctor-test.toml <<'EOF'
@@ -143,7 +152,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: ./.github/actions/fetch-v8
       - name: Build all binaries
-        run: cargo build --release --workspace
+        run: cargo build --locked --release --workspace
       - name: Create test config with forge-test-server
         run: |
           cat > /tmp/forge-run-test.toml <<EOF
@@ -154,11 +163,19 @@ jobs:
           [sandbox]
           timeout_secs = 5
           max_heap_mb = 64
-          execution_mode = "in_process"
+          execution_mode = "child_process"
           EOF
-      - name: Run basic-tool-chaining example
+      - name: Verify chained calls through the child-process sandbox
         run: |
-          ./target/release/forgemax run --config /tmp/forge-run-test.toml examples/basic-tool-chaining.js
+          cat > /tmp/forge-run-test.js <<'EOF'
+          async () => {
+            const echo = await forge.callTool("test", "echo", { message: "hello" });
+            const sum = await forge.callTool("test", "math.add", { a: echo.echoed.length, b: 37 });
+            return sum.result;
+          }
+          EOF
+          ./target/release/forgemax run --config /tmp/forge-run-test.toml /tmp/forge-run-test.js > /tmp/forge-run-output.json
+          python3 -c 'import json; result = json.load(open("/tmp/forge-run-output.json")); assert result == 42, result'
 
   deny:
     name: Dependency policy
@@ -178,4 +195,4 @@ jobs:
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
       - name: Run security audit
-        run: cargo audit
+        run: cargo audit --deny unsound

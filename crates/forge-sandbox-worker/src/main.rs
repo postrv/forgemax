@@ -14,11 +14,11 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use forge_sandbox::error::SandboxError;
 use forge_sandbox::ipc::{
-    read_message, read_message_with_limit, write_message, ChildMessage, ErrorKind,
-    IpcDispatchError, ParentMessage,
+    read_message, write_message, ChildMessage, ErrorKind, IpcDispatchError, MessageReader,
+    ParentMessage,
 };
 use forge_sandbox::{ResourceDispatcher, StashDispatcher, ToolDispatcher};
-use tokio::io::{self, AsyncWriteExt, BufReader};
+use tokio::io::{self, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, oneshot};
 
 /// Tool dispatcher that proxies tool calls through IPC to the parent process.
@@ -132,6 +132,54 @@ struct IpcStashBridge {
     )>,
     /// Atomic counter for generating unique request IDs.
     next_id: Arc<AtomicU64>,
+}
+
+type PendingResponses =
+    std::collections::HashMap<u64, oneshot::Sender<Result<serde_json::Value, IpcDispatchError>>>;
+
+/// Receive one parent response without losing frame progress on cancellation.
+async fn receive_parent_response<R: AsyncRead + Unpin>(
+    stdin: &mut R,
+    reader: &mut MessageReader,
+    pending: &mut PendingResponses,
+) -> Result<bool> {
+    let Some(message) = reader.read::<ParentMessage, _>(stdin).await? else {
+        return Ok(false);
+    };
+    match message {
+        ParentMessage::ToolCallResult { request_id, result }
+        | ParentMessage::ResourceReadResult { request_id, result }
+        | ParentMessage::StashResult { request_id, result } => {
+            if let Some(waiter) = pending.remove(&request_id) {
+                let _ = waiter.send(result);
+            }
+        }
+        _ => anyhow::bail!("unexpected message type from parent during execution"),
+    }
+    Ok(true)
+}
+
+/// Continue accepting responses while sending a request, so full pipes cannot
+/// leave the parent and worker both blocked waiting for the other to read.
+async fn forward_child_message<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    stdin: &mut R,
+    stdout: &mut W,
+    reader: &mut MessageReader,
+    pending: &mut PendingResponses,
+    message: &ChildMessage,
+) -> Result<()> {
+    let write = write_message(stdout, message);
+    tokio::pin!(write);
+    loop {
+        tokio::select! {
+            result = &mut write => return result.context("failed to write message to parent"),
+            result = receive_parent_response(stdin, reader, pending), if !pending.is_empty() => {
+                if !result? {
+                    anyhow::bail!("parent closed IPC input during execution");
+                }
+            }
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -399,23 +447,32 @@ async fn run_single_execution(
 
         let _ = exec_tx.send(child_result);
     });
+    drop(tx);
 
     // IPC event loop
-    let mut pending_waiters: std::collections::HashMap<
-        u64,
-        oneshot::Sender<Result<serde_json::Value, IpcDispatchError>>,
-    > = std::collections::HashMap::new();
+    let mut pending_waiters = PendingResponses::new();
     let mut execution_done = false;
+    let mut message_reader = MessageReader::new(max_ipc_size);
 
     loop {
         tokio::select! {
             msg = rx.recv() => {
                 match msg {
                     Some(child_msg) => {
+                        // A bridge registers its waiter before enqueueing the request.
+                        // Drain those registrations before exposing a request to the
+                        // parent, which may reply immediately.
+                        while let Ok((id, sender)) = waiter_rx.try_recv() {
+                            pending_waiters.insert(id, sender);
+                        }
                         let is_complete = matches!(child_msg, ChildMessage::ExecutionComplete { .. });
-                        write_message(stdout, &child_msg).await
-                            .context("failed to write message to parent")?;
-                        stdout.flush().await?;
+                        forward_child_message(
+                            stdin,
+                            stdout,
+                            &mut message_reader,
+                            &mut pending_waiters,
+                            &child_msg,
+                        ).await?;
                         if is_complete {
                             execution_done = true;
                             if pending_waiters.is_empty() {
@@ -437,36 +494,14 @@ async fn run_single_execution(
                 }
             }
 
-            result = read_message_with_limit::<ParentMessage, _>(stdin, max_ipc_size) => {
+            result = receive_parent_response(stdin, &mut message_reader, &mut pending_waiters) => {
                 match result {
-                    Ok(Some(ParentMessage::ToolCallResult { request_id, result })) => {
-                        if let Some(waiter) = pending_waiters.remove(&request_id) {
-                            let _ = waiter.send(result);
-                        }
+                    Ok(true) => {
                         if execution_done && pending_waiters.is_empty() {
                             break;
                         }
                     }
-                    Ok(Some(ParentMessage::ResourceReadResult { request_id, result })) => {
-                        if let Some(waiter) = pending_waiters.remove(&request_id) {
-                            let _ = waiter.send(result);
-                        }
-                        if execution_done && pending_waiters.is_empty() {
-                            break;
-                        }
-                    }
-                    Ok(Some(ParentMessage::StashResult { request_id, result })) => {
-                        if let Some(waiter) = pending_waiters.remove(&request_id) {
-                            let _ = waiter.send(result);
-                        }
-                        if execution_done && pending_waiters.is_empty() {
-                            break;
-                        }
-                    }
-                    Ok(Some(_)) => {
-                        tracing::warn!("unexpected message type from parent");
-                    }
-                    Ok(None) => {
+                    Ok(false) => {
                         break;
                     }
                     Err(e) => {
@@ -476,13 +511,13 @@ async fn run_single_execution(
                 }
             }
 
-            waiter = waiter_rx.recv() => {
-                if let Some((id, sender)) = waiter {
-                    pending_waiters.insert(id, sender);
-                }
-            }
         }
     }
+
+    // Wake any dispatch futures before joining if the parent disconnected.
+    drop(pending_waiters);
+    drop(waiter_rx);
+    drop(rx);
 
     // Wait for the V8 thread to finish
     let _ = exec_handle.join();

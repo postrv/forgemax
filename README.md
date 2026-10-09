@@ -73,7 +73,7 @@ The core innovation. Uses `deno_core` to run LLM-generated JavaScript in a locke
 
 ### forgemax-worker
 
-Isolated child process binary for production execution. Communicates with the parent via length-delimited JSON IPC over stdin/stdout. Starts with a clean environment — no env vars, no inherited file descriptors. Even a V8 zero-day is contained at the OS process boundary.
+Separate child process binary for production execution. Communicates with the parent via length-delimited JSON IPC over stdin/stdout and starts with a cleared environment. Process separation limits crash and memory-corruption impact on the gateway; it does not provide an operating-system filesystem or network sandbox if V8 itself is compromised.
 
 ### forge-manifest
 
@@ -136,12 +136,12 @@ scoop install forgemax
 
 **Cargo** (from source):
 ```bash
-cargo install forgemax
+cargo install --locked forgemax forge-sandbox-worker
 ```
 
 **From source**:
 ```bash
-cargo build --release
+cargo build --release --locked --workspace
 # Binaries: target/release/forgemax + target/release/forgemax-worker
 ```
 

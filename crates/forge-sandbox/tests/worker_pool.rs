@@ -16,7 +16,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use forge_sandbox::executor::ExecutionMode;
-use forge_sandbox::pool::{PoolConfig, WorkerPool};
+use forge_sandbox::pool::{PoolConfig, ReleaseOutcome, WorkerPool};
 use forge_sandbox::{ResourceDispatcher, SandboxConfig, SandboxExecutor, ToolDispatcher};
 use serial_test::serial;
 
@@ -113,6 +113,92 @@ fn ensure_worker_binary() -> &'static std::path::Path {
 fn make_executor(pool: Arc<WorkerPool>) -> SandboxExecutor {
     std::env::set_var("FORGE_WORKER_BIN", ensure_worker_binary());
     SandboxExecutor::new(sandbox_config()).with_pool(pool)
+}
+
+#[tokio::test]
+#[serial]
+async fn dropped_acquisition_returns_pool_capacity() {
+    std::env::set_var("FORGE_WORKER_BIN", ensure_worker_binary());
+    let pool = WorkerPool::new(PoolConfig {
+        max_workers: 1,
+        ..pool_config()
+    });
+    let config = sandbox_config();
+
+    let worker = pool.acquire(&config).await.unwrap();
+    assert!(pool.acquire(&config).await.is_err());
+    // Cancellation of an execution drops its acquired worker in the same way.
+    drop(worker);
+
+    let replacement = pool.acquire(&config).await.unwrap();
+    pool.release(replacement, ReleaseOutcome::Fatal).await;
+    let next = pool.acquire(&config).await.unwrap();
+    pool.release(next, ReleaseOutcome::Ok).await;
+    pool.shutdown().await;
+}
+
+#[cfg(feature = "worker-pool")]
+#[tokio::test]
+#[serial]
+async fn concurrent_prewarm_respects_pool_capacity() {
+    std::env::set_var("FORGE_WORKER_BIN", ensure_worker_binary());
+    let pool = WorkerPool::new(PoolConfig {
+        min_workers: 1,
+        max_workers: 1,
+        ..pool_config()
+    });
+    let config = sandbox_config();
+    let (first, second) = tokio::join!(pool.pre_warm(&config), pool.pre_warm(&config));
+    assert_eq!(first.unwrap() + second.unwrap(), 1);
+    assert_eq!(pool.metrics().spawned.load(Ordering::Relaxed), 1);
+
+    let worker = pool.acquire(&config).await.unwrap();
+    assert!(pool.acquire(&config).await.is_err());
+    pool.release(worker, ReleaseOutcome::Ok).await;
+    pool.shutdown().await;
+}
+
+#[cfg(feature = "worker-pool")]
+#[tokio::test]
+#[serial]
+async fn prewarm_after_shutdown_spawns_no_workers() {
+    let pool = WorkerPool::new(pool_config());
+    pool.shutdown().await;
+    assert_eq!(pool.pre_warm(&sandbox_config()).await.unwrap(), 0);
+    assert_eq!(pool.metrics().spawned.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+#[serial]
+async fn concurrent_tool_responses_remain_correlated() {
+    let pool = Arc::new(WorkerPool::new(pool_config()));
+    let exec = make_executor(pool.clone());
+    let dispatcher: Arc<dyn ToolDispatcher> = Arc::new(EchoDispatcher);
+    let code = r#"async () => {
+        const results = await Promise.all(Array.from({ length: 8 }, (_, request) =>
+            forge.callTool("echo", "echo", { request, text: "a".repeat(32768) })
+        ));
+        return results.map(result => ({
+            request: result.args.request,
+            length: result.args.text.length
+        }));
+    }"#;
+
+    // Check both a fresh worker and the same worker after reset.
+    for _ in 0..2 {
+        let result = exec
+            .execute_code(code, dispatcher.clone(), None, None)
+            .await
+            .unwrap();
+        let replies = result.as_array().unwrap();
+        assert_eq!(replies.len(), 8);
+        for (request, reply) in replies.iter().enumerate() {
+            assert_eq!(reply["request"], request);
+            assert_eq!(reply["length"], 32768);
+        }
+    }
+    assert_eq!(pool.metrics().spawned.load(Ordering::Relaxed), 1);
+    pool.shutdown().await;
 }
 
 // --- WP-I01: Sequential reuse ---

@@ -15,7 +15,8 @@ use crate::error::SandboxError;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::ipc::{
-    read_message, write_message, ChildMessage, IpcDispatchError, ParentMessage, WorkerConfig,
+    read_message_with_limit, write_message, ChildMessage, IpcDispatchError, ParentMessage,
+    WorkerConfig,
 };
 use crate::{ResourceDispatcher, StashDispatcher, ToolDispatcher};
 
@@ -131,24 +132,27 @@ impl SandboxHost {
             manifest: None,
             config: worker_config,
         };
-        write_message(&mut child_stdin, &execute_msg)
-            .await
-            .map_err(|e| {
-                SandboxError::Execution(anyhow::anyhow!("failed to send Execute: {}", e))
-            })?;
-
-        // IPC event loop with overall timeout
+        // Bound the entire exchange, including a blocked initial write.
         let result = tokio::time::timeout(
             // Give the child a bit more time than its internal timeout,
             // so the child can report its own timeout error cleanly.
             timeout + Duration::from_secs(2),
-            ipc_event_loop(
-                &mut child_stdin,
-                &mut child_stdout,
-                dispatcher,
-                resource_dispatcher,
-                stash_dispatcher,
-            ),
+            async {
+                write_message(&mut child_stdin, &execute_msg)
+                    .await
+                    .map_err(|e| {
+                        SandboxError::Execution(anyhow::anyhow!("failed to send Execute: {}", e))
+                    })?;
+                ipc_event_loop(
+                    &mut child_stdin,
+                    &mut child_stdout,
+                    dispatcher,
+                    resource_dispatcher,
+                    stash_dispatcher,
+                    config.max_ipc_message_size,
+                )
+                .await
+            },
         )
         .await;
 
@@ -177,13 +181,14 @@ pub(crate) async fn ipc_event_loop<W, R>(
     dispatcher: Arc<dyn ToolDispatcher>,
     resource_dispatcher: Option<Arc<dyn ResourceDispatcher>>,
     stash_dispatcher: Option<Arc<dyn StashDispatcher>>,
+    max_ipc_message_size: usize,
 ) -> Result<serde_json::Value, SandboxError>
 where
     W: AsyncWrite + Unpin,
     R: AsyncRead + Unpin,
 {
     loop {
-        let msg: Option<ChildMessage> = read_message(child_stdout)
+        let msg: Option<ChildMessage> = read_message_with_limit(child_stdout, max_ipc_message_size)
             .await
             .map_err(|e| SandboxError::Execution(anyhow::anyhow!("IPC read error: {}", e)))?;
 
@@ -395,16 +400,17 @@ pub fn find_worker_binary() -> Result<PathBuf, SandboxError> {
     }
 
     // 2. Same directory as current executable (or parent, for test binaries in deps/)
+    let worker_name = format!("forgemax-worker{}", std::env::consts::EXE_SUFFIX);
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            let worker = dir.join("forgemax-worker");
+            let worker = dir.join(&worker_name);
             if worker.exists() {
                 validate_binary_permissions(&worker)?;
                 return Ok(worker);
             }
             // Test binaries are in target/debug/deps/ but worker is in target/debug/
             if let Some(parent) = dir.parent() {
-                let worker = parent.join("forgemax-worker");
+                let worker = parent.join(&worker_name);
                 if worker.exists() {
                     validate_binary_permissions(&worker)?;
                     return Ok(worker);
@@ -800,9 +806,42 @@ mod tests {
             tool,
             resource,
             stash_disp,
+            crate::ipc::DEFAULT_MAX_IPC_MESSAGE_SIZE,
         )
         .await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn ipc_event_loop_honors_configured_frame_limit() {
+        let complete = ChildMessage::ExecutionComplete {
+            result: Ok(serde_json::json!("done")),
+            error_kind: None,
+            timeout_ms: None,
+        };
+        let payload_size = serde_json::to_vec(&complete).unwrap().len();
+        let mut frame = Vec::new();
+        write_message(&mut frame, &complete).await.unwrap();
+
+        for (limit, allowed) in [(payload_size - 1, false), (payload_size, true)] {
+            let result = ipc_event_loop(
+                &mut Vec::new(),
+                &mut std::io::Cursor::new(&frame),
+                Arc::new(NeverCalledTool),
+                None,
+                None,
+                limit,
+            )
+            .await;
+            if allowed {
+                assert_eq!(result.unwrap(), serde_json::json!("done"));
+            } else {
+                assert!(result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("IPC message too large"));
+            }
+        }
     }
 
     #[tokio::test]
