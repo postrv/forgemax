@@ -2,6 +2,16 @@
 
 All notable changes to Forgemax will be documented in this file.
 
+## [0.6.2] - Unreleased security candidate (2026-10-21)
+
+### Security
+
+- Update the locked Rustls TLS stack to `rustls` 0.23.46, `rustls-webpki` 0.103.16, and `webpki-root-certs` 1.0.10. These releases address RUSTSEC-2026-0346 through RUSTSEC-2026-0349 and RUSTSEC-2026-0382 through RUSTSEC-2026-0383 without changing ForgeMax's HTTP redirect policy.
+
+### Verification
+
+- Validate the exact candidate lockfile against the refreshed RustSec advisory database. The existing upstream `paste` maintenance warning remains visible.
+
 ## [0.6.1] - 2026-10-09
 
 ### Security

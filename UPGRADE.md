@@ -1,5 +1,9 @@
 # Upgrading Forgemax
 
+## v0.6.2 (TLS Security Maintenance Candidate)
+
+The candidate updates the locked Rustls TLS stack without changing ForgeMax configuration or MCP transport behavior. Rebuild both the gateway and worker from the same committed lockfile before distributing them as a pair. Existing v0.6.1 configuration files need no changes.
+
 ## v0.6.1 (Security Maintenance)
 
 Upgrade both `forgemax` and `forgemax-worker` together using the release archive or an installer.
