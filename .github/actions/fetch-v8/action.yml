@@ -1,5 +1,5 @@
 name: Fetch V8 prebuilt library
-description: Downloads the rusty_v8 prebuilt library for the current target
+description: Downloads and verifies the locked rusty_v8 prebuilt library
 
 inputs:
   target:
@@ -10,25 +10,42 @@ runs:
   using: composite
   steps:
     - shell: bash
+      env:
+        V8_TARGET: ${{ inputs.target }}
       run: |
-        V8_VERSION=$(grep -A1 'name = "v8"' Cargo.lock | grep version | head -1 | sed 's/.*"\(.*\)"/\1/')
-        TARGET="${{ inputs.target }}"
+        set -euo pipefail
+        V8_VERSION=$(awk -F '"' '/^name = "v8"$/ { getline; print $2; exit }' Cargo.lock)
+        TARGET="$V8_TARGET"
         if [ -z "$TARGET" ]; then
           TARGET=$(rustc -vV | sed -n 's|host: ||p')
         fi
-        # We enable the `simdutf` feature on v8 (required to resolve simdutf__*
-        # symbols introduced in v8 147.4 / deno_core 0.400). The matching
-        # prebuilt has a `simdutf_` infix in its name.
+        # SHA-256 digests of the simdutf archives in the upstream rusty_v8 release.
+        case "${V8_VERSION}:${TARGET}" in
+          150.4.0:aarch64-apple-darwin) SHA256=5aeffd8d5a0c1b79ac1d70af83d5b19099655fd9c645a794dc43f101f779838c ;;
+          150.4.0:x86_64-apple-darwin) SHA256=a750271fec6b211457ed0a5cf7d2eab1924b265621a82da86ab959d6ff0823e4 ;;
+          150.4.0:x86_64-unknown-linux-gnu) SHA256=f48762ca10d1f1fc605a441c5ae430ec8ce1e9e80f14d78fbc42cb878c30b476 ;;
+          150.4.0:x86_64-pc-windows-msvc) SHA256=f231f82cbacb9aefe6d9af57e6df2e8959a40e001f79306485133e3c075b98f0 ;;
+          *) echo "::error::Missing rusty_v8 archive digest for v${V8_VERSION} ${TARGET}"; exit 1 ;;
+        esac
         if [[ "$TARGET" == *"windows"* ]]; then
           FILENAME="rusty_v8_simdutf_release_${TARGET}.lib.gz"
         else
           FILENAME="librusty_v8_simdutf_release_${TARGET}.a.gz"
         fi
-        ARCHIVE="${{ runner.temp }}/rusty_v8/${FILENAME}"
+        ARCHIVE="${RUNNER_TEMP}/rusty_v8/v${V8_VERSION}/${FILENAME}"
         mkdir -p "$(dirname "$ARCHIVE")"
         if [ ! -f "$ARCHIVE" ]; then
           URL="https://github.com/denoland/rusty_v8/releases/download/v${V8_VERSION}/${FILENAME}"
           echo "Downloading V8 v${V8_VERSION} (simdutf variant) for ${TARGET}"
-          curl -L -f --retry 3 --retry-delay 5 -o "$ARCHIVE" "$URL"
+          curl --proto '=https' --proto-redir '=https' -Lf --retry 3 --retry-delay 5 -o "$ARCHIVE" "$URL"
         fi
-        echo "RUSTY_V8_ARCHIVE=${ARCHIVE}" >> $GITHUB_ENV
+        if command -v sha256sum >/dev/null; then
+          ACTUAL_SHA256=$(sha256sum < "$ARCHIVE" | awk '{print $1}')
+        else
+          ACTUAL_SHA256=$(shasum -a 256 < "$ARCHIVE" | awk '{print $1}')
+        fi
+        if [ "$ACTUAL_SHA256" != "$SHA256" ]; then
+          echo "::error::rusty_v8 archive SHA-256 mismatch for v${V8_VERSION} ${TARGET}"
+          exit 1
+        fi
+        echo "RUSTY_V8_ARCHIVE=${ARCHIVE}" >> "$GITHUB_ENV"

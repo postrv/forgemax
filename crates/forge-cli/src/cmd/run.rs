@@ -77,14 +77,10 @@ pub async fn execute(args: &RunArgs, config_path: Option<PathBuf>) -> Result<()>
     // Connect and build manifest
     let connect_result = common::connect_and_build_manifest(&config).await?;
 
-    let known_servers: std::collections::HashSet<String> = connect_result
-        .manifest
-        .servers
-        .iter()
-        .map(|s| s.name.clone())
-        .collect();
-    let known_tools: Vec<(String, String)> = connect_result
-        .manifest
+    let manifest = connect_result.manifest.current();
+    let known_servers: std::collections::HashSet<String> =
+        manifest.servers.iter().map(|s| s.name.clone()).collect();
+    let known_tools: Vec<(String, String)> = manifest
         .servers
         .iter()
         .flat_map(|s| {

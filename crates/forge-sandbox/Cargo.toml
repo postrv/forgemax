@@ -20,12 +20,12 @@ tracing.workspace = true
 async-trait.workspace = true
 sha2.workspace = true
 uuid.workspace = true
-chrono.workspace = true
+jiff.workspace = true
 regex = "1"
 percent-encoding = "2"
 
 # Metrics (optional, default off)
-prometheus-client = { version = "0.22", optional = true }
+prometheus-client = { version = "0.26", optional = true }
 
 # AST validator (optional, default on)
 oxc_parser = { workspace = true, optional = true }

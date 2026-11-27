@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use forge_error::DispatchError;
+use forge_manifest::LiveManifest;
 use forge_sandbox::{ResourceDispatcher, ToolDispatcher};
 use serde_json::Value;
 
@@ -11,12 +12,12 @@ use serde_json::Value;
 /// correct downstream MCP client based on server name.
 ///
 /// Validates both server names and tool names before dispatching, returning
-/// [`DispatchError::ServerNotFound`] or [`DispatchError::ToolNotFound`] with
-/// fuzzy-match suggestions when appropriate.
+/// [`DispatchError::ServerNotFound`] or [`DispatchError::ToolNotFound`].
 pub struct RouterDispatcher {
     clients: HashMap<String, Arc<dyn ToolDispatcher>>,
     /// Known tool names per server, for pre-dispatch validation.
     known_tools: HashMap<String, HashSet<String>>,
+    live_manifest: Option<LiveManifest>,
 }
 
 impl RouterDispatcher {
@@ -25,7 +26,16 @@ impl RouterDispatcher {
         Self {
             clients: HashMap::new(),
             known_tools: HashMap::new(),
+            live_manifest: None,
         }
+    }
+
+    /// Validate dispatch against the latest snapshot of the live manifest.
+    ///
+    /// Uses the exact names in the snapshot. An empty catalog permits no calls.
+    pub fn with_live_manifest(mut self, manifest: LiveManifest) -> Self {
+        self.live_manifest = Some(manifest);
+        self
     }
 
     /// Register a dispatcher for a named server.
@@ -79,15 +89,22 @@ impl ToolDispatcher for RouterDispatcher {
             .get(server)
             .ok_or_else(|| DispatchError::ServerNotFound(server.into()))?;
 
-        // Pre-dispatch tool name validation: if we know the server's tools,
-        // check the tool exists before sending to the upstream server.
-        if let Some(tools) = self.known_tools.get(server) {
-            if !tools.is_empty() && !tools.contains(tool) {
-                return Err(DispatchError::ToolNotFound {
-                    server: server.into(),
-                    tool: tool.into(),
-                });
-            }
+        let listed = if let Some(manifest) = &self.live_manifest {
+            manifest
+                .snapshot()
+                .tool_names
+                .get(server)
+                .is_some_and(|tools| tools.contains(tool))
+        } else {
+            self.known_tools
+                .get(server)
+                .is_none_or(|tools| tools.is_empty() || tools.contains(tool))
+        };
+        if !listed {
+            return Err(DispatchError::ToolNotFound {
+                server: server.into(),
+                tool: tool.into(),
+            });
         }
 
         client.call_tool(server, tool, args).await

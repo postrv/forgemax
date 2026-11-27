@@ -5,15 +5,17 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const { execFileSync, spawnSync } = require("child_process");
-const version = require("./package.json").version;
+const { name, version } = require("./package.json");
 
 test("packed npm package creates a working launcher before postinstall", { skip: process.platform === "win32" }, (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "forgemax npm package "));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const npmOptions = { encoding: "utf8", timeout: 30000, env: { ...process.env, npm_config_update_notifier: "false" } };
-  const [packed] = JSON.parse(execFileSync("npm", ["pack", "--json", "--ignore-scripts", "--pack-destination", root], {
+  const packResult = JSON.parse(execFileSync("npm", ["pack", "--json", "--ignore-scripts", "--pack-destination", root], {
     ...npmOptions, cwd: __dirname,
   }));
+  const packed = Array.isArray(packResult) ? packResult[0] : packResult[name];
+  assert.ok(packed, "npm must report the packed Forgemax package");
   const files = packed.files.map((file) => file.path);
   assert.ok(files.includes("cli.js"), "launcher must be in the package before lifecycle scripts run");
   assert.ok(files.includes("install.js"));

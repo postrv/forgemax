@@ -4,11 +4,23 @@
 //! and atomic swaps. Background tasks can call [`update()`](LiveManifest::update)
 //! to refresh the manifest without blocking concurrent `search()` or `execute()`.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 
 use crate::Manifest;
+
+/// The discovery view and exact MCP tool names published together.
+#[derive(Clone)]
+pub struct ManifestSnapshot {
+    /// The catalog exposed to search.
+    pub manifest: Arc<Manifest>,
+    /// Exact downstream tool names keyed by configured server name.
+    ///
+    /// The discovery view may shorten or sanitize names for display.
+    pub tool_names: HashMap<String, HashSet<String>>,
+}
 
 /// A live, atomically-swappable manifest.
 ///
@@ -23,15 +35,34 @@ use crate::Manifest;
 /// ```
 #[derive(Clone)]
 pub struct LiveManifest {
-    inner: Arc<ArcSwap<Manifest>>,
+    inner: Arc<ArcSwap<ManifestSnapshot>>,
+}
+
+impl From<Manifest> for LiveManifest {
+    fn from(manifest: Manifest) -> Self {
+        Self::new(manifest)
+    }
 }
 
 impl LiveManifest {
-    /// Create a new live manifest with the given initial value.
+    /// Create a live manifest used for discovery alone.
     pub fn new(manifest: Manifest) -> Self {
+        Self::from_snapshot(ManifestSnapshot {
+            manifest: Arc::new(manifest),
+            tool_names: HashMap::new(),
+        })
+    }
+
+    /// Create a live manifest with its exact dispatch names.
+    pub fn from_snapshot(snapshot: ManifestSnapshot) -> Self {
         Self {
-            inner: Arc::new(ArcSwap::from_pointee(manifest)),
+            inner: Arc::new(ArcSwap::from_pointee(snapshot)),
         }
+    }
+
+    /// Read the manifest and dispatch names from the same atomic snapshot.
+    pub fn snapshot(&self) -> Arc<ManifestSnapshot> {
+        self.inner.load_full()
     }
 
     /// Get a lock-free snapshot of the current manifest.
@@ -39,21 +70,29 @@ impl LiveManifest {
     /// This is wait-free and never blocks, even if another thread is
     /// updating the manifest concurrently.
     pub fn current(&self) -> Arc<Manifest> {
-        self.inner.load_full()
+        self.inner.load().manifest.clone()
     }
 
-    /// Atomically replace the manifest with a new version.
+    /// Atomically replace both the discovery view and the dispatch names.
+    pub fn publish(&self, snapshot: ManifestSnapshot) {
+        self.inner.store(Arc::new(snapshot));
+    }
+
+    /// Atomically replace a discovery-only manifest with a new version.
     ///
     /// All subsequent calls to [`current()`](Self::current) will see the
     /// new manifest. Readers holding an older `Arc<Manifest>` are unaffected.
     pub fn update(&self, new_manifest: Manifest) {
-        self.inner.store(Arc::new(new_manifest));
+        self.publish(ManifestSnapshot {
+            manifest: Arc::new(new_manifest),
+            tool_names: HashMap::new(),
+        });
     }
 
     /// Load a clone of the inner `Arc` pointer (for passing to subsystems
     /// that need their own reference).
     pub fn load_arc(&self) -> Arc<Manifest> {
-        self.inner.load_full()
+        self.current()
     }
 }
 

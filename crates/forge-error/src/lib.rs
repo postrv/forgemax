@@ -69,6 +69,17 @@ pub enum DispatchError {
         reason: String,
     },
 
+    /// A tool call ended without a definitive response. Its effects may have occurred.
+    #[error("outcome of tool '{tool}' on '{server}' is unknown: {reason}")]
+    ToolOutcomeUnknown {
+        /// The server that hosted the tool.
+        server: String,
+        /// The tool that was called.
+        tool: String,
+        /// Why the gateway could not determine the outcome.
+        reason: String,
+    },
+
     /// A tool returned an application-level error (MCP `isError: true`).
     ///
     /// The downstream server is healthy — the tool processed the request but
@@ -104,6 +115,7 @@ impl DispatchError {
             Self::GroupPolicyDenied { .. } => "GROUP_POLICY_DENIED",
             Self::Upstream { .. } => "UPSTREAM_ERROR",
             Self::TransportDead { .. } => "TRANSPORT_DEAD",
+            Self::ToolOutcomeUnknown { .. } => "TOOL_OUTCOME_UNKNOWN",
             Self::ToolError { .. } => "TOOL_ERROR",
             Self::RateLimit(_) => "RATE_LIMIT",
             Self::Internal(_) => "INTERNAL",
@@ -122,6 +134,7 @@ impl DispatchError {
             Self::Timeout { .. } => true,
             Self::Upstream { .. } => true,
             Self::TransportDead { .. } => true,
+            Self::ToolOutcomeUnknown { .. } => true,
             Self::Internal(_) => true,
             Self::ToolError { .. } => false,
             Self::ServerNotFound(_) => false,
@@ -140,6 +153,7 @@ impl DispatchError {
             Self::RateLimit(_) => true,
             Self::Upstream { .. } => true,
             Self::TransportDead { .. } => false,
+            Self::ToolOutcomeUnknown { .. } => false,
             Self::ToolError { .. } => false,
             Self::ServerNotFound(_) => false,
             Self::ToolNotFound { .. } => false,
@@ -179,9 +193,8 @@ impl DispatchError {
             Self::CircuitOpen(_) => Some("Retry after a delay".to_string()),
             Self::Timeout { .. } => Some("Retry with a simpler operation".to_string()),
             Self::RateLimit(_) => Some("Reduce request frequency".to_string()),
-            Self::TransportDead { .. } => Some(
-                "Server transport is dead. Gateway may auto-reconnect, or restart the gateway."
-                    .to_string(),
+            Self::TransportDead { .. } | Self::ToolOutcomeUnknown { .. } => Some(
+                "Check the previous operation's outcome before submitting it again.".to_string(),
             ),
             _ => None,
         };
@@ -670,8 +683,8 @@ mod tests {
         assert_eq!(json["retryable"], false);
         let fix = json["suggested_fix"].as_str().unwrap();
         assert!(
-            fix.contains("transport is dead"),
-            "expected transport dead suggestion, got: {fix}"
+            fix.contains("previous operation's outcome"),
+            "expected guidance on uncertain delivery, got: {fix}"
         );
     }
 }

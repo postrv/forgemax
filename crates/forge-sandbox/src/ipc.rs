@@ -43,7 +43,7 @@ pub struct IpcDispatchError {
     /// Server name (for ServerNotFound, ToolNotFound, ToolError, Timeout, CircuitOpen, Upstream).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server: Option<String>,
-    /// Tool name (for ToolNotFound, ToolError).
+    /// Tool name for tool-specific errors.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool: Option<String>,
     /// Timeout in milliseconds (for Timeout).
@@ -92,6 +92,11 @@ impl IpcDispatchError {
                 server: self.server.unwrap_or_default(),
                 reason: self.message,
             },
+            "TOOL_OUTCOME_UNKNOWN" => forge_error::DispatchError::ToolOutcomeUnknown {
+                server: self.server.unwrap_or_default(),
+                tool: self.tool.unwrap_or_default(),
+                reason: self.message,
+            },
             "TOOL_ERROR" => forge_error::DispatchError::ToolError {
                 server: self.server.unwrap_or_default(),
                 tool: self.tool.unwrap_or_default(),
@@ -120,7 +125,8 @@ impl From<&forge_error::DispatchError> for IpcDispatchError {
             forge_error::DispatchError::TransportDead { server, .. } => {
                 (Some(server.clone()), None, None)
             }
-            forge_error::DispatchError::ToolError { server, tool, .. } => {
+            forge_error::DispatchError::ToolError { server, tool, .. }
+            | forge_error::DispatchError::ToolOutcomeUnknown { server, tool, .. } => {
                 (Some(server.clone()), Some(tool.clone()), None)
             }
             _ => (None, None, None),
@@ -1922,6 +1928,22 @@ mod tests {
     }
 
     // --- ToolError IPC round-trip tests ---
+
+    #[test]
+    fn uncertain_tool_outcome_remains_nonretryable_after_ipc() {
+        let error = forge_error::DispatchError::ToolOutcomeUnknown {
+            server: "fixture".into(),
+            tool: "record".into(),
+            reason: "response timed out".into(),
+        };
+        let wire = serde_json::to_string(&IpcDispatchError::from(&error)).unwrap();
+        let restored = serde_json::from_str::<IpcDispatchError>(&wire)
+            .unwrap()
+            .to_dispatch_error();
+        assert_eq!(restored.code(), "TOOL_OUTCOME_UNKNOWN");
+        assert!(!restored.retryable());
+        assert!(restored.to_string().contains("response timed out"));
+    }
 
     #[tokio::test]
     async fn tool_error_round_trips_through_ipc() {

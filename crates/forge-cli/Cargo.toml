@@ -21,7 +21,7 @@ forge-sandbox.workspace = true
 forge-client.workspace = true
 forge-config.workspace = true
 forge-error.workspace = true
-rmcp.workspace = true
+rmcp = { workspace = true, features = ["transport-io"] }
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -39,6 +39,7 @@ metrics = ["forge-sandbox/metrics"]
 config-watch = ["forge-config/config-watch"]
 
 [dev-dependencies]
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
 forge-error.workspace = true
 tempfile = "3"
 serde_json.workspace = true

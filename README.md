@@ -88,7 +88,7 @@ Built dynamically from live `tools/list` responses when downstream servers conne
 
 ### forge-client
 
-MCP client connections to downstream servers. Supports stdio and HTTP/SSE transports. `RouterDispatcher` routes `callTool(server, tool, args)` to the correct downstream connection with pre-dispatch tool name validation — misspelled tools return `TOOL_NOT_FOUND` with Levenshtein-based suggestions before ever hitting the upstream server. `ReconnectingClient` decorator auto-reconnects on permanent transport failures (broken pipe, channel overflow) with exponential backoff — default enabled for stdio transports.
+MCP client connections to downstream servers. Supports stdio and Streamable HTTP. `RouterDispatcher` validates the tool name against the catalog before dispatch. Automatic reconnection is enabled by default for stdio. The gateway checks the replacement server's tool list before using the connection. If a tool response is lost, the gateway returns an error and reserves the replacement connection for future requests.
 
 ### forge-server
 
@@ -96,7 +96,7 @@ Implements `ServerHandler` from rmcp. Exposes `search` and `execute` as MCP tool
 
 ### forge-error
 
-Typed `DispatchError` enum replacing `anyhow::Error` across all dispatchers. Variants: `ServerNotFound`, `ToolNotFound`, `Timeout`, `CircuitOpen`, `GroupPolicyDenied`, `Upstream`, `TransportDead`, `RateLimit`, `Internal`. `TransportDead` distinguishes permanent transport failures (broken pipe, channel closed) from transient upstream errors — triggers circuit breaker but is not retryable without reconnection. Includes fuzzy matching — `find_symbls` suggests `find_symbols` via Levenshtein distance. Errors serialize to structured JSON with `{error, code, message, retryable, suggested_fix}`.
+`DispatchError` serializes to structured JSON with `{error, code, message, retryable, suggested_fix}`. A lost transport or a tool call that ends without a definitive response returns a nonretryable error. Verify the operation's outcome before submitting it again. Unknown tool names can include a suggested spelling.
 
 ### forge-audit
 
@@ -174,6 +174,11 @@ cargo test --workspace
 | `forgemax init` | Generate a starter config file |
 
 ### Configuration
+
+Forgemax serves MCP over stdio. It supports the `2026-07-28` discovery lifecycle
+and legacy initialization. Downstream stdio and Streamable HTTP connections
+probe modern discovery and fall back to legacy initialization when needed. The
+existing `transport = "sse"` setting selects downstream Streamable HTTP.
 
 Copy the example config and add your tokens:
 
@@ -357,9 +362,8 @@ Manifest Sanitization   Tool metadata sanitized to prevent prompt injection
   Circuit Breakers      Closed → Open → HalfOpen state machine per server,
                         prevents cascade failures from flaky downstreams
         |
-Transport Resilience    TransportDead detection (broken pipe, channel overflow),
-                        auto-reconnection with exponential backoff (1s → max),
-                        CAS-guarded concurrent reconnection prevention
+Transport Resilience    Typed transport loss detection, serialized reconnection
+                        with exponential backoff, replacement catalog validation
         |
   Server Groups         Opt-in strict/open isolation policies controlling
                         cross-server data flow within a single execution
@@ -398,9 +402,10 @@ Run an example: `forgemax run examples/basic-tool-chaining.js`
 
 ## Tests
 
-~790 tests across the workspace:
+Run the workspace tests:
 
 ```bash
+cargo build --locked --workspace
 cargo test --workspace
 ```
 
@@ -408,18 +413,18 @@ cargo test --workspace
 
 | Crate | Version | Purpose |
 |---|---|---|
-| deno_core | 0.391 | V8 sandbox runtime |
-| rmcp | 1.2 | MCP protocol (server + client) |
+| deno_core | 0.413 | V8 sandbox runtime |
+| rmcp | 3.12.0 | MCP protocol (server + client) |
 | tokio | 1.x | Async runtime |
 | serde | 1.x | Serialization |
 | schemars | 1.0 | JSON Schema (matches rmcp) |
-| oxc_parser / oxc_ast | 0.115 | AST-based code validation |
+| oxc_parser / oxc_ast | 0.133 | AST-based code validation |
 | arc-swap | 1.x | Lock-free LiveManifest reads |
 | strsim | 0.11 | Levenshtein fuzzy matching |
-| sha2 | 0.10 | Code hashing for audit log |
-| chrono | 0.4 | Audit timestamps |
-| notify | 7.x | Config file watching (optional) |
-| prometheus-client | 0.22 | Metrics export (optional) |
+| sha2 | 0.11 | Code hashing for audit log |
+| jiff | 1.x | UTC audit timestamps |
+| notify | 8.2 | Config file watching (optional) |
+| prometheus-client | 0.26 | Metrics export (optional) |
 
 ## License
 

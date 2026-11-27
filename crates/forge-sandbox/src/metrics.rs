@@ -42,16 +42,14 @@ impl ForgeMetrics {
     pub fn new(registry: &mut Registry) -> Self {
         let executions_total = Family::default();
         registry.register(
-            "forge_executions_total",
+            "forge_executions",
             "Total sandbox executions",
             executions_total.clone(),
         );
 
         let execution_duration_seconds =
             Family::<ExecutionLabels, Histogram>::new_with_constructor(|| {
-                Histogram::new(
-                    [0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0, 30.0].into_iter(),
-                )
+                Histogram::new([0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0, 30.0])
             });
         registry.register(
             "forge_execution_duration_seconds",
@@ -61,7 +59,7 @@ impl ForgeMetrics {
 
         let errors_total = Family::default();
         registry.register(
-            "forge_errors_total",
+            "forge_errors",
             "Total sandbox errors by kind",
             errors_total.clone(),
         );
@@ -172,11 +170,13 @@ mod tests {
         encode(&mut buf, &registry).unwrap();
 
         assert!(
-            buf.contains("forge_executions_total"),
+            buf.lines()
+                .any(|line| line == "forge_executions_total{operation=\"execute\"} 1"),
             "should contain execution counter: {buf}"
         );
         assert!(
-            buf.contains("forge_errors_total"),
+            buf.lines()
+                .any(|line| line == "forge_errors_total{error_kind=\"timeout\"} 1"),
             "should contain error counter: {buf}"
         );
     }

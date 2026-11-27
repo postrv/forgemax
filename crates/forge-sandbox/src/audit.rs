@@ -10,7 +10,7 @@
 //! The [`AuditLogger`] trait allows pluggable backends.
 //! [`JsonLinesAuditLogger`] writes newline-delimited JSON to any `AsyncWrite`.
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
@@ -28,7 +28,7 @@ pub struct AuditEntry {
     /// Unique execution identifier.
     pub execution_id: String,
     /// ISO-8601 timestamp of when execution started.
-    pub timestamp: DateTime<Utc>,
+    pub timestamp: Timestamp,
     /// SHA-256 hash of the submitted code.
     pub code_hash: String,
     /// First N characters of the code (for human review).
@@ -223,7 +223,7 @@ pub fn code_preview(code: &str) -> String {
 /// Builder for constructing audit entries during execution.
 pub struct AuditEntryBuilder {
     execution_id: String,
-    timestamp: DateTime<Utc>,
+    timestamp: Timestamp,
     code_hash: String,
     code_preview: String,
     operation: AuditOperation,
@@ -240,7 +240,7 @@ impl AuditEntryBuilder {
     pub fn new(code: &str, operation: AuditOperation) -> Self {
         Self {
             execution_id: Uuid::new_v4().to_string(),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             code_hash: sha256_hex(code),
             code_preview: crate::redact::redact_error_message(&code_preview(code)),
             operation,
@@ -666,7 +666,7 @@ mod tests {
 
         let entry = AuditEntry {
             execution_id: "test-id".into(),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             code_hash: "abc123".into(),
             code_preview: "async () => {}".into(),
             operation: AuditOperation::Execute,
@@ -699,7 +699,7 @@ mod tests {
 
         let entry = AuditEntry {
             execution_id: "test-id-2".into(),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             code_hash: "def456".into(),
             code_preview: "async () => { await forge.callTool(...); }".into(),
             operation: AuditOperation::Execute,
@@ -743,7 +743,7 @@ mod tests {
     fn audit_entry_serializes_no_raw_credentials() {
         let entry = AuditEntry {
             execution_id: "id".into(),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             code_hash: "hash".into(),
             code_preview: "preview".into(),
             operation: AuditOperation::Execute,
@@ -773,7 +773,7 @@ mod tests {
     fn stash_operations_omitted_when_empty() {
         let entry = AuditEntry {
             execution_id: "id".into(),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             code_hash: "hash".into(),
             code_preview: "preview".into(),
             operation: AuditOperation::Execute,
@@ -797,7 +797,7 @@ mod tests {
     fn stash_operations_included_when_present() {
         let entry = AuditEntry {
             execution_id: "id".into(),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             code_hash: "hash".into(),
             code_preview: "preview".into(),
             operation: AuditOperation::Execute,
@@ -901,7 +901,7 @@ mod tests {
         let logger = TracingAuditLogger;
         let entry = AuditEntry {
             execution_id: "trace-test".into(),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             code_hash: "abc".into(),
             code_preview: "async () => {}".into(),
             operation: AuditOperation::Execute,
@@ -928,7 +928,7 @@ mod tests {
         let logger = TracingAuditLogger;
         let entry = AuditEntry {
             execution_id: "err-test".into(),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             code_hash: "def".into(),
             code_preview: "async () => { throw new Error('x'); }".into(),
             operation: AuditOperation::Execute,
@@ -951,7 +951,7 @@ mod tests {
         let logger = TracingAuditLogger;
         let entry = AuditEntry {
             execution_id: "timeout-test".into(),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             code_hash: "ghi".into(),
             code_preview: "async () => { while(true) {} }".into(),
             operation: AuditOperation::Search,
@@ -1011,7 +1011,7 @@ mod tests {
         // Verify the full audit entry serializes correctly with all field types populated.
         let entry = AuditEntry {
             execution_id: "test-id".into(),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             code_hash: sha256_hex("code"),
             code_preview: "code".into(),
             operation: AuditOperation::Execute,
@@ -1060,7 +1060,7 @@ mod tests {
         let logger = TracingAuditLogger;
         let entry = AuditEntry {
             execution_id: "full-test".into(),
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             code_hash: sha256_hex("test"),
             code_preview: "test".into(),
             operation: AuditOperation::Execute,

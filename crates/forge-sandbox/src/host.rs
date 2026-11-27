@@ -4,10 +4,11 @@
 //! communicates over length-delimited JSON IPC (stdin/stdout), and routes
 //! tool calls through the parent's [`ToolDispatcher`].
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Context;
 use tokio::io::BufReader;
 use tokio::process::Command;
 
@@ -375,105 +376,92 @@ where
     }
 }
 
-/// Find the `forgemax-worker` binary.
-///
-/// Search order:
-/// 1. `FORGE_WORKER_BIN` environment variable (must be absolute path)
-/// 2. Same directory as the current executable
-///
-/// On Unix, rejects world-writable binaries (mode & 0o002 != 0).
+/// Find the `forgemax-worker` binary from an explicit absolute override or
+/// alongside the current executable. Return the resolved regular file.
 #[tracing::instrument]
 pub fn find_worker_binary() -> Result<PathBuf, SandboxError> {
-    // 1. Explicit env var — must be an absolute path
-    if let Ok(path) = std::env::var("FORGE_WORKER_BIN") {
-        let p = PathBuf::from(&path);
-        if !p.is_absolute() {
-            return Err(SandboxError::Execution(anyhow::anyhow!(
+    if let Some(path) = std::env::var_os("FORGE_WORKER_BIN") {
+        let path = PathBuf::from(path);
+        if !path.is_absolute() {
+            return Err(anyhow::anyhow!(
                 "FORGE_WORKER_BIN must be an absolute path, got: {}",
-                path
-            )));
+                path.display()
+            )
+            .into());
         }
-        if p.exists() {
-            validate_binary_permissions(&p)?;
-            return Ok(p);
-        }
+        return validate_worker_binary(&path);
     }
 
-    // 2. Same directory as current executable (or parent, for test binaries in deps/)
-    let worker_name = format!("forgemax-worker{}", std::env::consts::EXE_SUFFIX);
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let worker = dir.join(&worker_name);
-            if worker.exists() {
-                validate_binary_permissions(&worker)?;
-                return Ok(worker);
-            }
-            // Test binaries are in target/debug/deps/ but worker is in target/debug/
-            if let Some(parent) = dir.parent() {
-                let worker = parent.join(&worker_name);
-                if worker.exists() {
-                    validate_binary_permissions(&worker)?;
-                    return Ok(worker);
-                }
-            }
-        }
-    }
-
-    Err(SandboxError::Execution(anyhow::anyhow!(
-        "forgemax-worker binary not found. Set FORGE_WORKER_BIN or install alongside forgemax"
-    )))
+    let exe = std::env::current_exe().context("cannot find the current executable")?;
+    let dir = exe
+        .parent()
+        .context("current executable has no parent directory")?;
+    find_sibling_worker(dir)
 }
 
-/// Validate binary file permissions (Unix only).
-///
-/// Rejects:
-/// - World-writable binaries (mode & 0o002)
-/// - Binaries in world-writable directories without the sticky bit,
-///   which would allow binary replacement attacks.
-fn validate_binary_permissions(_path: &std::path::Path) -> Result<(), SandboxError> {
+fn find_sibling_worker(dir: &Path) -> Result<PathBuf, SandboxError> {
+    let worker_name = format!("forgemax-worker{}", std::env::consts::EXE_SUFFIX);
+    let mut worker = dir.join(&worker_name);
+    // Cargo puts integration-test executables in deps/ and the worker one level up.
+    if dir.ends_with("deps")
+        && matches!(worker.symlink_metadata(), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+    {
+        if let Some(parent) = dir.parent() {
+            worker = parent.join(&worker_name);
+        }
+    }
+    validate_worker_binary(&worker)
+}
+
+fn validate_worker_binary(path: &Path) -> Result<PathBuf, SandboxError> {
+    let resolved = path
+        .canonicalize()
+        .with_context(|| format!("cannot resolve worker binary {}", path.display()))?;
+    let metadata = resolved
+        .metadata()
+        .with_context(|| format!("cannot inspect worker binary {}", resolved.display()))?;
+    if !metadata.is_file() {
+        return Err(anyhow::anyhow!(
+            "worker binary {} must be a regular file",
+            resolved.display()
+        )
+        .into());
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
 
-        // Check the binary itself (follows symlinks via std::fs::metadata)
-        let metadata = std::fs::metadata(_path).map_err(|e| {
-            SandboxError::Execution(anyhow::anyhow!(
-                "cannot read metadata for {}: {}",
-                _path.display(),
-                e
-            ))
-        })?;
         let mode = metadata.permissions().mode();
         if mode & 0o002 != 0 {
-            return Err(SandboxError::Execution(anyhow::anyhow!(
-                "insecure permissions on worker binary {}: mode {:o} is world-writable",
-                _path.display(),
-                mode,
-            )));
+            return Err(anyhow::anyhow!(
+                "insecure permissions on worker binary {}: mode {mode:o} is world-writable",
+                resolved.display()
+            )
+            .into());
+        }
+        if mode & 0o111 == 0 {
+            return Err(
+                anyhow::anyhow!("worker binary {} must be executable", resolved.display()).into(),
+            );
         }
 
-        // Check the parent directory — world-writable without sticky bit allows replacement
-        if let Some(parent) = _path.parent() {
-            let dir_metadata = std::fs::metadata(parent).map_err(|e| {
-                SandboxError::Execution(anyhow::anyhow!(
-                    "cannot read metadata for parent directory {}: {}",
-                    parent.display(),
-                    e
-                ))
-            })?;
-            let dir_mode = dir_metadata.permissions().mode();
-            // World-writable (0o002) without sticky bit (0o1000) is insecure
+        // Check directories containing both the original path and any resolved symlink target.
+        let original = path
+            .ancestors()
+            .skip(1)
+            .filter(|_| path != resolved.as_path());
+        for dir in resolved.ancestors().skip(1).chain(original) {
+            let dir_mode = dir
+                .metadata()
+                .with_context(|| format!("cannot inspect worker directory {}", dir.display()))?
+                .permissions()
+                .mode();
             if dir_mode & 0o002 != 0 && dir_mode & 0o1000 == 0 {
-                return Err(SandboxError::Execution(anyhow::anyhow!(
-                    "insecure directory for worker binary {}: parent {} mode {:o} is world-writable without sticky bit",
-                    _path.display(),
-                    parent.display(),
-                    dir_mode,
-                )));
+                return Err(anyhow::anyhow!("insecure worker directory {}: mode {dir_mode:o} is world-writable without sticky bit", dir.display()).into());
             }
         }
     }
-    Ok(())
+    Ok(resolved)
 }
 
 #[cfg(test)]
@@ -500,6 +488,45 @@ mod tests {
                 "expected 'absolute' in error: {err}"
             );
         });
+    }
+
+    #[test]
+    fn find_worker_binary_rejects_missing_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing-worker");
+        temp_env::with_var("FORGE_WORKER_BIN", Some(&missing), || {
+            let err = find_worker_binary().unwrap_err().to_string();
+            assert!(err.contains("missing-worker"), "{err}");
+        });
+    }
+
+    #[test]
+    fn find_sibling_worker_rejects_a_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let worker = format!("forgemax-worker{}", std::env::consts::EXE_SUFFIX);
+        std::fs::create_dir(dir.path().join(worker)).unwrap();
+        let err = find_sibling_worker(dir.path()).unwrap_err().to_string();
+        assert!(err.contains("regular file"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn find_sibling_worker_uses_parent_only_for_cargo_test_layout() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let worker = dir.path().join("forgemax-worker");
+        std::fs::write(&worker, b"fixture").unwrap();
+        std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for name in ["bin", "deps"] {
+            std::fs::create_dir(dir.path().join(name)).unwrap();
+        }
+
+        assert!(find_sibling_worker(&dir.path().join("bin")).is_err());
+        assert_eq!(
+            find_sibling_worker(&dir.path().join("deps")).unwrap(),
+            worker.canonicalize().unwrap()
+        );
     }
 
     #[test]
@@ -573,8 +600,8 @@ mod tests {
         let link = dir.path().join("forgemax-worker");
         std::os::unix::fs::symlink(&real_bin, &link).unwrap();
 
-        // validate_binary_permissions follows symlinks (uses std::fs::metadata)
-        let result = validate_binary_permissions(&link);
+        // The worker lookup resolves a symlink before checking its target
+        let result = validate_worker_binary(&link);
         assert!(
             result.is_err(),
             "should reject symlink to world-writable binary"
@@ -597,7 +624,7 @@ mod tests {
         let link = dir.path().join("forgemax-worker");
         std::os::unix::fs::symlink(&real_bin, &link).unwrap();
 
-        let result = validate_binary_permissions(&link);
+        let result = validate_worker_binary(&link);
         assert!(
             result.is_ok(),
             "should accept symlink to secure binary: {:?}",
@@ -619,7 +646,7 @@ mod tests {
         std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        let result = validate_binary_permissions(&bin);
+        let result = validate_worker_binary(&bin);
         assert!(
             result.is_err(),
             "should reject binary in world-writable dir"

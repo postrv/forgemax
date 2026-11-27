@@ -1,5 +1,16 @@
 # Upgrading Forgemax
 
+## v0.7.0
+
+Upgrade `forgemax` and `forgemax-worker` from the same release archive.
+
+- Downstream connections probe `2026-07-28` discovery and fall back to a legacy handshake. Existing stdio and `sse` configuration values still select the same transports.
+- If a tool call loses its response, check its outcome before sending it again. Reconnection restores later requests. Tool deadlines can return `TOOL_OUTCOME_UNKNOWN` with `retryable: false`.
+- Set `reconnect = true` for HTTP downstreams that should open a replacement session for subsequent calls after expiration.
+- Audit JSON still contains UTC RFC 3339 timestamps. Rust consumers of the audit structs use `jiff::Timestamp` for the timestamp field.
+- Update Prometheus queries that use `forge_executions_total_total` or `forge_errors_total_total` to `forge_executions_total` or `forge_errors_total`.
+- If you set `FORGE_WORKER_BIN`, point it at the absolute path of the matching executable worker. An invalid override now stops worker launch.
+
 ## v0.6.1 (Security Maintenance)
 
 Upgrade both `forgemax` and `forgemax-worker` together using the release archive or an installer.

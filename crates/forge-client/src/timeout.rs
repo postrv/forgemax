@@ -40,9 +40,10 @@ impl ToolDispatcher for TimeoutDispatcher {
     ) -> Result<Value, DispatchError> {
         match tokio::time::timeout(self.timeout, self.inner.call_tool(server, tool, args)).await {
             Ok(result) => result,
-            Err(_elapsed) => Err(DispatchError::Timeout {
+            Err(_elapsed) => Err(DispatchError::ToolOutcomeUnknown {
                 server: self.server_name.clone(),
-                timeout_ms: self.timeout.as_millis() as u64,
+                tool: tool.into(),
+                reason: format!("timeout after {}ms", self.timeout.as_millis()),
             }),
         }
     }
@@ -158,7 +159,9 @@ mod tests {
             .call_tool("slow-server", "scan", serde_json::json!({}))
             .await;
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), DispatchError::Timeout { .. }));
+        let error = result.unwrap_err();
+        assert!(matches!(error, DispatchError::ToolOutcomeUnknown { .. }));
+        assert!(!error.retryable());
     }
 
     #[tokio::test]
@@ -171,7 +174,9 @@ mod tests {
             .call_tool("narsil", "symbols.find", serde_json::json!({}))
             .await
             .unwrap_err();
-        assert!(matches!(err, DispatchError::Timeout { ref server, .. } if server == "narsil"));
+        assert!(
+            matches!(err, DispatchError::ToolOutcomeUnknown { ref server, .. } if server == "narsil")
+        );
         let msg = err.to_string();
         assert!(msg.contains("timeout"), "should mention timeout: {msg}");
         assert!(msg.contains("narsil"), "should mention server name: {msg}");

@@ -3,21 +3,21 @@
 //! Wraps an [`McpClient`] and automatically reconnects when a
 //! [`TransportDead`](forge_error::DispatchError::TransportDead) error is detected.
 //!
-//! When multiple concurrent calls detect a dead transport simultaneously,
-//! only one reconnection attempt proceeds (CAS on `reconnecting`). Other
-//! callers wait on a [`tokio::sync::Notify`] for the reconnection to complete,
-//! then retry with the fresh client. This prevents reconnection-induced
-//! failures from cascading into the circuit breaker.
+//! Concurrent calls serialize reconnection and share the replacement client.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Context;
+use forge_error::DispatchError;
 use forge_sandbox::{ResourceDispatcher, ToolDispatcher};
 use serde_json::Value;
-use tokio::sync::{Mutex, Notify, RwLock};
+use tokio::runtime::Handle;
+use tokio::sync::{Mutex, RwLock};
+use tokio::task::JoinSet;
 
-use crate::{McpClient, TransportConfig};
+use crate::{McpClient, ToolInfo, TransportConfig, DEFAULT_CATALOG_TIMEOUT};
 
 /// A client wrapper that auto-reconnects on transport death.
 ///
@@ -29,22 +29,42 @@ use crate::{McpClient, TransportConfig};
 /// (tool calls, resource reads) can proceed concurrently, while reconnection
 /// briefly takes a write lock.
 ///
-/// A [`Notify`] wakes all waiting callers once reconnection completes, so
-/// concurrent calls that hit a dead transport wait for the reconnection
-/// rather than failing immediately.
+/// A replacement connection runs on the runtime that created the wrapper.
+/// It stays alive even when discovery or dispatch uses a short-lived runtime.
 pub struct ReconnectingClient {
     name: String,
     transport_config: TransportConfig,
-    inner: RwLock<Arc<McpClient>>,
-    reconnecting: AtomicBool,
-    /// Notified when a reconnection attempt completes (success or failure).
-    reconnect_done: Notify,
+    runtime: Option<Handle>,
+    inner: RwLock<ActiveConnection>,
     max_backoff: Duration,
     current_backoff: Mutex<Duration>,
 }
 
+struct ActiveConnection {
+    client: Arc<McpClient>,
+    /// The startup router has already checked the first connection. Every
+    /// replacement must supply its own catalog before taking over.
+    tool_names: Option<HashSet<String>>,
+}
+
 impl ReconnectingClient {
+    /// List tools on the same active connection used for dispatch.
+    pub async fn list_tools(&self) -> anyhow::Result<Vec<ToolInfo>> {
+        let client = self.current_client().await;
+        let tools = client.list_tools().await?;
+        let mut active = self.inner.write().await;
+        anyhow::ensure!(
+            Arc::ptr_eq(&client, &active.client),
+            "downstream connection was replaced during catalog discovery"
+        );
+        active.tool_names = Some(tools.iter().map(|tool| tool.name.clone()).collect());
+        Ok(tools)
+    }
+
     /// Create a new reconnecting wrapper around an existing client.
+    ///
+    /// Construct this on the long-lived host runtime when dispatch may run
+    /// on a separate runtime. Outside a runtime, reconnection uses the caller's runtime.
     pub fn new(
         name: String,
         transport_config: TransportConfig,
@@ -54,68 +74,35 @@ impl ReconnectingClient {
         Self {
             name,
             transport_config,
-            inner: RwLock::new(client),
-            reconnecting: AtomicBool::new(false),
-            reconnect_done: Notify::new(),
+            runtime: Handle::try_current().ok(),
+            inner: RwLock::new(ActiveConnection {
+                client,
+                tool_names: None,
+            }),
             max_backoff,
             current_backoff: Mutex::new(Duration::from_secs(1)),
         }
     }
 
-    /// Attempt to reconnect, returning true on success.
-    ///
-    /// Uses CAS on `reconnecting` to ensure only one reconnection attempt
-    /// proceeds at a time. Other callers wait on [`reconnect_done`] for the
-    /// reconnection to complete, then check the result.
-    async fn try_reconnect(&self) -> bool {
-        // CAS: only one task reconnects at a time
-        if self
-            .reconnecting
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            // Another task is already reconnecting — wait for it to finish.
-            // Use a bounded wait to avoid hanging forever if the reconnector panics.
-            tracing::debug!(server = %self.name, "waiting for concurrent reconnection to complete");
-            let wait_result =
-                tokio::time::timeout(Duration::from_secs(30), self.reconnect_done.notified()).await;
-            if wait_result.is_err() {
-                tracing::warn!(
-                    server = %self.name,
-                    "timed out waiting for concurrent reconnection"
-                );
-            }
-            // Check whether the reconnection succeeded by testing the flag.
-            // If it's still set, the reconnection failed or is stuck.
-            return !self.reconnecting.load(Ordering::SeqCst);
+    /// Replace the failed connection if another caller has not already done so.
+    async fn try_reconnect(&self, failed: &Arc<McpClient>) -> bool {
+        let mut backoff = self.current_backoff.lock().await;
+        if !Arc::ptr_eq(failed, &self.current_client().await) {
+            return true;
         }
 
-        // Apply backoff delay
-        let backoff = {
-            let guard = self.current_backoff.lock().await;
-            *guard
-        };
         tracing::info!(
             server = %self.name,
             backoff_ms = backoff.as_millis(),
             "attempting reconnection after backoff"
         );
-        tokio::time::sleep(backoff).await;
+        tokio::time::sleep(*backoff).await;
 
-        // Try to create a new connection
-        let success = match McpClient::connect(self.name.clone(), &self.transport_config).await {
+        match self.connect_replacement().await {
             Ok(new_client) => {
                 tracing::info!(server = %self.name, "reconnection successful");
-                // Swap the client under write lock
-                {
-                    let mut inner = self.inner.write().await;
-                    *inner = Arc::new(new_client);
-                }
-                // Reset backoff on success
-                {
-                    let mut guard = self.current_backoff.lock().await;
-                    *guard = Duration::from_secs(1);
-                }
+                *self.inner.write().await = new_client;
+                *backoff = Duration::from_secs(1);
                 true
             }
             Err(e) => {
@@ -124,24 +111,60 @@ impl ReconnectingClient {
                     error = %e,
                     "reconnection failed"
                 );
-                // Increase backoff (exponential, capped)
-                {
-                    let mut guard = self.current_backoff.lock().await;
-                    *guard = (*guard * 2).min(self.max_backoff);
-                }
+                *backoff = (*backoff * 2).min(self.max_backoff);
                 false
             }
-        };
+        }
+    }
 
-        self.reconnecting.store(false, Ordering::SeqCst);
-        // Wake ALL waiting callers so they can retry with the new client
-        self.reconnect_done.notify_waiters();
-        success
+    async fn connect_replacement(&self) -> anyhow::Result<ActiveConnection> {
+        let name = self.name.clone();
+        let config = self.transport_config.clone();
+        let connect = async move {
+            let client = McpClient::connect(name, &config).await?;
+            let tools = tokio::time::timeout(DEFAULT_CATALOG_TIMEOUT, client.list_tools())
+                .await
+                .context("replacement tool catalog discovery timed out")??;
+            Ok(ActiveConnection {
+                client: Arc::new(client),
+                tool_names: Some(tools.into_iter().map(|tool| tool.name).collect()),
+            })
+        };
+        let Some(runtime) = &self.runtime else {
+            return connect.await;
+        };
+        // Dropping the caller also cancels a replacement still being established.
+        let mut connection = JoinSet::new();
+        connection.spawn_on(connect, runtime);
+        connection
+            .join_next()
+            .await
+            .context("missing reconnection task")?
+            .context("reconnection task failed")?
     }
 
     /// Get a clone of the current inner client.
     async fn current_client(&self) -> Arc<McpClient> {
-        self.inner.read().await.clone()
+        self.inner.read().await.client.clone()
+    }
+
+    async fn client_for_tool(
+        &self,
+        server: &str,
+        tool: &str,
+    ) -> Result<Arc<McpClient>, DispatchError> {
+        let active = self.inner.read().await;
+        if active
+            .tool_names
+            .as_ref()
+            .is_some_and(|tools| !tools.contains(tool))
+        {
+            return Err(DispatchError::ToolNotFound {
+                server: server.into(),
+                tool: tool.into(),
+            });
+        }
+        Ok(active.client.clone())
     }
 }
 
@@ -153,29 +176,18 @@ impl ToolDispatcher for ReconnectingClient {
         tool: &str,
         args: Value,
     ) -> Result<Value, forge_error::DispatchError> {
-        let client = self.current_client().await;
-        let result = client.call_tool(server, tool, args.clone()).await;
-
-        match result {
-            Err(forge_error::DispatchError::TransportDead { .. }) => {
-                tracing::warn!(
-                    server = %self.name,
-                    tool = %tool,
-                    "transport dead, attempting reconnection"
-                );
-                if self.try_reconnect().await {
-                    // Retry once with the new client
-                    let new_client = self.current_client().await;
-                    new_client.call_tool(server, tool, args).await
-                } else {
-                    Err(forge_error::DispatchError::TransportDead {
-                        server: self.name.clone(),
-                        reason: "reconnection failed".into(),
-                    })
-                }
-            }
-            other => other,
+        let client = self.client_for_tool(server, tool).await?;
+        let result = client.call_tool(server, tool, args).await;
+        if matches!(result, Err(DispatchError::TransportDead { .. })) {
+            tracing::warn!(
+                server = %self.name,
+                tool = %tool,
+                "transport lost during tool call, reconnecting for future requests"
+            );
+            // The peer may have applied effects before its response was lost.
+            self.try_reconnect(&client).await;
         }
+        result
     }
 }
 
@@ -196,7 +208,7 @@ impl ResourceDispatcher for ReconnectingClient {
                     uri = %uri,
                     "transport dead, attempting reconnection"
                 );
-                if self.try_reconnect().await {
+                if self.try_reconnect(&client).await {
                     let new_client = self.current_client().await;
                     ResourceDispatcher::read_resource(new_client.as_ref(), server, uri).await
                 } else {

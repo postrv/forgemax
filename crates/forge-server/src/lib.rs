@@ -23,7 +23,7 @@ use forge_sandbox::{
 };
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
+use rmcp::model::{Implementation, ServerCapabilities, ServerConfig};
 use rmcp::schemars::JsonSchema;
 use rmcp::{tool, tool_handler, tool_router, ServerHandler};
 use serde::Deserialize;
@@ -238,15 +238,12 @@ impl ForgeServer {
         dispatcher: Arc<dyn ToolDispatcher>,
         resource_dispatcher: Option<Arc<dyn ResourceDispatcher>>,
     ) -> Self {
-        Self {
-            executor: Arc::new(SandboxExecutor::new(config)),
-            manifest: LiveManifest::new(manifest),
+        Self::new_with_executor(
+            SandboxExecutor::new(config),
+            manifest,
             dispatcher,
             resource_dispatcher,
-            group_policy: None,
-            session_stash: None,
-            tool_router: Self::tool_router(),
-        }
+        )
     }
 
     /// Set a group policy for cross-server data flow enforcement.
@@ -274,16 +271,17 @@ impl ForgeServer {
     /// Create a new Forge server with a pre-configured executor.
     ///
     /// Use this when you need to attach a worker pool to the executor
-    /// before wrapping it in the server.
+    /// before wrapping it in the server. Pass a `LiveManifest` to share
+    /// catalog updates with the dispatcher.
     pub fn new_with_executor(
         executor: SandboxExecutor,
-        manifest: Manifest,
+        manifest: impl Into<LiveManifest>,
         dispatcher: Arc<dyn ToolDispatcher>,
         resource_dispatcher: Option<Arc<dyn ResourceDispatcher>>,
     ) -> Self {
         Self {
             executor: Arc::new(executor),
-            manifest: LiveManifest::new(manifest),
+            manifest: manifest.into(),
             dispatcher,
             resource_dispatcher,
             group_policy: None,
@@ -294,8 +292,7 @@ impl ForgeServer {
 
     /// Get a reference to the live manifest for external updates.
     ///
-    /// Background tasks can call [`LiveManifest::update()`] to refresh
-    /// the manifest without restarting the server.
+    /// Background tasks can publish a new snapshot without restarting the server.
     pub fn live_manifest(&self) -> &LiveManifest {
         &self.manifest
     }
@@ -456,7 +453,7 @@ impl ForgeServer {
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for ForgeServer {
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> ServerConfig {
         let manifest = self.manifest.current();
         let stats = format!(
             "{} servers, {} tools",
@@ -464,7 +461,7 @@ impl ServerHandler for ForgeServer {
             manifest.total_tools(),
         );
 
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_instructions(format!(
                 "Forgemax Code Mode Gateway ({stats}). \
                  Use search() to discover available tools, then execute() to call them.\n\

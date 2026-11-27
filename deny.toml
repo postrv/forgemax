@@ -1,7 +1,7 @@
 # cargo-deny configuration for Forgemax
 # https://embarkstudios.github.io/cargo-deny/
 #
-# Run: cargo deny check --all-features
+# Run: cargo deny --locked --all-features check
 
 [graph]
 all-features = true

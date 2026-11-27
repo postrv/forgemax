@@ -15,14 +15,23 @@ pub mod timeout;
 
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::error::Error as _;
+use std::io::ErrorKind;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use forge_sandbox::{ResourceDispatcher, ToolDispatcher};
-use rmcp::model::{CallToolRequestParams, CallToolResult, Content, RawContent};
-use rmcp::service::RunningService;
-use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
-use rmcp::transport::{ConfigureCommandExt, StreamableHttpClientTransport, TokioChildProcess};
-use rmcp::{RoleClient, ServiceExt};
+use rmcp::model::{
+    CallToolRequestParams, CallToolResult, ContentBlock, ErrorCode, ProtocolVersion,
+};
+use rmcp::service::{RunningService, ServiceError};
+use rmcp::transport::streamable_http_client::{
+    StreamableHttpClientTransportConfig, StreamableHttpError,
+};
+use rmcp::transport::{
+    ConfigureCommandExt, IntoTransport, StreamableHttpClientTransport, TokioChildProcess,
+};
+use rmcp::{ClientCacheConfig, ClientLifecycleMode, ClientServiceExt, RoleClient};
 use serde_json::Value;
 use tokio::process::Command;
 
@@ -86,6 +95,36 @@ const STDIO_ENV_PASSTHROUGH: &[&str] = &[
     "SSL_CERT_FILE",
     "SSL_CERT_DIR",
 ];
+
+/// Default deadline for one downstream discovery operation.
+pub const DEFAULT_CATALOG_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn downstream_lifecycle() -> ClientLifecycleMode {
+    ClientLifecycleMode::Auto {
+        preferred_versions: vec![ProtocolVersion::V_2026_07_28],
+        legacy_version: Some(ProtocolVersion::V_2025_11_25),
+    }
+}
+
+async fn serve_downstream<T, E, A>(transport: T) -> Result<RunningService<RoleClient, ()>>
+where
+    T: IntoTransport<RoleClient, E, A>,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    // Leave time for the SDK's modern discovery probe and a legacy fallback.
+    let service = tokio::time::timeout(
+        Duration::from_secs(30),
+        ().serve_with_lifecycle(transport, downstream_lifecycle()),
+    )
+    .await
+    .context("MCP handshake timed out after 30 seconds")??;
+    // Explicit refreshes need the live catalog, including removals.
+    service
+        .peer()
+        .set_response_cache_config(ClientCacheConfig::disabled())
+        .await;
+    Ok(service)
+}
 
 fn stdio_child_env(explicit: &HashMap<String, String>) -> HashMap<String, String> {
     let mut env = HashMap::new();
@@ -251,8 +290,7 @@ impl McpClient {
             )
         })?;
 
-        let service: RunningService<RoleClient, ()> = ()
-            .serve(transport)
+        let service = serve_downstream(transport)
             .await
             .with_context(|| format!("MCP handshake failed for server '{}'", name))?;
 
@@ -289,7 +327,9 @@ impl McpClient {
             "connecting to downstream MCP server (HTTP)"
         );
 
-        let mut config = StreamableHttpClientTransportConfig::with_uri(url);
+        // Keep recovery in ReconnectingClient, where it is limited to future calls.
+        let mut config =
+            StreamableHttpClientTransportConfig::with_uri(url).reinit_on_expired_session(false);
 
         // Fail-closed: reject credentials on plain HTTP
         if let Some(ref hdrs) = headers {
@@ -310,8 +350,7 @@ impl McpClient {
         }
 
         let transport = StreamableHttpClientTransport::with_client(http_client()?, config);
-        let service: RunningService<RoleClient, ()> = ()
-            .serve(transport)
+        let service = serve_downstream(transport)
             .await
             .with_context(|| format!("MCP handshake failed for server '{}' (HTTP)", name))?;
 
@@ -344,9 +383,14 @@ impl McpClient {
 
     /// List all tools available on this server.
     pub async fn list_tools(&self) -> Result<Vec<ToolInfo>> {
-        let tools = self
-            .inner
-            .peer()
+        let peer = self.inner.peer();
+        if peer
+            .peer_info()
+            .is_some_and(|info| info.capabilities.tools.is_none())
+        {
+            return Ok(Vec::new());
+        }
+        let tools = peer
             .list_all_tools()
             .await
             .with_context(|| format!("failed to list tools for server '{}'", self.name))?;
@@ -367,11 +411,16 @@ impl McpClient {
     /// Returns an empty Vec if the server does not support resources
     /// (graceful degradation — not all MCP servers implement resources/list).
     pub async fn list_resources(&self) -> Result<Vec<ResourceInfo>> {
-        let result = self.inner.peer().list_resources(None).await;
+        let peer = self.inner.peer();
+        if peer
+            .peer_info()
+            .is_some_and(|info| info.capabilities.resources.is_none())
+        {
+            return Ok(Vec::new());
+        }
 
-        match result {
-            Ok(list) => Ok(list
-                .resources
+        match peer.list_all_resources().await {
+            Ok(resources) => Ok(resources
                 .into_iter()
                 .map(|r| ResourceInfo {
                     uri: r.uri.clone(),
@@ -380,26 +429,12 @@ impl McpClient {
                     mime_type: r.mime_type.clone(),
                 })
                 .collect()),
-            Err(e) => {
-                let err_str = e.to_string();
-                // Graceful degradation: treat "method not found" as "no resources"
-                if err_str.contains("Method not found")
-                    || err_str.contains("method not found")
-                    || err_str.contains("-32601")
-                {
-                    tracing::debug!(
-                        server = %self.name,
-                        "server does not support resources/list, returning empty"
-                    );
-                    Ok(vec![])
-                } else {
-                    Err(anyhow::anyhow!(
-                        "failed to list resources for server '{}': {}",
-                        self.name,
-                        e
-                    ))
-                }
+            Err(ServiceError::McpError(error)) if error.code == ErrorCode::METHOD_NOT_FOUND => {
+                tracing::debug!(server = %self.name, "server does not support resources/list");
+                Ok(Vec::new())
             }
+            Err(e) => Err(e)
+                .with_context(|| format!("failed to list resources for server '{}'", self.name)),
         }
     }
 
@@ -480,11 +515,23 @@ impl ToolDispatcher for McpClient {
             .await
             .map_err(|e| {
                 let msg = format!("tool call failed: tool='{}': {}", tool, e);
-                let err_str = e.to_string();
-                if is_transport_dead(&err_str) {
+                if is_transport_dead(&e) {
                     forge_error::DispatchError::TransportDead {
                         server: self.name.clone(),
-                        reason: msg,
+                        reason: format!("{msg}. The tool outcome is unknown"),
+                    }
+                } else if matches!(
+                    e,
+                    ServiceError::TransportSend(_)
+                        | ServiceError::Timeout { .. }
+                        | ServiceError::UnexpectedResponse
+                        | ServiceError::Cancelled { .. }
+                ) && !e.is_authorization_required()
+                {
+                    forge_error::DispatchError::ToolOutcomeUnknown {
+                        server: self.name.clone(),
+                        tool: tool.into(),
+                        reason: e.to_string(),
                     }
                 } else {
                     forge_error::DispatchError::Upstream {
@@ -497,26 +544,20 @@ impl ToolDispatcher for McpClient {
         // Tool-level errors (isError: true) mean the server is healthy but
         // the tool rejected the request (wrong params, missing state, etc.).
         // These must NOT trip the circuit breaker.
-        if result.is_error == Some(true) && result.structured_content.is_none() {
-            let error_text = result
-                .content
-                .iter()
-                .filter_map(|c| match &c.raw {
-                    RawContent::Text(t) => Some(t.text.as_str()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            return Err(forge_error::DispatchError::ToolError {
-                server: self.name.clone(),
-                tool: tool.to_string(),
-                message: format!("tool returned error: {}", error_text),
-            });
-        }
-
-        call_tool_result_to_value(result).map_err(|e| forge_error::DispatchError::Upstream {
-            server: self.name.clone(),
-            message: e.to_string(),
+        let tool_failed = result.is_error == Some(true);
+        call_tool_result_to_value(result).map_err(|error| {
+            if tool_failed {
+                forge_error::DispatchError::ToolError {
+                    server: self.name.clone(),
+                    tool: tool.to_string(),
+                    message: error.to_string(),
+                }
+            } else {
+                forge_error::DispatchError::Upstream {
+                    server: self.name.clone(),
+                    message: error.to_string(),
+                }
+            }
         })
     }
 }
@@ -530,8 +571,9 @@ impl ResourceDispatcher for McpClient {
     ) -> Result<Value, forge_error::DispatchError> {
         self.read_resource(uri).await.map_err(|e| {
             let msg = format!("resource read failed: uri='{}': {}", uri, e);
-            let err_str = e.to_string();
-            if is_transport_dead(&err_str) {
+            if e.downcast_ref::<ServiceError>()
+                .is_some_and(is_transport_dead)
+            {
                 forge_error::DispatchError::TransportDead {
                     server: self.name.clone(),
                     reason: msg,
@@ -546,17 +588,34 @@ impl ResourceDispatcher for McpClient {
     }
 }
 
-/// Returns true if the error string indicates a permanently dead transport.
-///
-/// Detects patterns from rmcp's internal channel overflow, broken pipes,
-/// and closed transports that indicate the MCP client session is unrecoverable.
-fn is_transport_dead(err_str: &str) -> bool {
-    err_str.contains("TransportClosed")
-        || err_str.contains("transport closed")
-        || err_str.contains("channel closed")
-        || err_str.contains("broken pipe")
-        || err_str.contains("Broken pipe")
-        || err_str.contains("BrokenPipe")
+/// Classify transport loss by type. JSON-RPC error messages come from the peer.
+fn is_transport_dead(error: &ServiceError) -> bool {
+    let ServiceError::TransportSend(transport) = error else {
+        return matches!(error, ServiceError::TransportClosed);
+    };
+    let mut cause = transport.source();
+    while let Some(error) = cause {
+        if matches!(
+            error.downcast_ref::<StreamableHttpError<reqwest::Error>>(),
+            Some(StreamableHttpError::SessionExpired)
+        ) {
+            return true;
+        }
+        if error.downcast_ref::<std::io::Error>().is_some_and(|error| {
+            matches!(
+                error.kind(),
+                ErrorKind::BrokenPipe
+                    | ErrorKind::ConnectionAborted
+                    | ErrorKind::ConnectionReset
+                    | ErrorKind::NotConnected
+                    | ErrorKind::UnexpectedEof
+            )
+        }) {
+            return true;
+        }
+        cause = error.source();
+    }
+    false
 }
 
 /// Convert a resource content item to a JSON Value.
@@ -574,26 +633,33 @@ fn resource_content_to_value(content: &rmcp::model::ResourceContents) -> Result<
             "data": blob,
             "mime_type": mime_type.as_deref().unwrap_or("application/octet-stream"),
         })),
+        _ => Err(anyhow::anyhow!("unsupported resource content")),
     }
 }
 
 /// Convert an MCP CallToolResult to a JSON Value.
 fn call_tool_result_to_value(result: CallToolResult) -> Result<Value> {
-    if let Some(structured) = result.structured_content {
-        return Ok(structured);
-    }
-
     if result.is_error == Some(true) {
         let error_text = result
             .content
             .iter()
-            .filter_map(|c| match &c.raw {
-                RawContent::Text(t) => Some(t.text.as_str()),
+            .filter_map(|c| match c {
+                ContentBlock::Text(t) if !t.text.trim().is_empty() => Some(t.text.as_str()),
                 _ => None,
             })
             .collect::<Vec<_>>()
             .join("\n");
-        return Err(anyhow::anyhow!("tool returned error: {}", error_text));
+        let details = match (error_text.is_empty(), result.structured_content) {
+            (true, Some(Value::String(text))) => text,
+            (true, Some(value)) => value.to_string(),
+            _ => error_text,
+        };
+        let end = floor_char_boundary(&details, MAX_TEXT_CONTENT_SIZE);
+        return Err(anyhow::anyhow!("tool returned error: {}", &details[..end]));
+    }
+
+    if let Some(structured) = result.structured_content {
+        return Ok(structured);
     }
 
     if result.content.len() == 1 {
@@ -629,9 +695,9 @@ fn floor_char_boundary(s: &str, max: usize) -> usize {
 ///
 /// Binary content (images, audio) larger than [`MAX_BINARY_CONTENT_SIZE`] is
 /// replaced with truncation metadata to prevent OOM on large base64 payloads.
-fn content_to_value(content: &Content) -> Result<Value> {
-    match &content.raw {
-        RawContent::Text(t) => {
+fn content_to_value(content: &ContentBlock) -> Result<Value> {
+    match content {
+        ContentBlock::Text(t) => {
             if t.text.len() > MAX_TEXT_CONTENT_SIZE {
                 let preview_end = floor_char_boundary(&t.text, 1024);
                 Ok(serde_json::json!({
@@ -644,7 +710,7 @@ fn content_to_value(content: &Content) -> Result<Value> {
                 serde_json::from_str(&t.text).or_else(|_| Ok(Value::String(t.text.clone())))
             }
         }
-        RawContent::Image(img) => {
+        ContentBlock::Image(img) => {
             if img.data.len() > MAX_BINARY_CONTENT_SIZE {
                 Ok(serde_json::json!({
                     "type": "image",
@@ -660,11 +726,11 @@ fn content_to_value(content: &Content) -> Result<Value> {
                 }))
             }
         }
-        RawContent::Resource(r) => Ok(serde_json::json!({
+        ContentBlock::Resource(r) => Ok(serde_json::json!({
             "type": "resource",
             "resource": serde_json::to_value(&r.resource).unwrap_or(Value::Null),
         })),
-        RawContent::Audio(a) => {
+        ContentBlock::Audio(a) => {
             if a.data.len() > MAX_BINARY_CONTENT_SIZE {
                 Ok(serde_json::json!({
                     "type": "audio",
@@ -761,18 +827,17 @@ fn sanitize_headers_for_transport(url: &str, headers: &mut HashMap<String, Strin
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rmcp::model::{Content, RawContent};
 
     #[test]
     fn content_to_value_text_string() {
-        let content = Content::text("hello");
+        let content = ContentBlock::text("hello");
         let val = content_to_value(&content).unwrap();
         assert_eq!(val, Value::String("hello".into()));
     }
 
     #[test]
     fn content_to_value_text_json() {
-        let content = Content::text(r#"{"k":"v"}"#);
+        let content = ContentBlock::text(r#"{"k":"v"}"#);
         let val = content_to_value(&content).unwrap();
         assert_eq!(val, serde_json::json!({"k": "v"}));
     }
@@ -780,7 +845,7 @@ mod tests {
     #[test]
     fn content_to_value_small_image_preserved() {
         let small_data = "a".repeat(1024); // 1KB
-        let content = Content::image(small_data.clone(), "image/png");
+        let content = ContentBlock::image(small_data.clone(), "image/png");
         let val = content_to_value(&content).unwrap();
         assert_eq!(val["type"], "image");
         assert_eq!(val["data"], small_data);
@@ -790,7 +855,7 @@ mod tests {
     #[test]
     fn content_to_value_oversized_image_truncated() {
         let large_data = "a".repeat(2 * 1024 * 1024); // 2MB
-        let content = Content::image(large_data, "image/png");
+        let content = ContentBlock::image(large_data, "image/png");
         let val = content_to_value(&content).unwrap();
         assert_eq!(val["type"], "image");
         assert_eq!(val["truncated"], true);
@@ -801,13 +866,7 @@ mod tests {
     #[test]
     fn content_to_value_oversized_audio_truncated() {
         let large_data = "a".repeat(2 * 1024 * 1024); // 2MB
-        let content = Content {
-            raw: RawContent::Audio(rmcp::model::RawAudioContent {
-                data: large_data,
-                mime_type: "audio/wav".into(),
-            }),
-            annotations: None,
-        };
+        let content = ContentBlock::audio(large_data, "audio/wav");
         let val = content_to_value(&content).unwrap();
         assert_eq!(val["type"], "audio");
         assert_eq!(val["truncated"], true);
@@ -817,7 +876,7 @@ mod tests {
     #[test]
     fn content_to_value_oversized_text_truncated() {
         let large_text = "x".repeat(11 * 1024 * 1024); // 11MB
-        let content = Content::text(large_text);
+        let content = ContentBlock::text(large_text);
         let val = content_to_value(&content).unwrap();
         assert_eq!(val["type"], "text");
         assert_eq!(val["truncated"], true);
@@ -828,7 +887,7 @@ mod tests {
     #[test]
     fn content_to_value_oversized_text_truncates_on_char_boundary() {
         let large_text = "€".repeat((MAX_TEXT_CONTENT_SIZE / 3) + 100);
-        let content = Content::text(large_text);
+        let content = ContentBlock::text(large_text);
         let val = content_to_value(&content).unwrap();
         assert_eq!(val["type"], "text");
         assert_eq!(val["truncated"], true);
@@ -838,7 +897,7 @@ mod tests {
     #[test]
     fn content_to_value_normal_text_not_truncated() {
         let normal_text = "x".repeat(1024); // 1KB — well under limit
-        let content = Content::text(normal_text.clone());
+        let content = ContentBlock::text(normal_text.clone());
         let val = content_to_value(&content).unwrap();
         assert_eq!(val, Value::String(normal_text));
     }
@@ -1078,7 +1137,7 @@ mod tests {
 
     #[test]
     fn call_tool_result_is_error_true_returns_err() {
-        let result = CallToolResult::error(vec![Content::text(
+        let result = CallToolResult::error(vec![ContentBlock::text(
             "Invalid params: missing field 'base_url'",
         )]);
         let err = call_tool_result_to_value(result);
@@ -1092,38 +1151,39 @@ mod tests {
 
     #[test]
     fn call_tool_result_success_returns_ok() {
-        let result = CallToolResult::success(vec![Content::text(r#"{"status": "ok"}"#)]);
+        let result = CallToolResult::success(vec![ContentBlock::text(r#"{"status": "ok"}"#)]);
         let val = call_tool_result_to_value(result).unwrap();
         assert_eq!(val["status"], "ok");
     }
 
     #[test]
-    fn call_tool_result_structured_content_takes_priority_over_is_error() {
-        let structured = serde_json::json!({"data": "important"});
-        let mut result = CallToolResult::error(vec![Content::text("error text")]);
-        result.structured_content = Some(structured.clone());
-        let val = call_tool_result_to_value(result).unwrap();
-        assert_eq!(val, structured);
+    fn call_tool_result_structured_error_remains_an_error() {
+        let mut result = CallToolResult::error(vec![]);
+        result.structured_content = Some(serde_json::json!({"message":"error details"}));
+        let error = call_tool_result_to_value(result).unwrap_err();
+        assert!(error.to_string().contains("error details"));
     }
 
     // --- Transport death detection tests ---
 
     #[test]
     fn transport_dead_detects_transport_closed() {
-        assert!(is_transport_dead("TransportClosed: channel full"));
-        assert!(is_transport_dead("error: transport closed unexpectedly"));
-        assert!(is_transport_dead("channel closed by peer"));
-        assert!(is_transport_dead("broken pipe while writing"));
-        assert!(is_transport_dead("Broken pipe (os error 32)"));
-        assert!(is_transport_dead("BrokenPipe"));
+        assert!(is_transport_dead(&ServiceError::TransportClosed));
+        let error = rmcp::transport::DynamicTransportError::from_parts(
+            "fixture",
+            std::any::TypeId::of::<()>(),
+            Box::new(std::io::Error::from(ErrorKind::BrokenPipe)),
+        );
+        assert!(is_transport_dead(&ServiceError::TransportSend(error)));
     }
 
     #[test]
-    fn transport_dead_rejects_normal_errors() {
-        assert!(!is_transport_dead("tool not found: echo"));
-        assert!(!is_transport_dead("timeout after 5000ms"));
-        assert!(!is_transport_dead("Invalid params: missing field"));
-        assert!(!is_transport_dead("connection refused"));
+    fn transport_dead_ignores_remote_error_text() {
+        let error = ServiceError::McpError(rmcp::ErrorData::internal_error(
+            "broken pipe while doing work",
+            None,
+        ));
+        assert!(!is_transport_dead(&error));
     }
 
     /// Compile-time guard: TransportConfig is #[non_exhaustive].

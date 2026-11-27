@@ -4,7 +4,7 @@
 //! Provides [`AuditEvent`] — a structured, serializable audit record
 //! for tracking gateway operations.
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::Serialize;
 
 /// A structured audit event emitted by the Forge gateway.
@@ -14,7 +14,7 @@ use serde::Serialize;
 #[non_exhaustive]
 pub struct AuditEvent {
     /// When the event occurred.
-    pub timestamp: DateTime<Utc>,
+    pub timestamp: Timestamp,
     /// The type of event.
     pub event_type: String,
     /// Human-readable description.
@@ -25,7 +25,7 @@ impl AuditEvent {
     /// Create a new audit event with the current timestamp.
     pub fn new(event_type: impl Into<String>, description: impl Into<String>) -> Self {
         Self {
-            timestamp: Utc::now(),
+            timestamp: Timestamp::now(),
             event_type: event_type.into(),
             description: description.into(),
         }
@@ -43,5 +43,23 @@ mod tests {
         assert!(json.contains("test_event"));
         assert!(json.contains("a test audit event"));
         assert!(json.contains("timestamp"));
+    }
+
+    #[test]
+    fn audit_timestamp_remains_an_rfc3339_utc_string() {
+        for previous in [
+            "2026-11-24T22:45:00Z",
+            "2026-11-24T22:45:00.120Z",
+            "2026-11-24T22:45:00.123456Z",
+            "2026-11-24T22:45:00.123456789Z",
+        ] {
+            let timestamp: Timestamp = serde_json::from_value(serde_json::json!(previous)).unwrap();
+            let mut event = AuditEvent::new("fixture", "audit record");
+            event.timestamp = timestamp;
+            let serialized = serde_json::to_value(event).unwrap();
+            let wire = serialized["timestamp"].as_str().unwrap();
+            assert!(wire.ends_with('Z'), "{wire}");
+            assert_eq!(wire.parse::<Timestamp>().unwrap(), timestamp);
+        }
     }
 }

@@ -2,6 +2,17 @@
 
 All notable changes to Forgemax will be documented in this file.
 
+## [0.7.0]
+
+- Upgrade to `rmcp 3.12.0` and support modern MCP discovery with legacy initialization over stdio and downstream Streamable HTTP.
+- Publish refreshed tool catalogs and routing names together. Preserve a failed server's last listing and validate replacement connections against their current tool list.
+- Return uncertain tool outcomes without replaying the original call. Preserve downstream tool error status when the error includes structured content.
+- Bound downstream handshakes and catalog discovery. Update audited dependencies and use Jiff for the gateway's UTC audit timestamps.
+- Refresh the locked dependency graph for Rust 1.93.0, including the TLS stack, Deno Core, the JavaScript parser, TOML, and Prometheus. Prometheus counters now expose `forge_executions_total` and `forge_errors_total` with a single suffix.
+- Pin the updated CI and release actions by commit, verify V8 archive digests, and require a native gateway and worker smoke test for every release target. Publish transitive dependency SBOMs for both binaries.
+- Validate the resolved worker and its installation path before launch. A configured worker override must resolve successfully.
+- Verify locked crate packaging before publication. Share the locked registry publisher between the release and recovery workflows.
+
 ## [0.6.1] - 2026-10-09
 
 ### Security

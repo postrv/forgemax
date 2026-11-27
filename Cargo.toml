@@ -14,7 +14,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.6.1"
+version = "0.7.0"
 edition = "2021"
 license = "FSL-1.1-ALv2"
 rust-version = "1.93.0"
@@ -36,8 +36,8 @@ strip = true
 
 [workspace.dependencies]
 # Core runtime
-deno_core = "0.412"
-tokio = { version = "1", features = ["full"] }
+deno_core = "0.413"
+tokio = { version = "1.53.3", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 
@@ -56,14 +56,14 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # MCP protocol
-rmcp = { version = "1.8", features = ["server", "macros", "transport-io"] }
+rmcp = { version = "=3.12.0", default-features = false, features = ["base64"] }
 schemars = "1.0"
 
 # AST validation (oxc)
-oxc_parser = "0.130"
-oxc_ast = "0.130"
-oxc_span = "0.130"
-oxc_allocator = "0.130"
+oxc_parser = "0.133"
+oxc_ast = "0.133"
+oxc_span = "0.133"
+oxc_allocator = "0.133"
 
 # Fuzzy matching
 strsim = "0.11"
@@ -80,13 +80,13 @@ notify = "8"
 # Security / audit
 sha2 = "0.11"
 uuid = { version = "1", features = ["v4"] }
-chrono = { version = "0.4", features = ["serde"] }
+jiff = { version = "1.0.3", default-features = false, features = ["std", "serde"] }
 
 # Internal crates
-forge-sandbox = { path = "crates/forge-sandbox", version = "0.6.1" }
-forge-manifest = { path = "crates/forge-manifest", version = "0.6.1" }
-forge-server = { path = "crates/forge-server", version = "0.6.1" }
-forge-client = { path = "crates/forge-client", version = "0.6.1" }
-forge-config = { path = "crates/forge-config", version = "0.6.1" }
-forge-error = { path = "crates/forge-error", version = "0.6.1" }
-forge-audit = { path = "crates/forge-audit", version = "0.6.1" }
+forge-sandbox = { path = "crates/forge-sandbox", version = "0.7.0" }
+forge-manifest = { path = "crates/forge-manifest", version = "0.7.0" }
+forge-server = { path = "crates/forge-server", version = "0.7.0" }
+forge-client = { path = "crates/forge-client", version = "0.7.0" }
+forge-config = { path = "crates/forge-config", version = "0.7.0" }
+forge-error = { path = "crates/forge-error", version = "0.7.0" }
+forge-audit = { path = "crates/forge-audit", version = "0.7.0" }

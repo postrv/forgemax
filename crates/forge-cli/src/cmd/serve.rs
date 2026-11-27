@@ -4,14 +4,16 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
-use anyhow::Result;
-use forge_manifest::{server_entry_from_tools, LiveManifest, ManifestBuilder, McpTool};
+use anyhow::{Context, Result};
+use forge_manifest::LiveManifest;
 use forge_sandbox::audit::TracingAuditLogger;
 use forge_sandbox::groups::GroupPolicy;
 use forge_sandbox::ExecutionMode;
 use forge_server::ForgeServer;
 use rmcp::ServiceExt;
+use tokio::time::{self, Instant, MissedTickBehavior};
 
 use crate::common;
 
@@ -19,48 +21,35 @@ use crate::common;
 ///
 /// Errors from individual servers are logged but don't fail the whole refresh —
 /// the stale manifest is preserved for any server that can't be reached.
-async fn refresh_manifest(
-    clients: &[(String, String, Arc<forge_client::McpClient>)],
-    live: &LiveManifest,
-) -> Result<()> {
-    let mut builder = ManifestBuilder::new();
-    let mut errors = 0;
+async fn refresh_manifest(sources: &[common::CatalogSource], live: &LiveManifest) {
+    let mut next = (*live.snapshot()).clone();
+    let manifest = Arc::make_mut(&mut next.manifest);
+    let mut updated = false;
 
-    for (name, description, client) in clients {
-        match client.list_tools().await {
+    for (source, entry) in sources.iter().zip(&mut manifest.servers) {
+        match source.list_tools().await {
             Ok(tools) => {
-                let mcp_tools: Vec<McpTool> = tools
-                    .into_iter()
-                    .map(|t| McpTool {
-                        name: t.name,
-                        description: t.description,
-                        input_schema: Some(t.input_schema),
-                    })
-                    .collect();
-                let entry = server_entry_from_tools(name, description, mcp_tools);
-                builder = builder.add_server(entry);
-                tracing::debug!(server = %name, "manifest refresh: server OK");
+                let (updated_entry, tool_names) =
+                    common::catalog_entry(&source.name, &entry.description, tools);
+                entry.categories = updated_entry.categories;
+                next.tool_names.insert(source.name.clone(), tool_names);
+                updated = true;
+                tracing::debug!(server = %source.name, "manifest refresh: server OK");
             }
             Err(e) => {
-                errors += 1;
-                tracing::warn!(server = %name, error = %e, "manifest refresh: server failed, keeping stale data");
+                tracing::warn!(server = %source.name, error = %e, "manifest refresh: server failed, keeping stale data");
             }
         }
     }
 
-    if errors == clients.len() && !clients.is_empty() {
-        tracing::warn!("manifest refresh: all servers failed, keeping stale manifest");
-    } else {
-        let new_manifest = builder.build();
+    if updated {
         tracing::info!(
-            servers = new_manifest.total_servers(),
-            tools = new_manifest.total_tools(),
+            servers = manifest.total_servers(),
+            tools = manifest.total_tools(),
             "manifest refreshed"
         );
-        live.update(new_manifest);
+        live.publish(next);
     }
-
-    Ok(())
 }
 
 /// Execute the serve command (start the MCP gateway).
@@ -70,13 +59,15 @@ pub async fn execute(config_path: Option<PathBuf>) -> Result<()> {
 
     // Connect to downstream servers and build manifest
     let result = common::connect_and_build_manifest(&config).await?;
-
-    tracing::info!(
-        servers = result.manifest.total_servers(),
-        tools = result.manifest.total_tools(),
-        has_resources = result.resource_dispatcher.is_some(),
-        "Forgemax Code Mode Gateway starting"
-    );
+    {
+        let initial_manifest = result.manifest.current();
+        tracing::info!(
+            servers = initial_manifest.total_servers(),
+            tools = initial_manifest.total_tools(),
+            has_resources = result.resource_dispatcher.is_some(),
+            "Forgemax Code Mode Gateway starting"
+        );
+    }
 
     // Build group policy if groups are configured
     let group_policy = if !config.groups.is_empty() {
@@ -139,68 +130,51 @@ pub async fn execute(config_path: Option<PathBuf>) -> Result<()> {
         server
     };
 
-    // Clone the live manifest reference for background refresh
-    let live_manifest = server.live_manifest().clone();
-
-    // Serve over stdio (standard MCP transport)
-    let service = server.serve(rmcp::transport::io::stdio()).await?;
-
-    // Spawn periodic manifest refresh task if configured
-    let refresh_interval = config.manifest.refresh_interval_secs.unwrap_or(0);
-    let refresh_handle = if refresh_interval > 0 {
-        let live = live_manifest.clone();
-        let clients = result.client_refs.clone();
-        Some(tokio::spawn(async move {
-            let mut interval =
-                tokio::time::interval(std::time::Duration::from_secs(refresh_interval));
-            interval.tick().await; // skip the first immediate tick
-            loop {
-                interval.tick().await;
-                tracing::info!("periodic manifest refresh triggered");
-                let _ = refresh_manifest(&clients, &live).await;
-            }
-        }))
-    } else {
-        None
-    };
-
-    // Wait for either normal shutdown, ctrl-c, or SIGHUP
     #[cfg(unix)]
     let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
 
-    // Pin the service.waiting() future so we can poll it across loop iterations
-    let waiting = service.waiting();
-    tokio::pin!(waiting);
+    let live_manifest = server.live_manifest().clone();
+    let service = server.serve(rmcp::transport::io::stdio()).await?;
 
-    loop {
-        // Create a future that resolves on SIGHUP (Unix) or never resolves (non-Unix)
-        let sighup_fut = async {
-            #[cfg(unix)]
-            {
-                sighup.recv().await;
+    // Serialize both triggers to keep overlapping refreshes from publishing out of order.
+    let refresh_interval = config.manifest.refresh_interval_secs.unwrap_or(0);
+    let mut interval = if refresh_interval == 0 {
+        None
+    } else {
+        let period = Duration::from_secs(refresh_interval);
+        let start = Instant::now()
+            .checked_add(period)
+            .context("manifest.refresh_interval_secs is too large")?;
+        let mut interval = time::interval_at(start, period);
+        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        Some(interval)
+    };
+    let refresh = async {
+        loop {
+            tokio::select! {
+                _ = async {
+                    match &mut interval {
+                        Some(interval) => { interval.tick().await; }
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {}
+                _ = async {
+                    #[cfg(unix)]
+                    { sighup.recv().await; }
+                    #[cfg(not(unix))]
+                    std::future::pending::<()>().await
+                } => {}
             }
-            #[cfg(not(unix))]
-            {
-                std::future::pending::<()>().await;
-            }
-        };
-
-        tokio::select! {
-            result = &mut waiting => { result?; break; }
-            _ = tokio::signal::ctrl_c() => {
-                tracing::info!("received shutdown signal, stopping gracefully");
-                break;
-            }
-            _ = sighup_fut => {
-                tracing::info!("received SIGHUP, refreshing manifest");
-                let _ = refresh_manifest(&result.client_refs, &live_manifest).await;
-            }
+            refresh_manifest(&result.catalog_sources, &live_manifest).await;
         }
-    }
+    };
 
-    // Cancel periodic refresh task
-    if let Some(handle) = refresh_handle {
-        handle.abort();
+    tokio::select! {
+        result = service.waiting() => { result?; }
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("received shutdown signal, stopping gracefully");
+        }
+        _ = refresh => {}
     }
 
     // Shut down worker pool if active

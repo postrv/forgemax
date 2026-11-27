@@ -1,17 +1,20 @@
 //! Shared utility functions used by multiple CLI subcommands.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use forge_client::{
     CircuitBreakerConfig, CircuitBreakerDispatcher, CircuitBreakerResourceDispatcher, McpClient,
-    RouterDispatcher, RouterResourceDispatcher, TimeoutDispatcher, TimeoutResourceDispatcher,
-    TransportConfig,
+    ReconnectingClient, RouterDispatcher, RouterResourceDispatcher, TimeoutDispatcher,
+    TimeoutResourceDispatcher, ToolInfo, TransportConfig, DEFAULT_CATALOG_TIMEOUT,
 };
 use forge_config::ForgeConfig;
-use forge_manifest::{server_entry_from_tools, ManifestBuilder, McpTool};
+use forge_manifest::{
+    server_entry_from_tools, LiveManifest, ManifestBuilder, ManifestSnapshot, McpTool, ServerEntry,
+};
 use forge_sandbox::stash::StashConfig;
 use forge_sandbox::{ExecutionMode, ResourceDispatcher, SandboxConfig, ToolDispatcher};
 
@@ -22,9 +25,64 @@ pub struct ConnectResult {
     /// The resource router dispatcher (if any server exposes resources).
     pub resource_dispatcher: Option<Arc<dyn ResourceDispatcher>>,
     /// The built manifest.
-    pub manifest: forge_manifest::Manifest,
-    /// Client references for manifest refresh.
-    pub client_refs: Vec<(String, String, Arc<McpClient>)>,
+    pub manifest: LiveManifest,
+    /// Active connections in the same order as the servers in the manifest.
+    pub catalog_sources: Vec<CatalogSource>,
+}
+
+enum CatalogClient {
+    Direct(Arc<McpClient>),
+    Reconnecting(Arc<ReconnectingClient>),
+}
+
+/// A downstream server and the active client used to refresh its tool catalog.
+pub struct CatalogSource {
+    /// The configured name of the server.
+    pub name: String,
+    client: CatalogClient,
+    timeout: Duration,
+}
+
+impl CatalogSource {
+    /// Fetch the current list within the server's refresh deadline.
+    pub async fn list_tools(&self) -> Result<Vec<ToolInfo>> {
+        tokio::time::timeout(self.timeout, async {
+            match &self.client {
+                CatalogClient::Direct(client) => client.list_tools().await,
+                CatalogClient::Reconnecting(client) => client.list_tools().await,
+            }
+        })
+        .await
+        .context("catalog refresh timed out")?
+    }
+}
+
+fn catalog_timeout(config: &forge_config::ServerConfig) -> Duration {
+    config
+        .timeout_secs
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_CATALOG_TIMEOUT)
+}
+
+/// Build the discoverable entry and exact names from the same tool list.
+pub fn catalog_entry(
+    name: &str,
+    description: &str,
+    tools: Vec<ToolInfo>,
+) -> (ServerEntry, HashSet<String>) {
+    let tool_names = tools.iter().map(|tool| tool.name.clone()).collect();
+    let tools = tools
+        .into_iter()
+        .map(|tool| McpTool {
+            name: tool.name,
+            description: tool.description,
+            input_schema: Some(tool.input_schema),
+        })
+        .collect();
+    (
+        server_entry_from_tools(name, description, tools),
+        tool_names,
+    )
 }
 
 /// Build SandboxConfig from config overrides.
@@ -177,10 +235,9 @@ pub fn feature_status_line() -> String {
 /// Result of connecting to a single downstream server.
 struct ServerConnectionResult {
     name: String,
-    description: String,
+    entry: ServerEntry,
+    tool_names: HashSet<String>,
     client: Arc<McpClient>,
-    mcp_tools: Vec<McpTool>,
-    tool_names: Vec<String>,
     resources: Vec<forge_client::ResourceInfo>,
     server_config: forge_config::ServerConfig,
     transport_config: TransportConfig,
@@ -226,12 +283,18 @@ pub async fn connect_and_build_manifest(config: &ForgeConfig) -> Result<ConnectR
                 .await
                 .with_context(|| format!("failed to connect to server '{}'", name))?;
 
-            let tools = client
-                .list_tools()
+            let deadline = catalog_timeout(&server_config);
+            let tools = tokio::time::timeout(deadline, client.list_tools())
                 .await
-                .with_context(|| format!("failed to list tools for server '{}'", name))?;
+                .with_context(|| {
+                    format!("tool catalog discovery timed out for server '{name}'")
+                })??;
 
-            let resources = match client.list_resources().await {
+            let resources = match tokio::time::timeout(deadline, client.list_resources())
+                .await
+                .context("resource catalog discovery timed out")
+                .and_then(|result| result)
+            {
                 Ok(res) => {
                     if !res.is_empty() {
                         tracing::info!(
@@ -252,35 +315,21 @@ pub async fn connect_and_build_manifest(config: &ForgeConfig) -> Result<ConnectR
                 }
             };
 
-            let mcp_tools: Vec<McpTool> = tools
-                .into_iter()
-                .map(|t| McpTool {
-                    name: t.name,
-                    description: t.description,
-                    input_schema: Some(t.input_schema),
-                })
-                .collect();
-
-            let tool_names: Vec<String> = mcp_tools.iter().map(|t| t.name.clone()).collect();
-            let description = server_config
-                .description
-                .as_deref()
-                .unwrap_or("MCP server")
-                .to_string();
+            let description = server_config.description.as_deref().unwrap_or("MCP server");
+            let (entry, tool_names) = catalog_entry(&name, description, tools);
 
             tracing::info!(
                 server = %name,
-                tool_count = mcp_tools.len(),
+                tool_count = entry.total_tools(),
                 resource_count = resources.len(),
                 "discovered capabilities"
             );
 
             Ok(ServerConnectionResult {
                 name,
-                description,
-                client: Arc::new(client),
-                mcp_tools,
+                entry,
                 tool_names,
+                client: Arc::new(client),
                 resources,
                 server_config,
                 transport_config,
@@ -300,25 +349,23 @@ pub async fn connect_and_build_manifest(config: &ForgeConfig) -> Result<ConnectR
     let mut router = RouterDispatcher::new();
     let mut resource_router = RouterResourceDispatcher::new();
     let mut manifest_builder = ManifestBuilder::new();
+    let mut known_tools = HashMap::new();
     let mut has_any_resources = false;
-    let mut client_refs: Vec<(String, String, Arc<McpClient>)> = Vec::new();
+    let mut catalog_sources = Vec::new();
 
     for result in results {
         let ServerConnectionResult {
             name,
-            description,
-            client,
-            mcp_tools,
+            entry,
             tool_names,
+            client,
             resources,
             server_config,
             transport_config,
         } = result;
 
-        let server_entry = server_entry_from_tools(&name, &description, mcp_tools);
-        manifest_builder = manifest_builder.add_server(server_entry);
-
-        client_refs.push((name.clone(), description, client.clone()));
+        manifest_builder = manifest_builder.add_server(entry);
+        known_tools.insert(name.clone(), tool_names);
 
         // Wrap with ReconnectingClient for transport resilience.
         // Default: enabled for stdio (pipe-based, susceptible to channel overflow).
@@ -326,27 +373,37 @@ pub async fn connect_and_build_manifest(config: &ForgeConfig) -> Result<ConnectR
             .reconnect
             .unwrap_or(server_config.transport == "stdio");
 
-        let (tool_client, resource_client): (Arc<dyn ToolDispatcher>, Arc<dyn ResourceDispatcher>) =
-            if reconnect_enabled {
-                let max_backoff = std::time::Duration::from_secs(
-                    server_config.max_reconnect_backoff_secs.unwrap_or(30),
-                );
-                let rc = Arc::new(forge_client::ReconnectingClient::new(
-                    name.clone(),
-                    transport_config,
-                    client.clone(),
-                    max_backoff,
-                ));
-                (rc.clone(), rc)
-            } else {
-                (client.clone(), client.clone())
-            };
+        let (catalog_client, tool_client, resource_client) = if reconnect_enabled {
+            let max_backoff = std::time::Duration::from_secs(
+                server_config.max_reconnect_backoff_secs.unwrap_or(30),
+            );
+            let client = Arc::new(ReconnectingClient::new(
+                name.clone(),
+                transport_config,
+                client,
+                max_backoff,
+            ));
+            (
+                CatalogClient::Reconnecting(client.clone()),
+                client.clone() as Arc<dyn ToolDispatcher>,
+                client as Arc<dyn ResourceDispatcher>,
+            )
+        } else {
+            (
+                CatalogClient::Direct(client.clone()),
+                client.clone() as Arc<dyn ToolDispatcher>,
+                client as Arc<dyn ResourceDispatcher>,
+            )
+        };
+        catalog_sources.push(CatalogSource {
+            name: name.clone(),
+            client: catalog_client,
+            timeout: catalog_timeout(&server_config),
+        });
 
         // Wire resource dispatcher if any resources exist
         if !resources.is_empty() {
             has_any_resources = true;
-            let resource_client: Arc<dyn ResourceDispatcher> = resource_client.clone();
-
             let resource_client: Arc<dyn ResourceDispatcher> =
                 if let Some(secs) = server_config.timeout_secs {
                     Arc::new(TimeoutResourceDispatcher::new(
@@ -407,12 +464,14 @@ pub async fn connect_and_build_manifest(config: &ForgeConfig) -> Result<ConnectR
             client
         };
 
-        router.set_known_tools(name.clone(), tool_names);
-        router.add_client(name.clone(), client);
+        router.add_client(name, client);
     }
 
-    let manifest = manifest_builder.build();
-    let dispatcher: Arc<dyn ToolDispatcher> = Arc::new(router);
+    let manifest = LiveManifest::from_snapshot(ManifestSnapshot {
+        manifest: Arc::new(manifest_builder.build()),
+        tool_names: known_tools,
+    });
+    let dispatcher: Arc<dyn ToolDispatcher> = Arc::new(router.with_live_manifest(manifest.clone()));
     let resource_dispatcher: Option<Arc<dyn ResourceDispatcher>> = if has_any_resources {
         Some(Arc::new(resource_router))
     } else {
@@ -423,7 +482,7 @@ pub async fn connect_and_build_manifest(config: &ForgeConfig) -> Result<ConnectR
         dispatcher,
         resource_dispatcher,
         manifest,
-        client_refs,
+        catalog_sources,
     })
 }
 

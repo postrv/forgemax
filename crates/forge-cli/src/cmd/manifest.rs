@@ -27,7 +27,7 @@ pub struct ManifestArgs {
 pub async fn execute(args: &ManifestArgs, config_path: Option<PathBuf>) -> Result<()> {
     let config = common::load_config(config_path.as_ref())?;
     let result = common::connect_and_build_manifest(&config).await?;
-    let manifest = &result.manifest;
+    let manifest = result.manifest.current();
 
     // Filter by server if requested
     if let Some(ref server_name) = args.server {
@@ -61,9 +61,9 @@ pub async fn execute(args: &ManifestArgs, config_path: Option<PathBuf>) -> Resul
             }
         }
     } else if args.json {
-        print_all_json(manifest, args.layer)?;
+        print_all_json(&manifest, args.layer)?;
     } else {
-        print_all_human(manifest, args.layer);
+        print_all_human(&manifest, args.layer);
     }
 
     Ok(())

@@ -19,7 +19,7 @@ pub mod live;
 
 use std::collections::BTreeMap;
 
-pub use live::LiveManifest;
+pub use live::{LiveManifest, ManifestSnapshot};
 use serde::{Deserialize, Serialize};
 
 /// TypeScript type definitions for the forge sandbox API.
